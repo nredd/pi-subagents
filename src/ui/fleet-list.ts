@@ -62,6 +62,8 @@ export interface FleetWorkflow {
   /** Set once the run settles, which is what freezes its clock. */
   completedAt?: number;
   tokens: number;
+  /** Live aggregate estimated cost for this run's newly executed agents. */
+  cost: number;
 }
 
 type MainEntry = { kind: "main" };
@@ -517,7 +519,8 @@ export class FleetList {
     // Frozen once the run settles, exactly as an agent's clock is.
     const elapsed = (workflow.completedAt ?? Date.now()) - workflow.startedAt;
     const agents = `${workflow.doneCount}/${workflow.totalCount} agent${workflow.totalCount === 1 ? "" : "s"}`;
-    const stats = `${agents} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
+    const cost = this.showCost() ? formatCost(workflow.cost) : "";
+    const stats = [agents, formatFleetElapsed(elapsed), formatFleetTokens(workflow.tokens), cost].filter(Boolean).join(" · ");
     return rightAlign(left, selected ? theme.fg("text", stats) : theme.fg("dim", stats), width);
   }
 

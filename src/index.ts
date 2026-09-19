@@ -73,6 +73,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
+import { WorkflowUsageTracker } from "./workflow/usage.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
@@ -611,6 +612,8 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  const workflowUsage = new WorkflowUsageTracker();
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
@@ -685,12 +688,27 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }, (record, usage) => {
     // Every assistant message from every agent — nested included, exactly once.
-    // Parked here until a tool result can carry it back to the parent session;
+    // Attribute the raw delta to its owning workflow before nested-tools folds
+    // it into ancestors, so workflow totals stay live without double-counting.
+    workflowUsage.record(record, usage, id => manager.getRecord(id));
+
+    // Park spend until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+  }, (record) => {
+    // Warm quota state from the model the session actually resolved, including
+    // workflow, nested, RPC and scheduled agents that bypass the Agent tool's
+    // eager dispatch refresh. Cache hits are in-memory and do not call the
+    // provider again. Repaint after the asynchronous read so Fleet never stays
+    // on "usage unavailable" for an otherwise visible provider.
+    const startedModel = record.session?.model;
+    if (currentCtx && startedModel) {
+      void subscriptionUsage.get(currentCtx, startedModel.provider, { signal: currentCtx.signal })
+        .then(() => fleet.update());
+    }
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -1170,11 +1188,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Live widget: show running agents above editor.
-  // widgetMode (default "background") selects what the widget shows: "all" =
+  // widgetMode (default "off") selects what the widget shows: "all" =
   // every agent; "background" = hide foreground (they already render inline as
   // the Agent tool result, so showing them here too is a duplicate, #118), keep
   // everything else; "off" = hide the widget entirely. Read live at render time.
-  let widgetMode: WidgetMode = "background";
+  let widgetMode: WidgetMode = "off";
   function getWidgetMode(): WidgetMode { return widgetMode; }
   const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
@@ -1184,10 +1202,9 @@ export default function (pi: ExtensionAPI) {
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
-    (_provider, modelId) => {
-      const provider = modelId?.startsWith("gpt-") ? "openai-codex" : modelId?.startsWith("claude-") ? "anthropic" : undefined;
-      return provider ? subscriptionUsage.format(subscriptionUsage.peek(provider)) : "usage unavailable";
-    });
+    (provider) => provider
+      ? subscriptionUsage.format(subscriptionUsage.peek(provider))
+      : "usage unavailable");
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1884,15 +1901,6 @@ Terse command-style prompts produce shallow, generic work.
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
-      // Fetch before allocating a queue slot or creating a worktree. Failed,
-      // unavailable and stale data remain advisory; only a fresh exhausted
-      // included subscription window blocks a new dispatch.
-      if (model) {
-        await subscriptionUsage.get(ctx, model.provider, { signal });
-        const quotaDecision = subscriptionUsage.decisionFor(model);
-        if (quotaDecision.block) return textResult(quotaDecision.message ?? "Subscription quota is exhausted.");
-      }
-
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
@@ -2037,6 +2045,16 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
 
+        // A resume keeps its existing session model regardless of invocation
+        // parameters, so refresh and decide against that model before mutating
+        // the record or taking a queue slot.
+        const resumeModel = existing.session.model;
+        if (resumeModel) {
+          await subscriptionUsage.get(ctx, resumeModel.provider, { signal });
+          const resumeQuota = subscriptionUsage.decisionFor(resumeModel);
+          if (resumeQuota.block) return textResult(resumeQuota.message ?? "Subscription quota is exhausted.");
+        }
+
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
         // on resume (this branch returned before the background branch below),
@@ -2090,6 +2108,16 @@ Terse command-style prompts produce shallow, generic work.
           record.result?.trim() || "No output.",
           buildDetails(detailBaseFor(record), record),
         );
+      }
+
+      // Fetch before allocating a queue slot or creating a worktree. Schedule
+      // creation above is configuration, not a dispatch. Failed, unavailable
+      // and stale data remain advisory; only a fresh exhausted included window
+      // blocks this fresh spawn.
+      if (model) {
+        await subscriptionUsage.get(ctx, model.provider, { signal });
+        const quotaDecision = subscriptionUsage.decisionFor(model);
+        if (quotaDecision.block) return textResult(quotaDecision.message ?? "Subscription quota is exhausted.");
       }
 
       // Background execution
@@ -2383,16 +2411,19 @@ Terse command-style prompts produce shallow, generic work.
     // Cached counters only, no derivation: the fleet list calls this on a
     // 200ms tick and reads the roster several times per update, so walking a
     // run's progress log here would put O(log) work in the render loop.
-    return [...workflowTasks.values()].map(task => ({
-      id: task.id,
-      name: task.meta?.name ?? task.workflowName ?? task.id,
-      status: task.status,
-      doneCount: task.doneCount,
-      totalCount: task.agentCount,
-      startedAt: task.startTime,
-      ...(task.endTime !== undefined ? { completedAt: task.endTime } : {}),
-      tokens: task.totalTokens,
-    }));
+    return [...workflowTasks.values()].map(task => {
+      const usage = workflowUsage.snapshot(task);
+      return {
+        id: task.id,
+        name: task.meta?.name ?? task.workflowName ?? task.id,
+        status: task.status,
+        doneCount: task.doneCount,
+        totalCount: task.agentCount,
+        startedAt: task.startTime,
+        ...(task.endTime !== undefined ? { completedAt: task.endTime } : {}),
+        ...usage,
+      };
+    });
   }
 
   /**

@@ -23,7 +23,7 @@ import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel, resolveModel } from "./model-resolver.js";
-import { getSubscriptionUsageService } from "./subscription-usage.js";
+import { getSubscriptionUsageService, type SubscriptionUsageService } from "./subscription-usage.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -31,6 +31,7 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorkt
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
+export type OnAgentSession = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
 /**
  * Fired once per assistant `message_end`, for EVERY agent this manager owns —
@@ -369,6 +370,7 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
+  private onSession?: OnAgentSession;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -420,11 +422,14 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    onSession?: OnAgentSession,
+    private readonly subscriptionUsage: Pick<SubscriptionUsageService, "decisionFor"> = getSubscriptionUsageService(),
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
     this.onUsage = onUsage;
+    this.onSession = onSession;
     this.maxConcurrent = maxConcurrent;
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -507,7 +512,7 @@ export class AgentManager {
     const resolvedConfigured = configuredModel ? resolveModel(configuredModel, ctx.modelRegistry) : undefined;
     const model = options.model ?? (typeof resolvedConfigured === "string" ? undefined : resolvedConfigured) ?? ctx.model;
     if (model) {
-      const quotaDecision = getSubscriptionUsageService().decisionFor(model);
+      const quotaDecision = this.subscriptionUsage.decisionFor(model);
       if (quotaDecision.block) throw new Error(quotaDecision.message);
     }
 
@@ -849,6 +854,7 @@ export class AgentManager {
             }
           }
         }
+        this.onSession?.(record);
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -1125,6 +1131,12 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+
+    const sessionModel = record.session.model;
+    if (sessionModel) {
+      const quotaDecision = this.subscriptionUsage.decisionFor(sessionModel);
+      if (quotaDecision.block) throw new Error(quotaDecision.message);
+    }
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still

@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Subscription-aware dispatch exposes normalized Claude Code and Codex quota windows.** `subscription_usage` and `/subscription-usage refresh` surface live OAuth-backed usage without storing credentials or raw responses; fresh exhausted included windows stop a direct `Agent` dispatch before it consumes a queue slot or creates a worktree. Failed, stale and unsupported collectors remain advisory, and paid extra-usage credits never bypass the included-limit guard.
-
-### Changed
-- **FleetView is the single laptop-sized agent surface.** The above-editor widget defaults off; the navigable Fleet list keeps its existing arrow-key windowing and conversation overlay while adding animated activity, model, turn/context and quota state to compact rows.
-
 ### Fixed
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 

@@ -466,7 +466,7 @@ describe("mentioning an agent that has never run", () => {
     // the row reads `↻1` where the Agent tool would read `↻1≤9`.
     const prevMax = getDefaultMaxTurns();
     try {
-      const { lifecycle } = bootDirect({ defaultMaxTurns: 9 });
+      const { lifecycle } = bootDirect({ defaultMaxTurns: 9, widgetMode: "background" });
       heldRun(fakeSession());
       let factory: any;
       const uiCtx = ctx({

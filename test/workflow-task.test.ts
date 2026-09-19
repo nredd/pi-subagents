@@ -15,6 +15,7 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatWorkflowNotification,
   pauseWorkflowTask,
   resumeWorkflowTask,
   type WorkflowTask,
@@ -89,6 +90,30 @@ describe("pausing a run", () => {
     expect(resumeWorkflowTask(task, 3_000)).toBe(true);
     expect(resumeWorkflowTask(task, 4_000)).toBe(false);
     expect(control.resume).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("workflow completion notification", () => {
+  it("keeps an ordinary multi-review result intact", () => {
+    const task = createWorkflowTask({ id: "wf_abc123", script: "" });
+    task.status = "completed";
+    task.value = `standards:${"s".repeat(4_000)}\nspec:${"p".repeat(4_000)}\nSPEC_TAIL`;
+
+    const notification = formatWorkflowNotification(task);
+
+    expect(notification).toContain("SPEC_TAIL");
+    expect(notification).not.toContain("...(truncated)");
+  });
+
+  it("never drops a large workflow return", () => {
+    const task = createWorkflowTask({ id: "wf_abc123", script: "" });
+    task.status = "completed";
+    task.value = `${"x".repeat(100_000)}RESULT_TAIL`;
+
+    const notification = formatWorkflowNotification(task);
+
+    expect(notification).toContain("RESULT_TAIL");
+    expect(notification).not.toContain("...(truncated)");
   });
 });
 

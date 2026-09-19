@@ -109,6 +109,7 @@ function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
     totalCount: 3,
     startedAt: Date.now() - 32_000,
     tokens: 26_400,
+    cost: 0,
     ...over,
   };
 }
@@ -118,6 +119,8 @@ function harness(
   opts: {
     viewerMarkdown?: () => ViewerMarkdownMode;
     onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    showCost?: () => boolean;
+    quotaFor?: (provider: string | undefined, modelId: string | undefined) => string | undefined;
   } = {},
 ): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
@@ -147,7 +150,7 @@ function harness(
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(manager, new Map(), opts.showCost, opts.viewerMarkdown, opts.onViewerMarkdown, opts.quotaFor);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -427,6 +430,16 @@ describe("FleetList rendering", () => {
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });
 
+  it("passes the effective provider and canonical model to the quota formatter", () => {
+    const quotaFor = vi.fn(() => "5h 42% used");
+    const h = harness([makeRecord({
+      invocation: { modelName: "sonnet 5", modelId: "anthropic/claude-sonnet-5" },
+    })], { quotaFor });
+
+    expect(h.render().join("\n")).toContain("5h 42% used");
+    expect(quotaFor).toHaveBeenCalledWith("anthropic", "anthropic/claude-sonnet-5");
+  });
+
   it("orders agents earliest-launched first (top)", () => {
     const agents = [
       makeRecord({ id: "new", description: "newest", startedAt: 2000 }),
@@ -673,6 +686,14 @@ describe("FleetList workflow rows", () => {
     expect(run).toContain("26.4k tokens");
     // A run owns most of the agents under it, so the container comes first.
     expect(rows.findIndex(row => row.includes("audit-src"))).toBeLessThan(agent);
+  });
+
+  it("shows the workflow's live aggregate cost when cost display is enabled", () => {
+    const h = harness([], { showCost: () => true });
+    const workflow = makeWorkflow({ tokens: 9_000, cost: 0.1234 });
+    h.setWorkflows([workflow]);
+
+    expect(h.render().map(plain).join("\n")).toContain("~$0.1234");
   });
 
   it("agrees with itself about a single-agent run", () => {

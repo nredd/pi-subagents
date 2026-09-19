@@ -31,7 +31,7 @@ You do not have to say "workflow" — the model picks the tool — but saying it
 
 ### 2. Read what came back
 
-The tool returns immediately. The run continues in the background and notifies you when it is done.
+The tool returns immediately. The run continues in the background and notifies you when it is done. The completion notification carries the script's complete return value, so later parallel reports are never silently dropped.
 
 ```text
 Workflow "auth-audit" started in the background.
@@ -68,7 +68,7 @@ A **card in the transcript**, updating as the run goes:
   ⎿  auditing 6 route files
 ```
 
-A **`workflow` row in FleetView**, above the agents, carrying its agent counts where a description would go. `⏎` on it opens the inspector rather than a conversation overlay.
+A **`workflow` row in FleetView**, above the agents, carrying its agent counts where a description would go. Its aggregate token count and optional estimated cost update after every child assistant message, including nested descendants. `⏎` on it opens the inspector rather than a conversation overlay.
 
 Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
 

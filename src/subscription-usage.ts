@@ -1,4 +1,3 @@
-import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const CACHE_TTL_MS = 5 * 60_000;
@@ -18,7 +17,6 @@ export interface SubscriptionUsageWindow {
 
 export interface SubscriptionUsageSnapshot {
   provider: string;
-  account?: string;
   status: SubscriptionUsageStatus;
   windows: SubscriptionUsageWindow[];
   credits?: { available: boolean; unlimited: boolean; balance?: string };
@@ -49,22 +47,22 @@ function errorSnapshot(provider: string, status: "error" | "unavailable", now: n
   };
 }
 
-function number(value: unknown): number | undefined {
+function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function timestamp(value: unknown): number | undefined {
-  const raw = number(value);
+  const raw = finiteNumber(value);
   if (raw === undefined) return undefined;
   return raw < 100_000_000_000 ? raw * 1000 : raw;
 }
 
 function percentage(value: unknown): number | undefined {
-  const raw = number(value);
+  const raw = finiteNumber(value);
   return raw === undefined || raw < 0 || raw > 100 ? undefined : raw;
 }
 
-function parseAnthropic(payload: unknown, _now: number): Omit<SubscriptionUsageSnapshot, "provider" | "retrievedAt" | "expiresAt"> | undefined {
+function parseAnthropic(payload: unknown): Omit<SubscriptionUsageSnapshot, "provider" | "retrievedAt" | "expiresAt"> | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const root = payload as Record<string, unknown>;
   const windows: SubscriptionUsageWindow[] = [];
@@ -121,10 +119,33 @@ function parseCodex(payload: unknown): Omit<SubscriptionUsageSnapshot, "provider
   return { status: "available", windows, credits, message: undefined };
 }
 
+interface SubscriptionCollector {
+  url: string;
+  headers(token: string): Record<string, string>;
+  parse(payload: unknown): Omit<SubscriptionUsageSnapshot, "provider" | "retrievedAt" | "expiresAt"> | undefined;
+}
+
+const COLLECTORS: Record<SubscriptionProvider, SubscriptionCollector> = {
+  anthropic: {
+    url: "https://api.anthropic.com/api/oauth/usage",
+    headers: token => ({ Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1" }),
+    parse: parseAnthropic,
+  },
+  "openai-codex": {
+    url: "https://chatgpt.com/backend-api/wham/usage",
+    headers: token => ({ Authorization: `Bearer ${token}` }),
+    parse: parseCodex,
+  },
+};
+
+function collectorFor(provider: string): SubscriptionCollector | undefined {
+  return provider === "anthropic" || provider === "openai-codex" ? COLLECTORS[provider] : undefined;
+}
+
 /** Subscription quota state for OAuth-backed consumer plans. OAuth secrets never leave this service. */
 export class SubscriptionUsageService {
   private readonly cache = new Map<string, SubscriptionUsageSnapshot>();
-  private lastManualRefreshAt = 0;
+  private readonly lastManualRefreshAt = new Map<string, number>();
 
   constructor(private readonly transport: SubscriptionUsageTransport = {
     fetch,
@@ -140,14 +161,19 @@ export class SubscriptionUsageService {
     const cached = this.cache.get(provider);
     const isManualRefresh = options.force === true;
     if (!isManualRefresh && cached && cached.expiresAt > now) return { snapshot: cached, refreshed: false };
-    if (isManualRefresh && now - this.lastManualRefreshAt < MANUAL_REFRESH_INTERVAL_MS) {
+    const lastManualRefreshAt = this.lastManualRefreshAt.get(provider) ?? 0;
+    if (isManualRefresh && now - lastManualRefreshAt < MANUAL_REFRESH_INTERVAL_MS) {
       return { snapshot: this.withStale(cached, provider, now, "Manual refresh is limited to once per minute."), refreshed: false };
     }
-    if (isManualRefresh) this.lastManualRefreshAt = now;
+    if (isManualRefresh) this.lastManualRefreshAt.set(provider, now);
 
     const snapshot = await this.fetchSnapshot(ctx, provider, now, options.signal);
     if (snapshot.status === "available") this.cache.set(provider, snapshot);
-    if (snapshot.status === "error" && cached) return { snapshot: this.withStale(cached, provider, now, snapshot.message), refreshed: false };
+    if (snapshot.status !== "available" && cached) {
+      const stale = this.withStale(cached, provider, now, snapshot.message);
+      this.cache.set(provider, stale);
+      return { snapshot: stale, refreshed: false };
+    }
     return { snapshot, refreshed: snapshot.status === "available" };
   }
 
@@ -157,7 +183,7 @@ export class SubscriptionUsageService {
     return cached.expiresAt > this.transport.now() ? cached : this.withStale(cached, provider, this.transport.now(), "Cached usage data is stale.");
   }
 
-  decisionFor(model: Pick<Model<any>, "provider" | "id">): { block: boolean; message?: string; snapshot?: SubscriptionUsageSnapshot } {
+  decisionFor(model: { provider: string; id: string }): { block: boolean; message?: string; snapshot?: SubscriptionUsageSnapshot } {
     const snapshot = this.peek(model.provider);
     if (!snapshot || snapshot.status !== "available") return { block: false, snapshot };
     const exhausted = snapshot.windows.find(window => window.usedPercent >= 100 && (
@@ -187,33 +213,40 @@ export class SubscriptionUsageService {
   }
 
   private async fetchSnapshot(ctx: ExtensionContext, provider: string, now: number, signal?: AbortSignal): Promise<SubscriptionUsageSnapshot> {
-    if (provider !== "anthropic" && provider !== "openai-codex") {
-      return errorSnapshot(provider, "unavailable", now, "No subscription usage collector is installed for this provider.");
+    const collector = collectorFor(provider);
+    if (!collector) return errorSnapshot(provider, "unavailable", now, "No subscription usage collector is installed for this provider.");
+    let token: string | undefined;
+    try {
+      token = await this.transport.getAccessToken(ctx, provider);
+    } catch {
+      return errorSnapshot(provider, "error", now, "OAuth credential lookup failed.");
     }
-    const token = await this.transport.getAccessToken(ctx, provider);
     if (!token) return errorSnapshot(provider, "unavailable", now, "No OAuth credential is available for this provider.");
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
     const abort = () => controller.abort();
-    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", abort, { once: true });
     try {
-      const response = await this.transport.fetch(
-        provider === "anthropic" ? "https://api.anthropic.com/api/oauth/usage" : "https://chatgpt.com/backend-api/wham/usage",
-        {
-          headers: provider === "anthropic"
-            ? { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1" }
-            : { Authorization: `Bearer ${token}` },
-          signal: controller.signal,
-        },
-      );
+      const response = await this.transport.fetch(collector.url, {
+        headers: collector.headers(token),
+        signal: controller.signal,
+      });
       if (!response.ok) return errorSnapshot(provider, "error", now, `Usage request failed (${response.status}).`);
       const payload: unknown = await response.json();
-      const parsed = provider === "anthropic" ? parseAnthropic(payload, now) : parseCodex(payload);
+      const parsed = collector.parse(payload);
       if (!parsed) return errorSnapshot(provider, "error", now, "Usage response had an unsupported shape.");
       return { provider, retrievedAt: now, expiresAt: now + CACHE_TTL_MS, ...parsed };
     } catch (error) {
-      const message = error instanceof Error && error.name === "AbortError" ? "Usage request timed out." : "Usage request failed.";
+      const aborted = error instanceof Error && error.name === "AbortError";
+      const message = aborted
+        ? timedOut ? "Usage request timed out." : "Usage request was cancelled."
+        : "Usage request failed.";
       return errorSnapshot(provider, "error", now, message);
     } finally {
       clearTimeout(timeout);

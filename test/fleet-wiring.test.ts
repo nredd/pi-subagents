@@ -111,6 +111,17 @@ describe("FleetView wiring (real extension lifecycle)", () => {
     expect(ui.onTerminalInput).toHaveBeenCalled();
   });
 
+  it("keeps the legacy above-editor widget off by default", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ui = uiCtx();
+
+    await lifecycle.get("tool_execution_start")?.({}, ctxWith(ui));
+
+    const registrations = ui.setWidget.mock.calls.filter(c => c[0] === "agents" && typeof c[1] === "function");
+    expect(registrations).toHaveLength(0);
+  });
+
   it("registers the belowEditor widget once a spawned agent has a session, then clears it on shutdown", async () => {
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "done",

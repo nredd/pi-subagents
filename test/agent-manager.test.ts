@@ -35,6 +35,107 @@ const resolvedRun = () =>
     steered: false,
   });
 
+describe("AgentManager — subscription quota", () => {
+  let manager: AgentManager;
+
+  afterEach(() => manager?.dispose());
+
+  it("stamps workflow ownership before the first usage message", async () => {
+    const onUsage = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, onUsage);
+    const session = mockSession();
+    vi.mocked(runAgent).mockImplementation(async (_pi, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      options.onAssistantUsage?.({ input: 10, output: 2, cacheWrite: 0, cost: 0.01 });
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+      workflowId: "wf_live",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ id, workflowId: "wf_live" }),
+      expect.objectContaining({ cost: 0.01 }),
+    );
+  });
+
+  it("reports the resolved session before its first usage message", async () => {
+    const onSession = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onSession);
+    const model = { provider: "openai-codex", id: "gpt-5.6-luna" } as any;
+    const session = { ...mockSession(), model };
+    vi.mocked(runAgent).mockImplementation(async (_pi, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+      model,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(onSession).toHaveBeenCalledWith(expect.objectContaining({ id, session }));
+  });
+
+  it("blocks a fresh spawn before creating a record", () => {
+    const quota = {
+      decisionFor: vi.fn(() => ({
+        block: true,
+        message: "Subscription quota blocked anthropic/claude-sonnet-5",
+      })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const model = { provider: "anthropic", id: "claude-sonnet-5" } as any;
+    vi.mocked(runAgent).mockClear();
+
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+      model,
+    })).toThrow("Subscription quota blocked");
+
+    expect(manager.listAgents()).toHaveLength(0);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("blocks a resume against the existing session model before mutating the record", async () => {
+    let exhausted = false;
+    const quota = {
+      decisionFor: vi.fn(() => exhausted
+        ? { block: true, message: "Subscription quota blocked anthropic/claude-sonnet-5" }
+        : { block: false }),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const model = { provider: "anthropic", id: "claude-sonnet-5" } as any;
+    const session = { ...mockSession(), model };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first",
+      session,
+      aborted: false,
+      steered: false,
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+      model,
+    });
+    await manager.getRecord(id)!.promise;
+    exhausted = true;
+    vi.mocked(resumeAgent).mockClear();
+
+    await expect(manager.resume(id, "more")).rejects.toThrow("Subscription quota blocked");
+
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)?.status).toBe("completed");
+  });
+});
+
 describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)", () => {
   let manager: AgentManager;
 

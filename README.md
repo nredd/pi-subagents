@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and smart group join (consolidated notifications)
-- **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
+- **Optional legacy widget UI** — above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Off by default because FleetView is the single agent surface; enable it via `/agents → Settings → Widget` with `all` or `background`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too. Assistant text renders as Markdown; `m` cycles that between off, assistant-only and everything (see [Viewer markdown](#persistent-settings))
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
@@ -108,7 +108,7 @@ Restrictions:
 
 ## UI
 
-The extension renders a persistent widget above the editor showing active agents. By default it shows background runs only (`widgetMode: background`) — foreground agents already render inline as the `Agent` tool result, so the widget would otherwise double-render them. Switch to `all` (every agent) or `off` (hide the widget) via `/agents → Settings → Widget`:
+The legacy above-editor widget is off by default (`widgetMode: off`) so FleetView remains the single agent surface. Switch to `background` (hide foreground agents, which already render inline) or `all` (every agent) via `/agents → Settings → Widget`:
 
 ```
 ● Agents
@@ -133,13 +133,13 @@ While subagents are running, a Claude Code-style navigable list renders **below*
   esc to interrupt · ← for agents · ↓ to manage
 
   ● main
-  ○ workflow         audit-src                    12/40 agents · 32s · ↓ 26.4k tokens
+  ○ workflow         audit-src          12/40 agents · 32s · ↓ 26.4k tokens · ~$0.042
   ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
   ○ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
                                                                                    ↓ 3 more
 ```
 
-Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet list, the above-editor widget, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. The agents are ordered earliest-launched first, and only agents you can actually open are shown (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. Its token and optional cost totals update after every assistant message, including messages from nested descendants, instead of appearing only when a child settles. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet list, the above-editor widget, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. The agents are ordered earliest-launched first, and only agents you can actually open are shown (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
 
 ### Agent mentions
 
@@ -592,9 +592,14 @@ The extension can inspect the consumer-subscription windows used by the active P
 
 Initial collectors use the providers' undocumented OAuth endpoints: Anthropic Claude Code (`anthropic`) and ChatGPT Codex (`openai-codex`). Other providers report `unavailable` until a collector is implemented. The service keeps only normalized windows, freshness and optional credit metadata in memory; it never persists OAuth credentials or provider response bodies.
 
-Successful reads are cached for five minutes. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute. Authentication, rate-limit, malformed-response and network failures are non-sensitive and advisory: stale data remains visible, but never blocks a dispatch.
+| `subscription_usage` parameter | Type | Behavior |
+|---|---|---|
+| `provider` | string, optional | Provider to inspect; defaults to the parent session's active provider |
+| `refresh` | boolean, optional | Request a live read; manual refresh is throttled independently per provider |
 
-A fresh exhausted included window blocks a new direct `Agent` dispatch before it takes a queue slot or creates a worktree. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
+Successful reads are cached for five minutes. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute per provider. Authentication, rate-limit, malformed-response and network failures are non-sensitive and advisory: stale data remains visible, but never blocks a dispatch.
+
+A fresh exhausted included window blocks every fresh spawn or resume before it takes a queue slot or creates a worktree; creating a future schedule is configuration and remains allowed. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
 
 ## Model Scope
 

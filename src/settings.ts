@@ -159,7 +159,7 @@ export interface SubagentsSettings {
    *     Agent tool result, so the widget would otherwise double-render them
    *     (#118); everything else (background, queued, scheduled, RPC) stays.
    *   - `off`: hide the widget entirely.
-   * Defaults to `background`. Pure-UI and applied live (toggling refreshes the
+   * Defaults to `off`. Pure-UI and applied live (toggling refreshes the
    * widget).
    */
   widgetMode?: WidgetMode;
