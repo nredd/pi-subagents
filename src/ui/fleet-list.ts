@@ -15,8 +15,8 @@ import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } 
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, formatCost, formatSessionTokens, formatTurns, SPINNER, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -144,6 +144,8 @@ export class FleetList {
      * point. Omitted → `m` still cycles, viewer-locally.
      */
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
+    /** Compact usage label for the model the row actually runs. */
+    private quotaFor?: (provider: string | undefined, modelId: string | undefined) => string | undefined,
   ) {}
 
   // ---- Lifecycle ----
@@ -528,15 +530,24 @@ export class FleetList {
     const name = renderAgentName(record.type, theme, selected
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
       : { fallbackColor: "muted" });
-    const description = selected ? theme.fg("text", record.description) : record.description;
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}`;
+    const activity = this.agentActivity.get(record.id);
+    const spinner = record.status === "running" ? `${theme.fg("accent", SPINNER[Math.floor(Date.now() / 80) % SPINNER.length])} ` : "";
+    const detail = activity && (activity.activeTools.size > 0 || activity.responseText.trim())
+      ? describeActivity(activity.activeTools, activity.responseText)
+      : record.description;
+    const description = selected ? theme.fg("text", detail) : theme.fg("muted", detail);
+    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${spinner}${name}  ${description}`;
     // The record, not the activity tracker — see the note in AgentWidget's
     // running line: only the record carries a nested child's spend, and only it
     // outlives the agent.
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const { modelName } = buildInvocationTags(record.invocation);
+    const turns = activity ? formatTurns(activity.turnCount, activity.maxTurns) : undefined;
+    const context = activity?.session ? formatSessionTokens(tokens, getSessionContextPercent(activity.session), theme, record.compactionCount) : formatFleetTokens(tokens);
+    const quota = this.quotaFor?.(record.invocation?.modelId?.split("/")[0], record.invocation?.modelId);
+    const stats = [modelName, formatFleetElapsed(elapsedMs), context, turns, quota, cost].filter(Boolean).join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

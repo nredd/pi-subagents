@@ -36,6 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { getSubscriptionUsageService } from "./subscription-usage.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -401,6 +402,52 @@ export default function (pi: ExtensionAPI) {
   // Initial load — the only strict one. A bad edit mid-session must not kill the
   // session on the next unrelated spawn, so every later reload keeps warning.
   reloadCustomAgents(strictAgentFiles);
+
+  // ---- Subscription usage -------------------------------------------------
+  // Kept in memory only. The service stores normalized public quota state, never
+  // OAuth credentials or provider response bodies.
+  const subscriptionUsage = getSubscriptionUsageService();
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    const providers = new Set(ctx.scopedModels.map(({ model }) => model.provider));
+    if (ctx.model) providers.add(ctx.model.provider);
+    const summaries = await Promise.all([...providers].map(async provider => {
+      const { snapshot } = await subscriptionUsage.get(ctx, provider, { signal: ctx.signal });
+      return `${provider}: ${subscriptionUsage.format(snapshot)}`;
+    }));
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nSubscription usage:\n- ${summaries.join("\n- ")}\n- Treat usage as decision support, not a task-fit prediction. Check subscription_usage before fan-out, prefer available cheaper models for bounded reconnaissance, and reduce parallelism or defer nonessential work when capacity is low.`,
+    };
+  });
+
+  pi.registerCommand("subscription-usage", {
+    description: "Show or refresh subscription usage for configured providers",
+    handler: async (args, ctx) => {
+      const force = args.trim() === "refresh";
+      const providers = new Set(ctx.scopedModels.map(({ model }) => model.provider));
+      if (ctx.model) providers.add(ctx.model.provider);
+      const results = await Promise.all([...providers].map(provider => subscriptionUsage.get(ctx, provider, { force })));
+      ctx.ui.notify(results.map(({ snapshot }) => `${snapshot.provider}: ${subscriptionUsage.format(snapshot)}`).join("\n"), "info");
+    },
+  });
+
+  pi.registerTool(defineTool({
+    name: "subscription_usage",
+    label: "Subscription Usage",
+    description: "Inspect live subscription quota windows for configured providers. Results are advisory except exhausted fresh included limits, which block new subagents on that provider.",
+    promptSnippet: "Inspect subscription quota before expensive subagent fan-out",
+    promptGuidelines: ["Use subscription_usage before subagent fan-out or when choosing a subagent model."],
+    parameters: Type.Object({
+      provider: Type.Optional(Type.String({ description: "Provider to inspect. Omit for the current provider." })),
+      refresh: Type.Optional(Type.Boolean({ description: "Request a live refresh. Limited to once per minute." })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const provider = params.provider ?? ctx.model?.provider;
+      if (!provider) return { content: [{ type: "text" as const, text: "No active provider is selected." }], details: {} };
+      const { snapshot } = await subscriptionUsage.get(ctx, provider, { force: params.refresh, signal });
+      return { content: [{ type: "text" as const, text: `${provider}: ${subscriptionUsage.format(snapshot)}` }], details: { snapshot } };
+    },
+  }));
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
@@ -1136,7 +1183,11 @@ export default function (pi: ExtensionAPI) {
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
+    (_provider, modelId) => {
+      const provider = modelId?.startsWith("gpt-") ? "openai-codex" : modelId?.startsWith("claude-") ? "anthropic" : undefined;
+      return provider ? subscriptionUsage.format(subscriptionUsage.peek(provider)) : "usage unavailable";
+    });
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1832,6 +1883,15 @@ Terse command-style prompts produce shallow, generic work.
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
+
+      // Fetch before allocating a queue slot or creating a worktree. Failed,
+      // unavailable and stale data remain advisory; only a fresh exhausted
+      // included subscription window blocks a new dispatch.
+      if (model) {
+        await subscriptionUsage.get(ctx, model.provider, { signal });
+        const quotaDecision = subscriptionUsage.decisionFor(model);
+        if (quotaDecision.block) return textResult(quotaDecision.message ?? "Subscription quota is exhausted.");
+      }
 
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;

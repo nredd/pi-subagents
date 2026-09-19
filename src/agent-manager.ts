@@ -20,8 +20,10 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getAgentConfig } from "./agent-types.js";
 import { assignHandle, handleBase } from "./mention.js";
-import { describeModel } from "./model-resolver.js";
+import { describeModel, resolveModel } from "./model-resolver.js";
+import { getSubscriptionUsageService } from "./subscription-usage.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -497,6 +499,17 @@ export class AgentManager {
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
+
+    // The parent tool warms the service asynchronously. Every other dispatch
+    // route still funnels through here, so a fresh cached exhausted window is
+    // enforced consistently before a record, queue position or worktree exists.
+    const configuredModel = getAgentConfig(type)?.model;
+    const resolvedConfigured = configuredModel ? resolveModel(configuredModel, ctx.modelRegistry) : undefined;
+    const model = options.model ?? (typeof resolvedConfigured === "string" ? undefined : resolvedConfigured) ?? ctx.model;
+    if (model) {
+      const quotaDecision = getSubscriptionUsageService().decisionFor(model);
+      if (quotaDecision.block) throw new Error(quotaDecision.message);
+    }
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();

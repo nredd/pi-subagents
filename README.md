@@ -483,6 +483,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 |---------|-------------|
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/subscription-usage [refresh]` | Show normalized subscription quota; `refresh` is live but limited to once per minute |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
 
@@ -584,6 +585,16 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
+
+## Subscription Usage
+
+The extension can inspect the consumer-subscription windows used by the active Pi providers and expose them to the parent model through the `subscription_usage` tool and a compact turn-level context summary. It is decision support, not a prediction that a task will fit in a remaining window.
+
+Initial collectors use the providers' undocumented OAuth endpoints: Anthropic Claude Code (`anthropic`) and ChatGPT Codex (`openai-codex`). Other providers report `unavailable` until a collector is implemented. The service keeps only normalized windows, freshness and optional credit metadata in memory; it never persists OAuth credentials or provider response bodies.
+
+Successful reads are cached for five minutes. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute. Authentication, rate-limit, malformed-response and network failures are non-sensitive and advisory: stale data remains visible, but never blocks a dispatch.
+
+A fresh exhausted included window blocks a new direct `Agent` dispatch before it takes a queue slot or creates a worktree. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
 
 ## Model Scope
 
@@ -955,6 +966,7 @@ src/
   group-join.ts       # Group join manager: batched completion notifications with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
+  subscription-usage.ts # OAuth-backed subscription collectors, normalized cache and dispatch decisions
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)
@@ -988,8 +1000,8 @@ src/
     task.ts           # local_workflow task record and batched progress updates
     tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
-    agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming
-    fleet-list.ts         # FleetView: navigable agent list below the editor
+    agent-widget.ts       # Shared compact activity, spinner and status formatting
+    fleet-list.ts         # Sole navigable agent surface below the editor
     conversation-viewer.ts # Live conversation overlay for viewing agent sessions
     viewer-keys.ts        # Viewer scroll keys resolved through user keybindings
     agent-mention.ts      # `@` roster (running, resumable, and startable agents) + popup rows

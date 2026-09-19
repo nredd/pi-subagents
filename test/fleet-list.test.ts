@@ -609,7 +609,11 @@ describe("FleetList cost display", () => {
       lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
     } as unknown as AgentActivity]]);
 
-    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+    const withActivity = row(true, 0.0042, tracked);
+    const withoutActivity = row(true, 0.0042);
+    expect(withActivity).toContain("↓ 13.1k tokens · ↻1 · ~$0.0042");
+    expect(withoutActivity).toContain("↓ 13.1k tokens · ~$0.0042");
+    expect(withActivity).not.toContain("↓ 2 tokens");
   });
 });
 
