@@ -52,6 +52,7 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
+  fallbackModels?: string[];
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -168,6 +169,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
+      fallback_models: Type.Optional(
+        Type.Array(Type.String(), { description: "Ordered fallback models used only when included quota blocks the primary." }),
+      ),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
@@ -258,6 +262,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const options: NestedSpawnOptions = {
         description: params.description,
         model,
+        fallbackModels: params.fallback_models,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,

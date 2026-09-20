@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -24,6 +24,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { getQuotaExhaustionPolicy, getQuotaFallbackModels, getQuotaWaitTimeoutMinutes, setQuotaExhaustionPolicy, setQuotaFallbackModels, setQuotaWaitTimeoutMinutes } from "./fallback-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -37,7 +38,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { getSubscriptionUsageService } from "./subscription-usage.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type QuotaWaitDispatch, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -78,6 +79,30 @@ import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./workt
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
+
+const QUOTA_WAIT_ENTRY_TYPE = "subagents:quota-wait";
+
+type QuotaWaitEntryData =
+  | { version: 1; id: string; status: "active"; dispatch: QuotaWaitDispatch }
+  | { version: 1; id: string; status: "released" | "cancelled" | "timed-out" };
+
+/** Latest active standalone waits from the current session branch. */
+export function restoredQuotaWaitDispatches(entries: readonly unknown[]): QuotaWaitDispatch[] {
+  const active = new Map<string, QuotaWaitDispatch>();
+  for (const raw of entries) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as { type?: unknown; customType?: unknown; data?: unknown };
+    if (entry.type !== "custom" || entry.customType !== QUOTA_WAIT_ENTRY_TYPE || !entry.data || typeof entry.data !== "object") continue;
+    const data = entry.data as Partial<QuotaWaitEntryData>;
+    if (data.version !== 1 || typeof data.id !== "string") continue;
+    if (data.status === "active" && data.dispatch && typeof data.dispatch === "object") {
+      active.set(data.id, data.dispatch as QuotaWaitDispatch);
+    } else if (data.status === "released" || data.status === "cancelled" || data.status === "timed-out") {
+      active.delete(data.id);
+    }
+  }
+  return [...active.values()];
+}
 
 /** Tool execute return value for a text response. */
 function textResult(msg: string, details?: AgentDetails) {
@@ -409,6 +434,19 @@ export default function (pi: ExtensionAPI) {
   // OAuth credentials or provider response bodies.
   const subscriptionUsage = getSubscriptionUsageService();
 
+  const quotaWaitSessionManagers = new Map<string, SessionManager>();
+  const appendQuotaWaitEntry = (
+    data: QuotaWaitEntryData,
+    sessionManager: SessionManager | undefined = quotaWaitSessionManagers.get(data.id)
+      ?? currentCtx?.sessionManager as SessionManager | undefined,
+  ): void => {
+    if (typeof sessionManager?.appendCustomEntry === "function") {
+      sessionManager.appendCustomEntry(QUOTA_WAIT_ENTRY_TYPE, data);
+    } else {
+      pi.appendEntry(QUOTA_WAIT_ENTRY_TYPE, data);
+    }
+  };
+
   pi.on("before_agent_start", async (event, ctx) => {
     const providers = new Set(ctx.scopedModels.map(({ model }) => model.provider));
     if (ctx.model) providers.add(ctx.model.provider);
@@ -709,6 +747,35 @@ export default function (pi: ExtensionAPI) {
       void subscriptionUsage.get(currentCtx, startedModel.provider, { signal: currentCtx.signal })
         .then(() => fleet.update());
     }
+  }, subscriptionUsage, (record, event) => {
+    if (event.wait.persistence === "schedule") scheduler.handleQuotaWait(record, event);
+    if (!isTopLevelAgent(record)) return;
+    if (currentCtx?.hasUI) {
+      fleet.ensureTimer();
+      fleet.update();
+    }
+    if (event.wait.persistence === "session") {
+      if (event.transition === "parked" && currentCtx) {
+        quotaWaitSessionManagers.set(record.id, currentCtx.sessionManager as SessionManager);
+      }
+      if (event.transition === "parked" || event.transition === "updated") {
+        appendQuotaWaitEntry({ version: 1, id: record.id, status: "active", dispatch: event.dispatch });
+      } else {
+        appendQuotaWaitEntry({ version: 1, id: record.id, status: event.transition });
+        quotaWaitSessionManagers.delete(record.id);
+      }
+    }
+    pi.events.emit("subagents:waiting", {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      transition: event.transition,
+      phase: event.wait.phase,
+      nextCheckAt: event.wait.nextCheckAt,
+      deadlineAt: event.wait.deadlineAt,
+      blocked: event.wait.blocked,
+      persistence: event.wait.persistence,
+    });
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -833,6 +900,32 @@ export default function (pi: ExtensionAPI) {
   // schedules reset on /new, restore on /resume.
   const scheduler = new SubagentScheduler();
 
+  async function restoreSessionQuotaWaits(ctx: ExtensionContext): Promise<void> {
+    const dispatches = restoredQuotaWaitDispatches(ctx.sessionManager.getBranch?.() ?? []);
+    const pending = dispatches.filter(dispatch => manager.getRecord(dispatch.id) === undefined);
+    const providers = [...new Set(pending.flatMap(dispatch =>
+      dispatch.modelChain.map(modelId => modelId.split("/", 1)[0]).filter(Boolean),
+    ))];
+    await Promise.all(providers.map(provider =>
+      subscriptionUsage.get(ctx, provider, { fresh: true, signal: ctx.signal }).catch(() => undefined),
+    ));
+
+    for (const dispatch of pending) {
+      try {
+        const id = manager.restoreQuotaWait(pi, ctx, dispatch);
+        if (!manager.getRecord(id)?.quotaWait) {
+          appendQuotaWaitEntry({ version: 1, id, status: "released" }, ctx.sessionManager as SessionManager);
+        }
+      } catch (error) {
+        appendQuotaWaitEntry({ version: 1, id: dispatch.id, status: "cancelled" }, ctx.sessionManager as SessionManager);
+        ctx.ui?.notify?.(
+          `Unable to restore quota wait ${dispatch.id}: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    }
+  }
+
   function startScheduler(ctx: ExtensionContext) {
     try {
       const sessionId = ctx.sessionManager?.getSessionId?.();
@@ -891,6 +984,7 @@ export default function (pi: ExtensionAPI) {
       // also avoids the race where a consumer loaded after us misses the event.
       pi.events.emit("subagents:ready", {});
     }
+    await restoreSessionQuotaWaits(ctx);
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
     // most once per activation: pi appends wrappers to a list it never prunes,
@@ -1490,6 +1584,9 @@ export default function (pi: ExtensionAPI) {
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
+      setQuotaFallbackModels,
+      setQuotaExhaustionPolicy,
+      setQuotaWaitTimeoutMinutes,
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -1677,6 +1774,11 @@ Terse command-style prompts produce shallow, generic work.
         Type.String({
           description:
             'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+        }),
+      ),
+      fallback_models: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Ordered fallback models used only when included quota blocks the primary. Agent frontmatter overrides this list.",
         }),
       ),
       thinking: Type.Optional(
@@ -2019,6 +2121,7 @@ Terse command-style prompts produce shallow, generic work.
             subagent_type: requestedType,
             prompt: params.prompt as string,
             model: params.model as string | undefined,
+            fallbackModels: params.fallback_models as string[] | undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2052,7 +2155,9 @@ Terse command-style prompts produce shallow, generic work.
         if (resumeModel) {
           await subscriptionUsage.get(ctx, resumeModel.provider, { signal });
           const resumeQuota = subscriptionUsage.decisionFor(resumeModel);
-          if (resumeQuota.block) return textResult(resumeQuota.message ?? "Subscription quota is exhausted.");
+          if (resumeQuota.block && !runInBackground) {
+            return textResult(resumeQuota.message ?? "Subscription quota is exhausted.");
+          }
         }
 
         // Background resume: detached run that notifies on completion, mirroring
@@ -2110,15 +2215,11 @@ Terse command-style prompts produce shallow, generic work.
         );
       }
 
-      // Fetch before allocating a queue slot or creating a worktree. Schedule
-      // creation above is configuration, not a dispatch. Failed, unavailable
-      // and stale data remain advisory; only a fresh exhausted included window
-      // blocks this fresh spawn.
-      if (model) {
-        await subscriptionUsage.get(ctx, model.provider, { signal });
-        const quotaDecision = subscriptionUsage.decisionFor(model);
-        if (quotaDecision.block) return textResult(quotaDecision.message ?? "Subscription quota is exhausted.");
-      }
+      // Warm the primary provider before dispatch. AgentManager is the one
+      // admission point for the primary and its explicit fallback chain; doing
+      // a primary-only check here would reject a spawn before a fallback could
+      // be selected. Failed, unavailable and stale reads remain advisory.
+      if (model) await subscriptionUsage.get(ctx, model.provider, { signal });
 
       // Background execution
       if (runInBackground) {
@@ -2144,6 +2245,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          fallbackModels: params.fallback_models as string[] | undefined,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2197,13 +2299,17 @@ Terse command-style prompts produce shallow, generic work.
         });
 
         const isQueued = record?.status === "queued";
+        const quotaWait = record?.quotaWait;
+        const dispatchStatus = quotaWait ? "waiting for subscription quota" : isQueued ? "queued" : "started";
         return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
+          `${fallbackNote}Agent ${dispatchStatus} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+          (quotaWait
+            ? `Next quota check: ${new Date(quotaWait.nextCheckAt).toISOString()}\n`
+            : isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
           `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
@@ -2298,6 +2404,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          fallbackModels: params.fallback_models as string[] | undefined,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -3562,6 +3669,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // explicit configuration — which then fails loudly if general-purpose later
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
+      quotaFallbackModels: getQuotaFallbackModels(),
+      quotaExhaustionPolicy: getQuotaExhaustionPolicy(),
+      quotaWaitTimeoutMinutes: getQuotaWaitTimeoutMinutes(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),

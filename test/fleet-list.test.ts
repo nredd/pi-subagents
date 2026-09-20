@@ -452,14 +452,31 @@ describe("FleetList rendering", () => {
     expect(oldIdx).toBeLessThan(newIdx); // earliest sits above the later one
   });
 
-  it("hides agents that have no session yet (pending)", () => {
+  it("hides ordinary pending agents without sessions but shows quota waits", () => {
     const agents = [
       makeRecord({ id: "live", description: "running one" }),
       makeRecord({ id: "pending", description: "queued one", status: "queued", session: undefined }),
+      makeRecord({
+        id: "quota",
+        description: "parked one",
+        status: "queued",
+        session: undefined,
+        quotaWait: {
+          phase: "preflight",
+          parkedAt: Date.now(),
+          deadlineAt: Date.now() + 3_600_000,
+          nextCheckAt: Date.now() + 60_000,
+          unknownPollAttempt: 0,
+          blocked: [{ modelId: "anthropic/claude-opus-4-6", window: "five_hour" }],
+          persistence: "session",
+        },
+      }),
     ];
-    const lines = harness(agents).render();
-    expect(lines.some(l => l.includes("running one"))).toBe(true);
-    expect(lines.some(l => l.includes("queued one"))).toBe(false);
+    const rendered = harness(agents).render(200).map(plain).join("\n");
+    expect(rendered).toContain("running one");
+    expect(rendered).not.toContain("queued one");
+    expect(rendered).toContain("parked one · waiting for quota");
+    expect(rendered).toContain("retry in 1m");
   });
 
   it("collapses overflow into a '↓ N more' indicator", () => {

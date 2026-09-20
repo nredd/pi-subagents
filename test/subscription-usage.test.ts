@@ -60,6 +60,39 @@ describe("SubscriptionUsageService", () => {
     expect(service.decisionFor({ provider: "anthropic", id: "claude-sonnet-5" }).block).toBe(false);
   });
 
+  it("allows automatic fresh reads to bypass a valid cache without manual throttling", async () => {
+    let usedPercent = 100;
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      five_hour: { utilization: usedPercent, resets_at: 1_700_000_100 },
+    }), { status: 200 }));
+    const service = new SubscriptionUsageService({
+      fetch,
+      now: () => 1_700_000_000_000,
+      getAccessToken: async () => "token",
+    });
+
+    await service.get({} as never, "anthropic");
+    usedPercent = 20;
+    const refreshed = await service.get({} as never, "anthropic", { fresh: true });
+
+    expect(refreshed.refreshed).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(service.decisionFor({ provider: "anthropic", id: "claude-sonnet-5" }).block).toBe(false);
+  });
+
+  it("reports the blocking window and reset time with an exhausted decision", async () => {
+    const service = new SubscriptionUsageService(transport({
+      five_hour: { utilization: 100, resets_at: 1_700_000_100 },
+    }));
+    await service.get({} as never, "anthropic");
+
+    expect(service.decisionFor({ provider: "anthropic", id: "claude-sonnet-5" })).toMatchObject({
+      block: true,
+      window: "five_hour",
+      resetAt: 1_700_000_100_000,
+    });
+  });
+
   it("throttles manual refresh independently per provider", async () => {
     const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(
       url.includes("anthropic")
@@ -112,6 +145,53 @@ describe("SubscriptionUsageService", () => {
 
     expect(result.snapshot.status).toBe("error");
     expect(result.snapshot.message).toBe("Usage request was cancelled.");
+  });
+
+  it("deduplicates concurrent fresh reads per provider", async () => {
+    let resolveFetch!: (response: Response) => void;
+    const fetch = vi.fn(() => new Promise<Response>(resolve => { resolveFetch = resolve; }));
+    const service = new SubscriptionUsageService({
+      fetch,
+      now: () => 1_700_000_000_000,
+      getAccessToken: async () => "token",
+    });
+
+    const first = service.get({} as never, "anthropic", { fresh: true });
+    const second = service.get({} as never, "anthropic", { fresh: true });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    resolveFetch(new Response(JSON.stringify({ five_hour: { utilization: 20 } }), { status: 200 }));
+
+    const results = await Promise.all([first, second]);
+    expect(results.map(result => result.snapshot.status)).toEqual(["available", "available"]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("detaches a cancelled caller without aborting a shared refresh", async () => {
+    let resolveFetch!: (response: Response) => void;
+    let requestSignal: AbortSignal | undefined;
+    const fetch = vi.fn((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal;
+      return new Promise<Response>(resolve => { resolveFetch = resolve; });
+    });
+    const service = new SubscriptionUsageService({
+      fetch,
+      now: () => 1_700_000_000_000,
+      getAccessToken: async () => "token",
+    });
+    const controller = new AbortController();
+
+    const cancelled = service.get({} as never, "anthropic", { fresh: true, signal: controller.signal });
+    const live = service.get({} as never, "anthropic", { fresh: true });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const cancelledResult = await cancelled;
+
+    expect(cancelledResult.snapshot.message).toBe("Usage request was cancelled.");
+    expect(requestSignal?.aborted).toBe(false);
+
+    resolveFetch(new Response(JSON.stringify({ five_hour: { utilization: 20 } }), { status: 200 }));
+    expect((await live).snapshot.status).toBe("available");
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("retains a stale snapshot when a refresh fails", async () => {

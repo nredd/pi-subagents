@@ -111,6 +111,24 @@ describe("child-safe nested Agent tools", () => {
     );
   });
 
+  it("passes call-level fallback models to the manager", async () => {
+    const [agent] = tools();
+    const fallbackModels = ["openai-codex/gpt-5.6-terra"];
+    const result = await execute(agent, {
+      subagent_type: "reviewer",
+      description: "review evidence",
+      prompt: "Review it",
+      fallback_models: fallbackModels,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(spawnAndWait).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), "reviewer", "Review it",
+      expect.objectContaining({ fallbackModels }),
+      expect.any(Function),
+    );
+  });
+
   it("keeps agent discovery rooted in inherited config, not the working directory", async () => {
     const workCwd = mkdtempSync(join(tmpdir(), "nested-tools-work-"));
     const workAgentDir = join(workCwd, ".pi", "agents");

@@ -84,6 +84,19 @@ describe("Agent tool → persisted scheduled job", () => {
     }
   });
 
+  it("persists the raw fallback chain for fire-time resolution", async () => {
+    const fallbackModels = ["openai-codex/gpt-5.6-terra", "anthropic/claude-sonnet-5"];
+    const { job, restore } = await scheduleAndReadBack({
+      subagent_type: "general-purpose",
+      fallback_models: fallbackModels,
+    });
+    try {
+      expect(job.fallbackModels).toEqual(fallbackModels);
+    } finally {
+      restore();
+    }
+  });
+
   it("persists the normalized turn limit, not the raw parameter", async () => {
     // max_turns goes through normalizeMaxTurns and the agent-config/default
     // fallback chain before it is stored. Persisting the raw param instead

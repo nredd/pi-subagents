@@ -119,6 +119,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       excludeExtensions: csvListOptional(fm.exclude_extensions),
       skills: inheritField(fm.skills ?? fm.inherit_skills),
       model: str(fm.model),
+      fallbackModels: parseFallbackModelsField(fm.fallback_models),
       thinking: str(fm.thinking) as ThinkingLevel | undefined,
       maxTurns: nonNegativeInt(fm.max_turns),
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
@@ -283,6 +284,23 @@ function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelecto
  */
 function csvListOptional(val: unknown): string[] | undefined {
   return parseCsvField(val);
+}
+
+/**
+ * Parse `fallback_models:` — the one frontmatter list field where "declared but
+ * empty" and "absent" must stay distinguishable (see `AgentConfig.fallbackModels`
+ * and `resolveFallbackModelSpec`), unlike every other CSV field above.
+ *
+ * omitted/null → undefined (not declared — caller/global sources still apply);
+ * "none"/empty string/empty array → [] (explicit "no fallback", stops fallthrough);
+ * YAML array or CSV string → the listed items.
+ */
+function parseFallbackModelsField(val: unknown): string[] | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (Array.isArray(val)) {
+    return val.map(v => String(v).trim()).filter(Boolean);
+  }
+  return parseCsvField(val) ?? [];
 }
 
 /**

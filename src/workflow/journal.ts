@@ -80,6 +80,7 @@ export interface JournalKeyInput {
   prompt: string;
   label?: string;
   model?: string;
+  fallbackModels?: string[];
   agentType?: string;
   effort?: string;
   isolation?: string;
@@ -105,7 +106,9 @@ export function journalKey(input: JournalKeyInput): string {
     // and invalidate every journal already on disk. Conditional, a schema-less
     // call keys exactly as it always did, and adding or changing a schema still
     // produces a different key.
-    ...(input.schema !== undefined ? [input.schema] : []),
+    ...(input.fallbackModels !== undefined
+      ? [input.schema ?? null, input.fallbackModels]
+      : input.schema !== undefined ? [input.schema] : []),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }

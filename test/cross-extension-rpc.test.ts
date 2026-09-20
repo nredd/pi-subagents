@@ -389,6 +389,39 @@ describe("cross-extension RPC", () => {
       );
     });
 
+    it("normalizes snake-case fallback models for the manager", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-fallback", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-fallback", type: "general-purpose", prompt: "x",
+        options: { fallback_models: ["openai-codex/gpt-5.5"] },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(manager.spawn).toHaveBeenCalledWith(
+        deps.pi, ctx, "general-purpose", "x",
+        expect.objectContaining({ fallbackModels: ["openai-codex/gpt-5.5"] }),
+      );
+    });
+
+    it("rejects malformed fallback models before spawning", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-bad-fallback", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-bad-fallback", type: "general-purpose", prompt: "x",
+        options: { fallback_models: "openai-codex/gpt-5.5" },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply.mock.calls[0][0]).toEqual({
+        success: false,
+        error: "fallback_models must be an array of model strings",
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
     it("passes a Model object through unchanged", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();

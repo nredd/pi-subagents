@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Explicit quota fallback chains and asynchronous quota waiting.** Agent frontmatter, tool calls, RPC, schedules and workflows can name an ordered fallback list; the first defined source wins and an explicit empty list disables lower-precedence defaults. Fresh included-quota exhaustion selects only from that chain. With `quotaExhaustionPolicy: "wait-async"`, detached, scheduled, nested and workflow-owned dispatches park without occupying a concurrency slot, retry at known resets or bounded 1m/2m/5m polling intervals, and time out at a configurable fixed deadline.
+- **Durable standalone and scheduled quota waits.** Top-level waits are journaled in the parent session and restored on `/resume`; scheduled waits persist in the schedule store and suppress duplicate fires. FleetView renders the wait and next retry, and `subagents:waiting` reports every wait transition. Workflow waits remain process-local and recover through the existing manual journal resume path.
+- **Confirmed mid-run quota recovery.** A quota-looking provider failure triggers a fresh included-usage check. When that confirms exhaustion, the existing child history is rebound to the next explicit fallback model under a continuation prompt rather than restarting the original task; stale, unavailable or failed confirmation remains fail-open.
+
 ### Fixed
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 

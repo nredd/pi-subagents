@@ -113,6 +113,13 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
       let normalizedOptions = options ?? {};
+      const fallbackOverride = normalizedOptions.fallback_models ?? normalizedOptions.fallbackModels;
+      if (fallbackOverride != null) {
+        if (!Array.isArray(fallbackOverride) || fallbackOverride.some(candidate => typeof candidate !== "string")) {
+          throw new Error("fallback_models must be an array of model strings");
+        }
+        normalizedOptions = { ...normalizedOptions, fallbackModels: [...fallbackOverride] };
+      }
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.

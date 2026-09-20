@@ -85,6 +85,14 @@ export function formatFleetTokens(count: number): string {
   return `↓ ${compact} tokens`;
 }
 
+/** Compact live retry status for a quota-parked row. */
+export function formatQuotaRetry(nextCheckAt: number, now = Date.now()): string {
+  const minutes = Math.ceil(Math.max(0, nextCheckAt - now) / 60_000);
+  if (minutes === 0) return "checking quota";
+  if (minutes < 60) return `retry in ${minutes}m`;
+  return `retry in ${Math.ceil(minutes / 60)}h`;
+}
+
 /**
  * Place `right` flush to `width`, truncating `left` first so the stats survive.
  * The final clamp guarantees the line never exceeds `width` (which would wrap and
@@ -241,16 +249,17 @@ export class FleetList {
 
   /**
    * Agents shown in the list, ordered earliest-launched first so the ones you
-   * started sooner sit at the top. Every row is openable (has a session), so Enter
-   * never dead-ends. Included: running/queued, plus the agent currently being
-   * viewed, plus recently-finished ones (they linger briefly before dropping out).
-   * Pending agents with no session yet are hidden until they start.
+   * started sooner sit at the top. Ordinary pending agents stay hidden until
+   * they have an openable session, but quota waits are shown immediately: they
+   * may remain parked for hours and otherwise look as if dispatch disappeared.
+   * Included after that gate: running/queued, the agent currently being viewed,
+   * and recently-finished agents (which linger briefly before dropping out).
    * (`listAgents()` is newest-first, so we re-sort.)
    */
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
     return this.manager.listAgents()
-      .filter(a => isTopLevelAgent(a) && a.session && (
+      .filter(a => isTopLevelAgent(a) && (a.session !== undefined || a.quotaWait !== undefined) && (
         a.status === "running" || a.status === "queued"
         || a.id === this.viewingAgentId
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
@@ -404,7 +413,10 @@ export class FleetList {
     const record = entry.record;
     if (!this.ui) return;
     if (!record.session) {
-      this.ui.notify(`Agent is ${record.status} — no session available.`, "info");
+      const detail = record.quotaWait
+        ? `waiting for subscription quota (${formatQuotaRetry(record.quotaWait.nextCheckAt)})`
+        : `${record.status} — no session available`;
+      this.ui.notify(`Agent is ${detail}.`, "info");
       return;
     }
     const session = record.session;
@@ -535,9 +547,11 @@ export class FleetList {
       : { fallbackColor: "muted" });
     const activity = this.agentActivity.get(record.id);
     const spinner = record.status === "running" ? `${theme.fg("accent", SPINNER[Math.floor(Date.now() / 80) % SPINNER.length])} ` : "";
-    const detail = activity && (activity.activeTools.size > 0 || activity.responseText.trim())
-      ? describeActivity(activity.activeTools, activity.responseText)
-      : record.description;
+    const detail = record.quotaWait
+      ? `${record.description} · waiting for quota`
+      : activity && (activity.activeTools.size > 0 || activity.responseText.trim())
+        ? describeActivity(activity.activeTools, activity.responseText)
+        : record.description;
     const description = selected ? theme.fg("text", detail) : theme.fg("muted", detail);
     const left = `  ${this.bullet(rosterIndex, sel, theme)} ${spinner}${name}  ${description}`;
     // The record, not the activity tracker — see the note in AgentWidget's
@@ -550,7 +564,8 @@ export class FleetList {
     const turns = activity ? formatTurns(activity.turnCount, activity.maxTurns) : undefined;
     const context = activity?.session ? formatSessionTokens(tokens, getSessionContextPercent(activity.session), theme, record.compactionCount) : formatFleetTokens(tokens);
     const quota = this.quotaFor?.(record.invocation?.modelId?.split("/")[0], record.invocation?.modelId);
-    const stats = [modelName, formatFleetElapsed(elapsedMs), context, turns, quota, cost].filter(Boolean).join(" · ");
+    const quotaWait = record.quotaWait ? formatQuotaRetry(record.quotaWait.nextCheckAt) : undefined;
+    const stats = [modelName, quotaWait, formatFleetElapsed(elapsedMs), context, turns, quota, cost].filter(Boolean).join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

@@ -60,13 +60,14 @@ describe("journalKey", () => {
     const keys = new Set([
       journalKey(base),
       journalKey({ ...base, model: "haiku" }),
+      journalKey({ ...base, fallbackModels: ["sonnet"] }),
       journalKey({ ...base, agentType: "Explore" }),
       journalKey({ ...base, effort: "high" }),
       journalKey({ ...base, isolation: "worktree" }),
       journalKey({ ...base, gate: "npm test" }),
       journalKey({ ...base, label: "one" }),
     ]);
-    expect(keys.size).toBe(7);
+    expect(keys.size).toBe(8);
   });
 
   it("ignores which phase the row is filed under", () => {

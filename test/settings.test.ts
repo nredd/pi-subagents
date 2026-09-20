@@ -545,13 +545,16 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
-      setRememberAgents: vi.fn(),
+        setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
+        setQuotaFallbackModels: vi.fn(),
+        setQuotaExhaustionPolicy: vi.fn(),
+        setQuotaWaitTimeoutMinutes: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
@@ -601,6 +604,25 @@ describe("settings persistence", () => {
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
       expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
+    });
+
+    it("resets process-local quota settings when fields are absent", () => {
+      applySettings(
+        {
+          quotaFallbackModels: ["openai-codex/gpt-5.6-terra"],
+          quotaExhaustionPolicy: "wait-async",
+          quotaWaitTimeoutMinutes: 60,
+        },
+        appliers,
+      );
+      expect(appliers.setQuotaFallbackModels).toHaveBeenLastCalledWith(["openai-codex/gpt-5.6-terra"]);
+      expect(appliers.setQuotaExhaustionPolicy).toHaveBeenLastCalledWith("wait-async");
+      expect(appliers.setQuotaWaitTimeoutMinutes).toHaveBeenLastCalledWith(60);
+
+      applySettings({}, appliers);
+      expect(appliers.setQuotaFallbackModels).toHaveBeenLastCalledWith(undefined);
+      expect(appliers.setQuotaExhaustionPolicy).toHaveBeenLastCalledWith(undefined);
+      expect(appliers.setQuotaWaitTimeoutMinutes).toHaveBeenLastCalledWith(undefined);
     });
 
     it("applies fallbackSubagent through to the registry", () => {
@@ -796,13 +818,16 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
-      setRememberAgents: vi.fn(),
+        setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
+        setQuotaFallbackModels: vi.fn(),
+        setQuotaExhaustionPolicy: vi.fn(),
+        setQuotaWaitTimeoutMinutes: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),

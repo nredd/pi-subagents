@@ -2,8 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
+import {
+  setQuotaExhaustionPolicy,
+  setQuotaFallbackModels,
+  setQuotaWaitTimeoutMinutes,
+} from "../src/fallback-models.js";
 import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -20,7 +25,7 @@ vi.mock("../src/worktree.js", () => ({
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { addUsage } from "../src/usage.js";
-import { isWorktreeIsolationEnabled } from "../src/worktree.js";
+import { createWorktree, isWorktreeIsolationEnabled } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -133,6 +138,754 @@ describe("AgentManager — subscription quota", () => {
 
     expect(resumeAgent).not.toHaveBeenCalled();
     expect(manager.getRecord(id)?.status).toBe("completed");
+  });
+});
+
+describe("AgentManager — fallback model capture", () => {
+  let manager: AgentManager;
+  const models = [
+    { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+    { provider: "openai-codex", id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+  ];
+  const ctx = {
+    cwd: "/tmp",
+    modelRegistry: {
+      find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      getAll: () => models,
+      getAvailable: () => models,
+    },
+  } as any;
+
+  afterEach(() => {
+    manager?.dispose();
+    setQuotaFallbackModels(undefined);
+    setQuotaExhaustionPolicy(undefined);
+    setQuotaWaitTimeoutMinutes(undefined);
+  });
+
+  it("stores the resolved call-level fallback chain on the invocation", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+      invocation: {},
+    });
+
+    expect(manager.getRecord(id)?.invocation?.fallbackModels).toEqual(["openai-codex/gpt-5.6-terra"]);
+  });
+
+  it("uses the global chain when the call does not declare one", () => {
+    setQuotaFallbackModels(["openai-codex/gpt-5.6-terra"]);
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: models[0] as any,
+      invocation: {},
+    });
+
+    expect(manager.getRecord(id)?.invocation?.fallbackModels).toEqual(["openai-codex/gpt-5.6-terra"]);
+  });
+
+  it("selects the first fallback when fresh quota blocks the primary", async () => {
+    const quota = {
+      decisionFor: vi.fn((model: { provider: string }) => model.provider === "anthropic"
+        ? { block: true, message: "primary exhausted", window: "five_hour", resetAt: Date.now() + 60_000 }
+        : { block: false }),
+    };
+    resolvedRun();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+      invocation: {},
+    });
+    await manager.getRecord(id)?.promise;
+
+    expect(runAgent).toHaveBeenCalledWith(
+      ctx,
+      "general-purpose",
+      "test",
+      expect.objectContaining({ model: models[1] }),
+    );
+    expect(manager.getRecord(id)?.quotaModelIndex).toBe(1);
+  });
+
+  it("continues the same conversation on the next fallback after confirmed mid-run exhaustion", async () => {
+    let primaryBlocked = false;
+    const quota = {
+      get: vi.fn(async () => undefined),
+      decisionFor: vi.fn((model: { provider: string }) => ({
+        block: model.provider === "anthropic" && primaryBlocked,
+        message: "primary exhausted",
+        window: "five_hour",
+      })),
+    };
+    const sessionManager = { getSessionFile: () => "/sessions/child.jsonl" } as any;
+    const primarySession = { ...mockSession(), model: models[0], sessionManager } as any;
+    const fallbackSession = { ...mockSession(), model: models[1], sessionManager } as any;
+    vi.mocked(runAgent).mockReset();
+    vi.mocked(runAgent)
+      .mockImplementationOnce(async (_ctx, _type, _prompt, options) => {
+        options.onSessionCreated?.(primarySession);
+        primaryBlocked = true;
+        return {
+          responseText: "partial",
+          session: primarySession,
+          aborted: false,
+          steered: false,
+          failure: "429 rate limit exceeded",
+        };
+      })
+      .mockImplementationOnce(async (_ctx, _type, _prompt, options) => {
+        options.onSessionCreated?.(fallbackSession);
+        return { responseText: "done", session: fallbackSession, aborted: false, steered: false };
+      });
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
+      description: "test",
+      isBackground: true,
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+      invocation: {},
+    });
+    await manager.getRecord(id)?.promise;
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(runAgent).toHaveBeenLastCalledWith(
+      ctx,
+      "general-purpose",
+      expect.stringContaining("Continue from the preserved conversation"),
+      expect.objectContaining({ model: models[1], resumeSessionManager: sessionManager }),
+    );
+    expect(quota.get).toHaveBeenCalledWith(ctx, "anthropic", expect.objectContaining({ fresh: true }));
+    expect(manager.getRecord(id)).toMatchObject({ status: "completed", result: "done", quotaModelIndex: 1 });
+  });
+
+  it("parks confirmed mid-run exhaustion without holding a pool slot, then resumes history", async () => {
+    setQuotaExhaustionPolicy("wait-async");
+    const resetAt = Date.now() + 75;
+    let primaryFailed = false;
+    const quota = {
+      get: vi.fn(async () => undefined),
+      decisionFor: vi.fn((model: { provider: string }) => {
+        if (!primaryFailed) return { block: false };
+        if (model.provider === "openai-codex" && Date.now() >= resetAt) return { block: false };
+        return { block: true, message: "exhausted", window: "five_hour", resetAt };
+      }),
+    };
+    const events = vi.fn();
+    const sessionManager = { getSessionFile: () => "/sessions/child.jsonl" } as any;
+    const primarySession = { ...mockSession(), model: models[0], sessionManager } as any;
+    const fallbackSession = { ...mockSession(), model: models[1], sessionManager } as any;
+    vi.mocked(runAgent).mockReset().mockImplementation(async (_ctx, _type, runPrompt, options) => {
+      if (runPrompt === "other") {
+        const session = mockSession();
+        options.onSessionCreated?.(session);
+        return { responseText: "other done", session, aborted: false, steered: false };
+      }
+      if (!primaryFailed) {
+        primaryFailed = true;
+        options.onSessionCreated?.(primarySession);
+        return {
+          responseText: "partial",
+          session: primarySession,
+          aborted: false,
+          steered: false,
+          failure: "429 rate limit exceeded",
+        };
+      }
+      options.onSessionCreated?.(fallbackSession);
+      return { responseText: "done", session: fallbackSession, aborted: false, steered: false };
+    });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any, events);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
+      description: "test",
+      isBackground: true,
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+    });
+    for (let i = 0; i < 20 && !manager.getRecord(id)?.quotaWait; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    expect(manager.getRecord(id)).toMatchObject({ status: "queued", quotaWait: { phase: "mid-run" } });
+
+    const otherId = manager.spawn(mockPi, ctx, "general-purpose", "other", {
+      description: "other",
+      isBackground: true,
+    });
+    await manager.getRecord(otherId)?.promise;
+    expect(manager.getRecord(otherId)?.status).toBe("completed");
+    await manager.getRecord(id)?.promise;
+
+    expect(manager.getRecord(id)).toMatchObject({ status: "completed", result: "done", quotaModelIndex: 1 });
+    expect(events).toHaveBeenCalledWith(expect.objectContaining({ id }), expect.objectContaining({
+      transition: "parked",
+      wait: expect.objectContaining({ phase: "mid-run", persistence: "session" }),
+    }));
+    expect(events).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ transition: "released" }));
+  });
+
+  it("does not switch models for an unconfirmed or unrelated mid-run failure", async () => {
+    let blocked = false;
+    const quota = {
+      get: vi.fn(async () => undefined),
+      decisionFor: vi.fn(() => ({ block: blocked, message: "exhausted", window: "five_hour" })),
+    };
+    const session = { ...mockSession(), model: models[0], sessionManager: {} } as any;
+    vi.mocked(runAgent).mockReset().mockImplementation(async () => {
+      blocked = true;
+      return {
+        responseText: "partial",
+        session,
+        aborted: false,
+        steered: false,
+        failure: "tool protocol failed",
+      };
+    });
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
+      description: "test",
+      isBackground: true,
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+    });
+    await manager.getRecord(id)?.promise;
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(quota.get).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)).toMatchObject({ status: "error", error: "tool protocol failed" });
+  });
+
+  it("does not recover a mid-run quota-looking failure when the fresh confirmation fails", async () => {
+    let blocked = false;
+    const quota = {
+      get: vi.fn(async () => { throw new Error("usage unavailable"); }),
+      decisionFor: vi.fn(() => ({ block: blocked, message: "exhausted", window: "five_hour" })),
+    };
+    const session = { ...mockSession(), model: models[0], sessionManager: {} } as any;
+    vi.mocked(runAgent).mockReset().mockImplementation(async () => {
+      blocked = true;
+      return {
+        responseText: "partial",
+        session,
+        aborted: false,
+        steered: false,
+        failure: "429 rate limit exceeded",
+      };
+    });
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
+      description: "test",
+      isBackground: true,
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+    });
+    await manager.getRecord(id)?.promise;
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)).toMatchObject({ status: "error", error: "429 rate limit exceeded" });
+  });
+
+  it("rejects before creating a record when every explicit candidate is blocked", () => {
+    const quota = {
+      decisionFor: vi.fn((model: { provider: string; id: string }) => ({
+        block: true,
+        message: `${model.provider}/${model.id} exhausted`,
+        window: "included",
+      })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    expect(() => manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: models[0] as any,
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+    })).toThrow("all configured models are blocked");
+    expect(manager.listAgents()).toHaveLength(0);
+  });
+});
+
+describe("AgentManager — quota waiting", () => {
+  let manager: AgentManager;
+  const model = { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" } as any;
+  const ctx = {
+    cwd: "/tmp",
+    model,
+    modelRegistry: {
+      find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+      getAll: () => [model],
+      getAvailable: () => [model],
+    },
+  } as any;
+
+  beforeEach(() => {
+    vi.mocked(runAgent).mockReset();
+    vi.mocked(resumeAgent).mockReset();
+  });
+
+  afterEach(async () => {
+    await manager?.dispose();
+    setQuotaExhaustionPolicy(undefined);
+    setQuotaWaitTimeoutMinutes(undefined);
+    vi.useRealTimers();
+  });
+
+  it("parks eligible background work without starting or taking a slot, then wakes it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = true;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour" }
+        : { block: false }),
+      get: vi.fn(async () => {
+        blocked = false;
+        return { snapshot: {}, refreshed: true };
+      }),
+    };
+    const onQuotaWait = vi.fn();
+    resolvedRun();
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any, onQuotaWait);
+
+    const parkedId = manager.spawn(mockPi, ctx, "general-purpose", "parked", {
+      description: "parked",
+      isBackground: true,
+      model,
+    });
+    expect(manager.getRecord(parkedId)).toMatchObject({
+      status: "queued",
+      quotaWait: { phase: "preflight", nextCheckAt: 1_700_000_060_000 },
+    });
+    expect(onQuotaWait).toHaveBeenCalledWith(
+      expect.objectContaining({ id: parkedId }),
+      expect.objectContaining({ transition: "parked" }),
+    );
+    expect(runAgent).not.toHaveBeenCalled();
+
+    blocked = false;
+    const immediateId = manager.spawn(mockPi, ctx, "general-purpose", "immediate", {
+      description: "immediate",
+      isBackground: true,
+      model,
+    });
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    await manager.getRecord(immediateId)?.promise;
+
+    blocked = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    await manager.getRecord(parkedId)?.promise;
+
+    expect(quota.get).toHaveBeenCalledWith(ctx, "anthropic", expect.objectContaining({ fresh: true }));
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(manager.getRecord(parkedId)?.quotaWait).toBeUndefined();
+    expect(manager.getRecord(parkedId)?.status).toBe("completed");
+  });
+
+  it("restores a durable preflight wait with its original id and deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    setQuotaWaitTimeoutMinutes(2);
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    let dispatch: any;
+    const first = new AgentManager(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      quota as any,
+      (_record, event) => {
+        if (event.transition === "parked") dispatch = event.dispatch;
+      },
+    );
+    const id = first.spawn(mockPi, ctx, "general-purpose", "persist me", {
+      description: "persist me",
+      isBackground: true,
+      model,
+    });
+    expect(dispatch).toBeDefined();
+    await first.dispose();
+
+    vi.setSystemTime(1_700_000_030_000);
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const restoredId = manager.restoreQuotaWait(mockPi, ctx, dispatch);
+
+    expect(restoredId).toBe(id);
+    expect(manager.getRecord(id)).toMatchObject({
+      status: "queued",
+      quotaWait: {
+        parkedAt: 1_700_000_000_000,
+        deadlineAt: 1_700_000_120_000,
+        nextCheckAt: 1_700_000_090_000,
+      },
+    });
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(manager.getRecord(id)?.status).toBe("error");
+    expect(manager.getRecord(id)?.error).toContain("timed out");
+  });
+
+  it("restores a durable mid-run continuation without replaying the original prompt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = true;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000 }
+        : { block: false }),
+      get: vi.fn(async () => { blocked = false; }),
+    };
+    resolvedRun();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const continuation = "Continue from the preserved conversation after the provider quota interruption.";
+
+    const id = manager.restoreQuotaWait(mockPi, ctx, {
+      version: 1,
+      id: "mid-run-restored",
+      type: "general-purpose",
+      prompt: continuation,
+      modelChain: ["anthropic/claude-opus-4-6"],
+      wait: {
+        phase: "mid-run",
+        parkedAt: 1_700_000_000_000,
+        deadlineAt: 1_700_000_120_000,
+        nextCheckAt: 1_700_000_060_000,
+        unknownPollAttempt: 0,
+        blocked: [{ modelId: "anthropic/claude-opus-4-6", window: "five_hour", resetAt: 1_700_000_060_000 }],
+        persistence: "session",
+      },
+      options: {
+        description: "resume quota failure",
+        isBackground: true,
+        resumeSessionFile: "/sessions/child.jsonl",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await manager.getRecord(id)?.promise;
+
+    expect(runAgent).toHaveBeenCalledWith(
+      ctx,
+      "general-purpose",
+      continuation,
+      expect.objectContaining({ resumeSessionFile: "/sessions/child.jsonl" }),
+    );
+    expect(manager.getRecord(id)?.status).toBe("completed");
+  });
+
+  it("parks a detached resume without a pool slot and continues the existing session", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = false;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000 }
+        : { block: false }),
+      get: vi.fn(async () => { blocked = false; }),
+    };
+    const session = { ...mockSession(), model, sessionManager: { getSessionFile: () => "/sessions/agent.jsonl" } } as any;
+    vi.mocked(runAgent).mockReset().mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return { responseText: "first", session, aborted: false, steered: false };
+    });
+    vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "continued" });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any);
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "first", {
+      description: "resume later",
+      isBackground: true,
+      model,
+    });
+    await manager.getRecord(id)?.promise;
+    blocked = true;
+
+    const resumed = await manager.resume(id, "continue", undefined, { isBackground: true });
+
+    expect(resumed).toBe(manager.getRecord(id));
+    expect(resumed).toMatchObject({ status: "queued", quotaWait: { phase: "preflight" } });
+    expect(resumeAgent).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await manager.getRecord(id)?.promise;
+    expect(resumeAgent).toHaveBeenCalledWith(session, "continue", expect.anything());
+    expect(manager.getRecord(id)).toMatchObject({ status: "completed", result: "continued" });
+  });
+
+  it("waits inline for an owned nested resume without persisting the workflow state", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = false;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000 }
+        : { block: false }),
+      get: vi.fn(async () => { blocked = false; }),
+    };
+    const session = { ...mockSession(), model, sessionManager: {} } as any;
+    vi.mocked(runAgent).mockReset().mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return { responseText: "first", session, aborted: false, steered: false };
+    });
+    vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "continued" });
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "first", {
+      description: "nested resume",
+      parentAgentId: "parent",
+      model,
+    });
+    await manager.getRecord(id)?.promise;
+    blocked = true;
+
+    const resumedPromise = manager.resume(id, "continue");
+    await Promise.resolve();
+    expect(manager.getRecord(id)).toMatchObject({
+      status: "queued",
+      quotaWait: { phase: "preflight", persistence: "process" },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    const resumed = await resumedPromise;
+
+    expect(resumed).toMatchObject({ status: "completed", result: "continued" });
+  });
+
+  it("fails a top-level foreground call immediately under wait-async", async () => {
+    setQuotaExhaustionPolicy("wait-async");
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    await expect(manager.spawnAndWait(mockPi, ctx, "general-purpose", "foreground", {
+      description: "foreground",
+      model,
+    })).rejects.toThrow("all configured models are blocked");
+    expect(manager.listAgents()).toHaveLength(0);
+  });
+
+  it("allows an owned blocking child to wait, then starts it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = true;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour" }
+        : { block: false }),
+      get: vi.fn(async () => {
+        blocked = false;
+        return { snapshot: {}, refreshed: true };
+      }),
+    };
+    resolvedRun();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "nested", {
+      description: "nested",
+      model,
+      parentAgentId: "parent",
+    });
+    expect(manager.listAgents()[0]).toMatchObject({ status: "queued", parentAgentId: "parent" });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    const { record } = await waiting;
+
+    expect(record.status).toBe("completed");
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a delayed startup failure on the parked record", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = true;
+    const onComplete = vi.fn();
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour" }
+        : { block: false }),
+      get: vi.fn(async () => {
+        blocked = false;
+        return { snapshot: {}, refreshed: true };
+      }),
+    };
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
+    manager = new AgentManager(onComplete, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "startup failure", {
+      description: "startup failure",
+      isBackground: true,
+      isolation: "worktree",
+      model,
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await Promise.resolve();
+
+    expect(manager.getRecord(id)).toMatchObject({
+      status: "error",
+      error: expect.stringContaining("Cannot run with isolation"),
+    });
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("times out once at the fixed deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    setQuotaWaitTimeoutMinutes(1);
+    const onComplete = vi.fn();
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    manager = new AgentManager(onComplete, undefined, undefined, undefined, undefined, undefined, quota as any);
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "timeout", {
+      description: "timeout",
+      isBackground: true,
+      model,
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(manager.getRecord(id)).toMatchObject({ status: "error" });
+    expect(manager.getRecord(id)?.error).toContain("timed out");
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(runAgent).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an owned blocking waiter when its parked record is cancelled", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "cancel", {
+      description: "cancel",
+      model,
+      parentAgentId: "parent",
+    });
+    const record = manager.listAgents()[0];
+
+    expect(manager.abort(record.id)).toBe(true);
+    await expect(waiting).resolves.toMatchObject({ record: { status: "stopped" } });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    expect(quota.get).not.toHaveBeenCalled();
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("abortAll releases every parked quota waiter", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "cancel all", {
+      description: "cancel all",
+      model,
+      parentAgentId: "parent",
+    });
+
+    expect(manager.abortAll()).toBe(1);
+    await expect(waiting).resolves.toMatchObject({ record: { status: "stopped" } });
+    expect(manager.hasRunning()).toBe(false);
+  });
+
+  it("dispose releases parked quota waiters before clearing their records", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "dispose", {
+      description: "dispose",
+      model,
+      parentAgentId: "parent",
+    });
+
+    await manager.dispose();
+    await expect(waiting).resolves.toMatchObject({ record: { status: "stopped" } });
+  });
+
+  it("waitForAll includes parked quota waits", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    let blocked = true;
+    const quota = {
+      decisionFor: vi.fn(() => blocked
+        ? { block: true, message: "exhausted", window: "five_hour" }
+        : { block: false }),
+      get: vi.fn(async () => {
+        blocked = false;
+        return { snapshot: {}, refreshed: true };
+      }),
+    };
+    resolvedRun();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "wait for all", {
+      description: "wait for all",
+      isBackground: true,
+      model,
+    });
+    let settled = false;
+    const waiting = manager.waitForAll().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await waiting;
+
+    expect(manager.getRecord(id)?.status).toBe("completed");
+  });
+
+  it("cancels a parked wait without a late start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    setQuotaExhaustionPolicy("wait-async");
+    const quota = {
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
+    };
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "cancel", {
+      description: "cancel",
+      isBackground: true,
+      model,
+    });
+
+    expect(manager.abort(id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    expect(manager.getRecord(id)?.status).toBe("stopped");
+    expect(quota.get).not.toHaveBeenCalled();
+    expect(runAgent).not.toHaveBeenCalled();
   });
 });
 

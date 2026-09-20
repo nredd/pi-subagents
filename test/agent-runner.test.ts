@@ -951,6 +951,20 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/explore.jsonl", "/normal/pi/sessions");
   });
 
+  it("rebinds an existing session manager for quota recovery without reopening or replacing history", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const existing = { kind: "existing-session-manager" } as any;
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "continue", { pi, resumeSessionManager: existing });
+
+    expect(sessionManagerOpen).not.toHaveBeenCalled();
+    expect(sessionManagerCreate).not.toHaveBeenCalled();
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ sessionManager: existing }));
+  });
+
   it("uses pi's normal persistent session location and links to the parent session", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");

@@ -241,6 +241,12 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   // the first time it is ejected.
   fmFields.push(`tools: ${formatToolsField(cfg.builtinToolNames)}`);
   if (cfg.model) fmFields.push(`model: ${cfg.model}`);
+  // Explicit empty (`[]`) is a real declaration — "no fallback for this
+  // agent" — distinct from the field being absent; `none` round-trips back to
+  // `[]` via parseFallbackModelsField, same as `allowed_subagents`'s `none`.
+  if (cfg.fallbackModels !== undefined) {
+    fmFields.push(`fallback_models: ${cfg.fallbackModels.length ? cfg.fallbackModels.join(", ") : "none"}`);
+  }
   if (cfg.thinking) fmFields.push(`thinking: ${cfg.thinking}`);
   if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
   if (cfg.allowedSubagents !== undefined) {

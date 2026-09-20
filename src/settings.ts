@@ -241,6 +241,44 @@ export interface SubagentsSettings {
    */
   fallbackSubagent?: string;
   /**
+   * Global default ordered fallback model chain, lowest precedence of the
+   * three `fallback_models` sources (agent frontmatter > caller parameter >
+   * this setting). Applied only when a spawn declares no chain of its own.
+   * Configure no machine-specific values in a shared/checked-in config — this
+   * setting is meant to be set per-machine (e.g. in the global,
+   * not-checked-in `subagents.json`). Undefined/omitted = no project-wide
+   * default chain. Candidates are validated/resolved the same way the primary
+   * model is (fuzzy `resolveModel`, then `scopeModels` if enabled); an
+   * unresolvable or out-of-scope entry is dropped, not an error.
+   */
+  quotaFallbackModels?: string[];
+  /**
+   * What happens when every model in a spawn's effective fallback chain
+   * (primary + `quotaFallbackModels`/frontmatter/call-level fallbacks) is
+   * blocked by exhausted, fresh, included subscription quota.
+   *
+   *   - `fail` (default): today's behavior — the spawn (or resume) is refused
+   *     immediately with the quota message, exactly as when there is no
+   *     fallback chain at all.
+   *   - `wait-async`: reserved for asynchronously-owned work (background/
+   *     detached top-level spawns and resumes, scheduled jobs, workflow and
+   *     nested children) to park until a candidate in the chain becomes
+   *     available instead of failing outright. A top-level FOREGROUND call
+   *     still fails immediately under this policy — there is no caller to wait
+   *     asynchronously on.
+   *
+   * This setting currently only declares the policy; see the changelog for
+   * which behaviors are wired to it in a given release.
+   */
+  quotaExhaustionPolicy?: "fail" | "wait-async";
+  /**
+   * Under `quotaExhaustionPolicy: "wait-async"`, the wall-clock ceiling (in
+   * minutes) a parked spawn waits for a candidate to become available before
+   * giving up and failing. Defaults to `10080` (7 days). Has no effect under
+   * `fail`.
+   */
+  quotaWaitTimeoutMinutes?: number;
+  /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
    *
@@ -305,6 +343,7 @@ export interface SubagentsSettings {
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
+export type QuotaExhaustionPolicy = "fail" | "wait-async";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
@@ -328,6 +367,9 @@ export interface SettingsAppliers {
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
+  setQuotaFallbackModels: (v: string[] | undefined) => void;
+  setQuotaExhaustionPolicy: (v: QuotaExhaustionPolicy | undefined) => void;
+  setQuotaWaitTimeoutMinutes: (n: number | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -342,6 +384,7 @@ const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptio
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+const VALID_QUOTA_EXHAUSTION_POLICIES: ReadonlySet<string> = new Set<QuotaExhaustionPolicy>(["fail", "wait-async"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -350,6 +393,10 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+// 10 years in minutes — generous enough for any realistic "wait indefinitely
+// within reason" configuration, small enough to reject a units mistake (e.g.
+// minutes typed as milliseconds).
+const QUOTA_WAIT_TIMEOUT_CEILING_MINUTES = 5_256_000;
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
@@ -461,6 +508,27 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
+  if (Array.isArray(r.quotaFallbackModels)) {
+    const items = r.quotaFallbackModels
+      .filter((v): v is string => typeof v === "string")
+      .map(v => v.trim())
+      .filter(Boolean);
+    // The array is present either way (even empty) — same "defined beats
+    // absent" contract fallback-models.ts uses for the other two sources, so a
+    // deliberately-emptied global chain does not silently reappear from a
+    // corrupted/garbage entry being dropped down to "unset".
+    out.quotaFallbackModels = items;
+  }
+  if (typeof r.quotaExhaustionPolicy === "string" && VALID_QUOTA_EXHAUSTION_POLICIES.has(r.quotaExhaustionPolicy)) {
+    out.quotaExhaustionPolicy = r.quotaExhaustionPolicy as QuotaExhaustionPolicy;
+  }
+  if (
+    Number.isInteger(r.quotaWaitTimeoutMinutes) &&
+    (r.quotaWaitTimeoutMinutes as number) >= 1 &&
+    (r.quotaWaitTimeoutMinutes as number) <= QUOTA_WAIT_TIMEOUT_CEILING_MINUTES
+  ) {
+    out.quotaWaitTimeoutMinutes = r.quotaWaitTimeoutMinutes as number;
+  }
   return out;
 }
 
@@ -519,6 +587,11 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  // These settings live in module state and must reset when a project/session
+  // omits them, or values from the previous activation leak into the next one.
+  appliers.setQuotaFallbackModels(s.quotaFallbackModels);
+  appliers.setQuotaExhaustionPolicy(s.quotaExhaustionPolicy);
+  appliers.setQuotaWaitTimeoutMinutes(s.quotaWaitTimeoutMinutes);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

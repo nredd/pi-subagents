@@ -310,6 +310,7 @@ All fields are optional — sensible defaults for everything.
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `fallback_models` | `subagents.json` `quotaFallbackModels` | Ordered CSV or YAML list used only when fresh included quota blocks `model`. `none`, an empty string, or `[]` explicitly disables lower-precedence fallbacks |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -322,7 +323,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Frontmatter is authoritative. If an agent file sets `model`, `fallback_models`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
 
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
@@ -599,7 +600,26 @@ Initial collectors use the providers' undocumented OAuth endpoints: Anthropic Cl
 
 Successful reads are cached for five minutes. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute per provider. Authentication, rate-limit, malformed-response and network failures are non-sensitive and advisory: stale data remains visible, but never blocks a dispatch.
 
-A fresh exhausted included window blocks every fresh spawn or resume before it takes a queue slot or creates a worktree; creating a future schedule is configuration and remains allowed. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
+A fresh exhausted included window blocks dispatch before it takes a queue slot or creates a worktree; creating a future schedule is configuration and remains allowed. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
+
+**Fallback chains.** `fallback_models` on an agent definition, `fallback_models` on an `Agent` call (or `fallbackModels` in workflow/RPC APIs), and global `quotaFallbackModels` are the three sources, in that precedence order. The first *defined* source wins; an explicit empty list means no fallback and does not fall through. The primary model always stays first. Invalid, unavailable and out-of-scope fallback entries are dropped with warnings rather than invalidating a usable primary. Dispatch picks the first model in this explicit chain that fresh quota does not block; it never scans arbitrary enabled models.
+
+```json
+{
+  "quotaFallbackModels": [
+    "openai-codex/gpt-5.6-terra",
+    "anthropic/claude-sonnet-5"
+  ],
+  "quotaExhaustionPolicy": "wait-async",
+  "quotaWaitTimeoutMinutes": 10080
+}
+```
+
+`quotaExhaustionPolicy` defaults to `"fail"`. `"wait-async"` parks only detached/background, scheduled, nested and workflow-owned work; a top-level blocking call still fails immediately with reset guidance. A parked dispatch owns no concurrency slot. Known reset times wake at the earliest reset; unknown or past resets poll after 1 minute, 2 minutes, then every 5 minutes, bounded by the fixed timeout (seven days by default).
+
+Standalone top-level waits are journaled in the parent session and restored on `/resume`. Scheduled waits remain in the session's schedule store, keep one-shot jobs enabled, and suppress duplicate interval/cron fires until release. Nested and workflow waits are process-local; after an interrupted workflow, use its journal's normal manual resume path. FleetView shows parked agents and their next retry.
+
+A provider failure during a run triggers fallback only when its text looks quota-related **and** a fresh usage read confirms included-quota exhaustion. The existing child history is rebound to a new session on the next explicit model and receives a continuation prompt; the original task is never restarted. If confirmation fails, data is stale, or no collector supports the provider, the original failure is reported unchanged.
 
 ## Model Scope
 
@@ -626,7 +646,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Quota fallback, policy and timeout settings are currently file-only. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -748,6 +768,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:steered` | Steering message accepted — fires for a *queued* steer as well as a delivered one | `id`, `message` |
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
+| `subagents:waiting` | A quota wait is parked, updated, released, cancelled or timed out | `id`, `type`, `description`, `transition`, `phase`, `nextCheckAt`, `deadlineAt`, `blocked`, `persistence` |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
 | `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `{}` (empty object) |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
@@ -972,6 +993,8 @@ src/
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
   subscription-usage.ts # OAuth-backed subscription collectors, normalized cache and dispatch decisions
+  fallback-models.ts # Explicit fallback precedence, model-chain resolution and quota selection
+  quota-wait.ts      # Reset-aware retry scheduling and bounded unknown-reset polling
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)

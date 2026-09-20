@@ -58,6 +58,8 @@ export interface WorkflowSpawnRequest {
   label: string;
   agentType: string;
   model?: string;
+  /** Ordered call-level fallback candidates; agent frontmatter still has precedence. */
+  fallbackModels?: string[];
   /**
    * Reasoning effort for this child, as one of pi's thinking levels.
    *
@@ -432,6 +434,7 @@ interface AgentCallPayload {
   prompt: string;
   label?: string;
   model?: string;
+  fallbackModels?: string[];
   agentType?: string;
   isolation?: "worktree";
   phaseIndex?: number;
@@ -851,6 +854,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       const label = payload.label ?? resumed?.label ?? derivedLabel(payload.prompt);
       const agentType = resumed?.agentType ?? payload.agentType ?? "general-purpose";
       const model = resumed !== undefined ? resumed.model : payload.model;
+      const fallbackModels = resumed === undefined ? payload.fallbackModels : undefined;
       const isolation = resumed !== undefined ? resumed.isolation : payload.isolation;
       openLaunches.set(callId, label);
 
@@ -1024,6 +1028,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     label,
                     agentType,
                     ...(model !== undefined ? { model } : {}),
+                    ...(fallbackModels !== undefined ? { fallbackModels } : {}),
                     ...(payload.effort !== undefined ? { effort: payload.effort } : {}),
                     ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
                     ...(isolation !== undefined ? { isolation } : {}),

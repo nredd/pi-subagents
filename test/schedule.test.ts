@@ -22,6 +22,7 @@ function makeMockManager() {
   const spawnFn = vi.fn(() => "agent-" + Math.random().toString(36).slice(2, 10));
   return {
     spawn: spawnFn,
+    restoreQuotaWait: vi.fn((_pi, _ctx, dispatch) => dispatch.id),
     awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(() => ({ promise: Promise.resolve("done") })),
   } as any;
@@ -313,6 +314,90 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
   });
 
+  it("suppresses interval refires while a quota wait is persisted and restores it", () => {
+    manager.waitForCompletion = vi.fn(() => new Promise(() => {}));
+    const job = scheduler.addJob({
+      name: "quota", description: "quota", schedule: "1s",
+      subagent_type: "general-purpose", prompt: "wait",
+    });
+    vi.advanceTimersByTime(1_000);
+    const agentId = manager.spawn.mock.results[0].value;
+    const wait = {
+      phase: "preflight" as const,
+      parkedAt: Date.now(),
+      deadlineAt: Date.now() + 600_000,
+      nextCheckAt: Date.now() + 60_000,
+      unknownPollAttempt: 0,
+      blocked: [{ modelId: "anthropic/claude-opus-4-6", window: "five_hour" }],
+      persistence: "schedule" as const,
+    };
+    scheduler.handleQuotaWait(
+      { id: agentId, scheduleId: job.id } as any,
+      {
+        transition: "parked",
+        wait,
+        dispatch: {
+          version: 1,
+          id: agentId,
+          type: "general-purpose",
+          prompt: "wait",
+          modelChain: ["anthropic/claude-opus-4-6"],
+          wait,
+          options: { description: "quota", isBackground: true, scheduleId: job.id },
+        },
+      },
+    );
+
+    vi.advanceTimersByTime(5_000);
+    expect(manager.spawn).toHaveBeenCalledTimes(1);
+    expect(store.get(job.id)).toMatchObject({
+      lastStatus: "running",
+      pendingAgentId: agentId,
+      quotaModelChain: ["anthropic/claude-opus-4-6"],
+      quotaWait: wait,
+    });
+
+    scheduler.stop();
+    const restoredManager = makeMockManager();
+    restoredManager.spawn.mockReturnValue(agentId);
+    restoredManager.waitForCompletion = vi.fn(() => new Promise(() => {}));
+    scheduler = new SubagentScheduler();
+    scheduler.start(pi, ctx, restoredManager, store);
+
+    expect(restoredManager.spawn).not.toHaveBeenCalled();
+    expect(restoredManager.restoreQuotaWait).toHaveBeenCalledWith(
+      pi,
+      ctx,
+      expect.objectContaining({
+        id: agentId,
+        modelChain: ["anthropic/claude-opus-4-6"],
+        wait,
+        options: expect.objectContaining({ scheduleId: job.id }),
+      }),
+    );
+  });
+
+  it("keeps a one-shot enabled while its dispatch waits for quota", () => {
+    const wait = {
+      phase: "preflight" as const,
+      parkedAt: Date.now(),
+      deadlineAt: Date.now() + 600_000,
+      nextCheckAt: Date.now() + 60_000,
+      unknownPollAttempt: 0,
+      blocked: [{ modelId: "anthropic/claude-opus-4-6", window: "five_hour" }],
+      persistence: "schedule" as const,
+    };
+    manager.getRecord.mockReturnValue({ quotaWait: wait, promise: new Promise(() => {}) });
+    const job = scheduler.addJob({
+      name: "quota-once", description: "quota once", schedule: "+1s",
+      subagent_type: "general-purpose", prompt: "wait",
+    });
+
+    vi.advanceTimersByTime(1_000);
+
+    expect(store.get(job.id)?.enabled).toBe(true);
+  });
+
   it("fire passes bypassQueue: true to manager.spawn", () => {
     scheduler.addJob({
       name: "every-1s", description: "x", schedule: "1s",
@@ -324,6 +409,17 @@ describe("SubagentScheduler — fire path", () => {
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.bypassQueue).toBe(true);
     expect(optsArg.isBackground).toBe(true);
+  });
+
+  it("fire passes the persisted fallback chain to the manager", () => {
+    scheduler.addJob({
+      name: "every-1s", description: "x", schedule: "1s",
+      subagent_type: "general-purpose", prompt: "x",
+      fallbackModels: ["openai-codex/gpt-5.6-terra"],
+    });
+
+    vi.advanceTimersByTime(1_000);
+    expect(manager.spawn.mock.calls[0][4].fallbackModels).toEqual(["openai-codex/gpt-5.6-terra"]);
   });
 
   it("fire passes the job's configuration as the invocation snapshot", () => {

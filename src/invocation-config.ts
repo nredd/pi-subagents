@@ -56,6 +56,7 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
 
 interface AgentInvocationParams {
   model?: string;
+  fallback_models?: string[];
   thinking?: string;
   max_turns?: number;
   run_in_background?: boolean;

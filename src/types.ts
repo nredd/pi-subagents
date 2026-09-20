@@ -52,6 +52,15 @@ export interface AgentConfig {
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
   model?: string;
+  /**
+   * Ordered fallback model chain, highest-precedence source: `fallback_models:`
+   * frontmatter (YAML array or CSV). `undefined` = not declared here, defer to
+   * the caller's `fallback_models` parameter, then the global
+   * `quotaFallbackModels` setting. An explicit empty list (`[]`, or `none` in
+   * frontmatter) is itself a declaration — "no fallback for this agent" — and
+   * stops that fallthrough. See `resolveFallbackModelSpec` in fallback-models.ts.
+   */
+  fallbackModels?: string[];
   thinking?: ThinkingLevel;
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
@@ -153,6 +162,59 @@ export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
   | { kind: "tombstone"; entry: AgentTombstone };
 
+export interface QuotaBlockedModel {
+  modelId: string;
+  window: string;
+  resetAt?: number;
+}
+
+export interface QuotaWaitInfo {
+  phase: "preflight" | "mid-run" | "resume";
+  parkedAt: number;
+  deadlineAt: number;
+  nextCheckAt: number;
+  unknownPollAttempt: number;
+  blocked: QuotaBlockedModel[];
+  persistence: "session" | "schedule" | "process";
+}
+
+/** Serializable dispatch state needed to restore a parked quota wait. */
+export interface QuotaWaitDispatch {
+  version: 1;
+  id: string;
+  type: SubagentType;
+  prompt: string;
+  modelChain: string[];
+  wait: QuotaWaitInfo;
+  options: {
+    description: string;
+    name?: string;
+    resumeSessionFile?: string;
+    reclaim?: { handle: string; alias?: string };
+    maxTurns?: number;
+    isolated?: boolean;
+    inheritContext?: boolean;
+    thinkingLevel?: ThinkingLevel;
+    isBackground?: boolean;
+    isolation?: IsolationMode;
+    invocation?: AgentInvocation;
+    depth?: number;
+    maxSubagentDepth?: number;
+    configCwd?: string;
+    cwd?: string;
+    rootSessionId?: string;
+    scheduleId?: string;
+  };
+}
+
+export type QuotaWaitTransition = "parked" | "updated" | "released" | "cancelled" | "timed-out";
+
+export interface AgentQuotaWaitEvent {
+  transition: QuotaWaitTransition;
+  wait: QuotaWaitInfo;
+  dispatch: QuotaWaitDispatch;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -240,6 +302,12 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+  /** Canonical primary-first model chain snapshotted when this run was admitted. */
+  quotaModelChain?: string[];
+  /** Index of the model selected from `quotaModelChain`. */
+  quotaModelIndex?: number;
+  /** Present while this queued record is parked on included subscription quota. */
+  quotaWait?: QuotaWaitInfo;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
   /**
@@ -263,6 +331,8 @@ export interface AgentRecord {
    * `isTopLevelAgent`.
    */
   workflowId?: string;
+  /** Scheduled job that owns this dispatch, when fired by the scheduler. */
+  scheduleId?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
   /**
@@ -297,6 +367,14 @@ export interface AgentInvocation {
   requestedThinking?: EffectiveThinkingLevel;
   /** The caller's `model` parameter, as written, when an agent file's pin won. */
   requestedModel?: string;
+  /**
+   * Effective ordered fallback chain, resolved (canonical `provider/id`),
+   * scope-validated, and de-duplicated against the primary — the primary
+   * itself is NOT repeated here. Empty/undefined = no fallback chain for this
+   * spawn. Captured at spawn time, like the rest of this snapshot, for display
+   * and workflow journal purposes; see fallback-models.ts.
+   */
+  fallbackModels?: string[];
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -354,6 +432,8 @@ export interface ScheduledSubagent {
   subagent_type: SubagentType;
   prompt: string;
   model?: string;
+  /** Raw (unresolved) call-level fallback candidates — re-resolved at fire time against the registry as it then stands. */
+  fallbackModels?: string[];
   thinking?: ThinkingLevel;
   max_turns?: number;
   isolated?: boolean;
@@ -365,6 +445,14 @@ export interface ScheduledSubagent {
   createdAt: string;
   lastRun?: string;
   lastStatus?: "success" | "error" | "running";
+  /** Durable quota wait for the currently pending dispatch. */
+  quotaWait?: QuotaWaitInfo;
+  /** Agent id retained across scheduler reload while `quotaWait` is active. */
+  pendingAgentId?: string;
+  /** Canonical primary-first model chain captured for the pending dispatch. */
+  quotaModelChain?: string[];
+  /** Complete durable dispatch, including mid-run continuation state. */
+  quotaDispatch?: QuotaWaitDispatch;
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;

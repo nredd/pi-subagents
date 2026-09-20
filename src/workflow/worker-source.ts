@@ -301,6 +301,14 @@ function optionalText(value, what) {
   return requireText(value, what);
 }
 
+function optionalTextArray(value, what) {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.some(function (item) { return typeof item !== "string" || item.trim() === ""; })) {
+    throw new Error(what + " must be an array of non-empty strings.");
+  }
+  return Array.from(value);
+}
+
 /**
  * Reasoning effort a child may be spawned under — pi's \`ThinkingLevel\`.
  *
@@ -325,6 +333,7 @@ const AGENT_OPTIONS = [
   "label",
   "phase",
   "model",
+  "fallbackModels",
   "agentType",
   "isolation",
   "gate",
@@ -459,6 +468,7 @@ async function agentIn(scope, prompt, opts) {
   const label = optionalText(options.label, "agent() opts.label");
   const phaseName = optionalText(options.phase, "agent() opts.phase");
   const model = optionalText(options.model, "agent() opts.model");
+  const fallbackModels = optionalTextArray(options.fallbackModels, "agent() opts.fallbackModels");
   const agentType = optionalText(options.agentType, "agent() opts.agentType");
   const isolation = optionalText(options.isolation, "agent() opts.isolation");
   if (isolation !== undefined && isolation !== "worktree") {
@@ -496,6 +506,11 @@ async function agentIn(scope, prompt, opts) {
         "agent() opts.resume and opts.model are mutually exclusive: a resumed agent keeps the model it was started with."
       );
     }
+    if (fallbackModels !== undefined) {
+      throw new Error(
+        "agent() opts.resume and opts.fallbackModels are mutually exclusive: a resumed agent keeps the fallback chain it was started with."
+      );
+    }
     if (isolation !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.isolation are mutually exclusive: a resumed agent keeps the working tree it was started in."
@@ -527,6 +542,7 @@ async function agentIn(scope, prompt, opts) {
     prompt: text,
     label: label,
     model: model,
+    fallbackModels: fallbackModels,
     agentType: agentType,
     isolation: isolation,
     phaseIndex: phaseIndex,

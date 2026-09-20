@@ -23,7 +23,7 @@ import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
-import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentQuotaWaitEvent, AgentRecord, IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -41,6 +41,7 @@ export interface NewJobInput {
   subagent_type: SubagentType;
   prompt: string;
   model?: string;
+  fallbackModels?: string[];
   thinking?: ThinkingLevel;
   max_turns?: number;
   isolated?: boolean;
@@ -104,6 +105,7 @@ export class SubagentScheduler {
       subagent_type: input.subagent_type,
       prompt: input.prompt,
       model: input.model,
+      fallbackModels: input.fallbackModels,
       thinking: input.thinking,
       max_turns: input.max_turns,
       isolated: input.isolated,
@@ -170,6 +172,14 @@ export class SubagentScheduler {
     const store = this.store;
     if (!store) return;
     try {
+      if (
+        job.quotaWait
+        && job.pendingAgentId
+        && (job.quotaDispatch !== undefined || job.quotaModelChain?.length)
+      ) {
+        this.executeJob(job.id, true);
+        return;
+      }
       if (job.scheduleType === "interval" && job.intervalMs) {
         const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
         this.intervals.set(job.id, t);
@@ -177,13 +187,7 @@ export class SubagentScheduler {
         const target = new Date(job.schedule).getTime();
         const delay = target - Date.now();
         if (delay > 0) {
-          const t = setTimeout(() => {
-            this.executeJob(job.id);
-            // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
-            store.update(job.id, { enabled: false });
-            const updated = store.get(job.id);
-            if (updated) this.emit({ type: "updated", job: updated });
-          }, delay);
+          const t = setTimeout(() => this.executeJob(job.id), delay);
           this.intervals.set(job.id, t);
         } else {
           // Past timestamp — disable, mark error, never fire
@@ -218,7 +222,7 @@ export class SubagentScheduler {
    * queue), persist completion. Fire-and-forget: the timer tick returns
    * immediately so other jobs keep firing.
    */
-  private executeJob(id: string): void {
+  private executeJob(id: string, restoringQuotaWait = false): void {
     const store = this.store;
     const pi = this.pi;
     const ctx = this.ctx;
@@ -226,6 +230,7 @@ export class SubagentScheduler {
     if (!store || !pi || !ctx || !manager) return;
     const job = store.get(id);
     if (!job?.enabled) return;
+    if (job.quotaWait && !restoringQuotaWait) return;
 
     store.update(id, { lastStatus: "running" });
 
@@ -246,17 +251,25 @@ export class SubagentScheduler {
       // an Agent call — not a file deleted directly from a shell. The catch below turns
       // this into lastStatus: "error" plus an error event, like any other
       // fire-time failure.
-      const dispatch = resolveSpawnType(job.subagent_type);
-      if (!dispatch.ok) throw new Error(dispatch.message);
-      agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
+      if (restoringQuotaWait && job.quotaDispatch) {
+        agentId = manager.restoreQuotaWait(pi, ctx, job.quotaDispatch);
+      } else {
+        const dispatch = resolveSpawnType(job.subagent_type);
+        if (!dispatch.ok) throw new Error(dispatch.message);
+        agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
+        fallbackModels: job.fallbackModels,
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        scheduleId: job.id,
+        recordId: restoringQuotaWait ? job.pendingAgentId : undefined,
+        quotaModelChain: restoringQuotaWait ? job.quotaModelChain : undefined,
+        quotaWaitRestore: restoringQuotaWait ? job.quotaWait : undefined,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
         // The model is left out on purpose: agent-manager fills in the effective
@@ -269,27 +282,60 @@ export class SubagentScheduler {
           maxTurns: normalizeMaxTurns(job.max_turns),
           isolated: job.isolated,
           runInBackground: true,
-          isolation: job.isolation,
-        },
-      });
+            isolation: job.isolation,
+          },
+        });
+      }
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      const current = store.get(id);
+      const enabled = current?.scheduleType === "once" ? false : current?.enabled;
+      store.update(id, {
+        enabled,
+        lastRun: new Date().toISOString(),
+        lastStatus: "error",
+        quotaWait: undefined,
+        pendingAgentId: undefined,
+        quotaModelChain: undefined,
+        quotaDispatch: undefined,
+        runCount: (current?.runCount ?? 0) + 1,
+      });
       this.emit({ type: "error", jobId: id, error });
+      if (restoringQuotaWait) {
+        const updated = store.get(id);
+        if (updated?.enabled) this.scheduleJob(updated);
+      }
       return;
     }
 
-    this.emit({ type: "fired", jobId: id, agentId, name: job.name });
+    if (!restoringQuotaWait) this.emit({ type: "fired", jobId: id, agentId, name: job.name });
+    const spawnedRecord = manager.getRecord(agentId);
+    if (job.scheduleType === "once" && !spawnedRecord?.quotaWait) {
+      store.update(id, { enabled: false });
+      const updated = store.get(id);
+      if (updated) this.emit({ type: "updated", job: updated });
+    }
 
     const finalize = (status: "success" | "error") => {
+      const before = store.get(id);
+      if (!before || before.pendingAgentId !== undefined && before.pendingAgentId !== agentId) return;
+      const enabled = before.scheduleType === "once" ? false : before.enabled;
       const next = this.getNextRun(id);
       const current = store.get(id);
       store.update(id, {
+        enabled,
         lastRun: new Date().toISOString(),
         lastStatus: status,
+        quotaWait: undefined,
+        pendingAgentId: undefined,
+        quotaModelChain: undefined,
+        quotaDispatch: undefined,
         runCount: (current?.runCount ?? 0) + 1,
         nextRun: next,
       });
+      const updated = store.get(id);
+      if (restoringQuotaWait && updated?.enabled) this.scheduleJob(updated);
+      if (updated && before.scheduleType === "once") this.emit({ type: "updated", job: updated });
     };
 
     // AgentManager's promise resolves either way (its .catch returns ""), so we
@@ -297,14 +343,41 @@ export class SubagentScheduler {
     // Terminal states: completed/steered = success; error/aborted/stopped = error.
     // awaitStartup first: with isolation: "worktree" the run promise only exists
     // once the repo copy is made, and a failed copy rejects here.
-    manager.awaitStartup(agentId)
-      .then(() => manager.getRecord(agentId)?.promise)
-      .then(() => {
-        const r = manager.getRecord(agentId);
+    const waitForCompletion = typeof manager.waitForCompletion === "function"
+      ? manager.waitForCompletion(agentId)
+      : manager.awaitStartup(agentId).then(async () => {
+          const record = manager.getRecord(agentId);
+          if (record?.promise) await record.promise;
+          return record;
+        });
+    void waitForCompletion
+      .then((record) => {
+        const r = record ?? manager.getRecord(agentId);
         const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
         finalize(failed ? "error" : "success");
       })
       .catch(() => finalize("error"));
+  }
+
+  /** Persist manager-owned quota transitions for a scheduled dispatch. */
+  handleQuotaWait(record: AgentRecord, event: AgentQuotaWaitEvent): void {
+    const store = this.store;
+    if (!store || !record.scheduleId || event.wait.persistence !== "schedule") return;
+    const job = store.get(record.scheduleId);
+    if (!job) return;
+    if (event.transition === "parked" || event.transition === "updated") {
+      store.update(job.id, {
+        lastStatus: "running",
+        quotaWait: event.wait,
+        pendingAgentId: record.id,
+        quotaModelChain: event.dispatch.modelChain,
+        quotaDispatch: event.dispatch,
+      });
+      return;
+    }
+    if (event.transition === "released") {
+      store.update(job.id, { quotaWait: undefined, quotaDispatch: undefined });
+    }
   }
 
   private emit(event: ScheduleChangeEvent): void {

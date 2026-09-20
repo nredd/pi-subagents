@@ -146,6 +146,7 @@ function collectorFor(provider: string): SubscriptionCollector | undefined {
 export class SubscriptionUsageService {
   private readonly cache = new Map<string, SubscriptionUsageSnapshot>();
   private readonly lastManualRefreshAt = new Map<string, number>();
+  private readonly inFlight = new Map<string, Promise<SubscriptionUsageSnapshot>>();
 
   constructor(private readonly transport: SubscriptionUsageTransport = {
     fetch,
@@ -156,19 +157,25 @@ export class SubscriptionUsageService {
     },
   }) {}
 
-  async get(ctx: ExtensionContext, provider: string, options: { force?: boolean; signal?: AbortSignal } = {}): Promise<SubscriptionUsageResult> {
+  async get(ctx: ExtensionContext, provider: string, options: { force?: boolean; fresh?: boolean; signal?: AbortSignal } = {}): Promise<SubscriptionUsageResult> {
     const now = this.transport.now();
     const cached = this.cache.get(provider);
     const isManualRefresh = options.force === true;
-    if (!isManualRefresh && cached && cached.expiresAt > now) return { snapshot: cached, refreshed: false };
+    const needsFreshRead = isManualRefresh || options.fresh === true;
+    if (!needsFreshRead && cached && cached.expiresAt > now) return { snapshot: cached, refreshed: false };
     const lastManualRefreshAt = this.lastManualRefreshAt.get(provider) ?? 0;
     if (isManualRefresh && now - lastManualRefreshAt < MANUAL_REFRESH_INTERVAL_MS) {
       return { snapshot: this.withStale(cached, provider, now, "Manual refresh is limited to once per minute."), refreshed: false };
     }
     if (isManualRefresh) this.lastManualRefreshAt.set(provider, now);
+    if (options.signal?.aborted) {
+      return { snapshot: errorSnapshot(provider, "error", now, "Usage request was cancelled."), refreshed: false };
+    }
 
-    const snapshot = await this.fetchSnapshot(ctx, provider, now, options.signal);
-    if (snapshot.status === "available") this.cache.set(provider, snapshot);
+    const snapshot = await this.waitForCaller(this.refresh(ctx, provider, now), options.signal);
+    if (!snapshot) {
+      return { snapshot: errorSnapshot(provider, "error", now, "Usage request was cancelled."), refreshed: false };
+    }
     if (snapshot.status !== "available" && cached) {
       const stale = this.withStale(cached, provider, now, snapshot.message);
       this.cache.set(provider, stale);
@@ -183,7 +190,13 @@ export class SubscriptionUsageService {
     return cached.expiresAt > this.transport.now() ? cached : this.withStale(cached, provider, this.transport.now(), "Cached usage data is stale.");
   }
 
-  decisionFor(model: { provider: string; id: string }): { block: boolean; message?: string; snapshot?: SubscriptionUsageSnapshot } {
+  decisionFor(model: { provider: string; id: string }): {
+    block: boolean;
+    message?: string;
+    snapshot?: SubscriptionUsageSnapshot;
+    window?: string;
+    resetAt?: number;
+  } {
     const snapshot = this.peek(model.provider);
     if (!snapshot || snapshot.status !== "available") return { block: false, snapshot };
     const exhausted = snapshot.windows.find(window => window.usedPercent >= 100 && (
@@ -194,6 +207,8 @@ export class SubscriptionUsageService {
     return {
       block: true,
       snapshot,
+      window: exhausted.name,
+      resetAt: exhausted.resetAt,
       message: `Subscription quota blocked ${model.provider}/${model.id}: ${exhausted.name} is exhausted and resets ${reset}. Paid credits are not treated as subscription capacity.`,
     };
   }
@@ -212,7 +227,44 @@ export class SubscriptionUsageService {
     return { ...cached, status: "stale", expiresAt: now, message };
   }
 
-  private async fetchSnapshot(ctx: ExtensionContext, provider: string, now: number, signal?: AbortSignal): Promise<SubscriptionUsageSnapshot> {
+  private refresh(ctx: ExtensionContext, provider: string, now: number): Promise<SubscriptionUsageSnapshot> {
+    const existing = this.inFlight.get(provider);
+    if (existing) return existing;
+
+    const refresh = this.fetchSnapshot(ctx, provider, now)
+      .then(snapshot => {
+        if (snapshot.status === "available") this.cache.set(provider, snapshot);
+        return snapshot;
+      })
+      .finally(() => {
+        if (this.inFlight.get(provider) === refresh) this.inFlight.delete(provider);
+      });
+    this.inFlight.set(provider, refresh);
+    return refresh;
+  }
+
+  private async waitForCaller(
+    refresh: Promise<SubscriptionUsageSnapshot>,
+    signal: AbortSignal | undefined,
+  ): Promise<SubscriptionUsageSnapshot | undefined> {
+    if (!signal) return refresh;
+    if (signal.aborted) return undefined;
+
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (snapshot: SubscriptionUsageSnapshot | undefined) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        resolve(snapshot);
+      };
+      const abort = () => finish(undefined);
+      signal.addEventListener("abort", abort, { once: true });
+      void refresh.then(snapshot => finish(snapshot));
+    });
+  }
+
+  private async fetchSnapshot(ctx: ExtensionContext, provider: string, now: number): Promise<SubscriptionUsageSnapshot> {
     const collector = collectorFor(provider);
     if (!collector) return errorSnapshot(provider, "unavailable", now, "No subscription usage collector is installed for this provider.");
     let token: string | undefined;
@@ -229,9 +281,6 @@ export class SubscriptionUsageService {
       timedOut = true;
       controller.abort();
     }, REQUEST_TIMEOUT_MS);
-    const abort = () => controller.abort();
-    if (signal?.aborted) controller.abort();
-    else signal?.addEventListener("abort", abort, { once: true });
     try {
       const response = await this.transport.fetch(collector.url, {
         headers: collector.headers(token),
@@ -250,7 +299,6 @@ export class SubscriptionUsageService {
       return errorSnapshot(provider, "error", now, message);
     } finally {
       clearTimeout(timeout);
-      signal?.removeEventListener("abort", abort);
     }
   }
 }

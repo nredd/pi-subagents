@@ -99,6 +99,26 @@ describe("script globals", () => {
     expect(calls[0].label).toBe("hello");
   });
 
+  it("carries opts.fallbackModels to the spawn request", async () => {
+    const stub = stubHost();
+    const result = await run(
+      "return await agent('go', { fallbackModels: ['openai-codex/gpt-5.6-terra'] });",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(stub.calls[0].fallbackModels).toEqual(["openai-codex/gpt-5.6-terra"]);
+  });
+
+  it("rejects malformed opts.fallbackModels before spawning", async () => {
+    const stub = stubHost();
+    const result = await run("return await agent('go', { fallbackModels: [''] });", { host: stub.host });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("fallbackModels");
+    expect(stub.calls).toHaveLength(0);
+  });
+
   it("carries opts.effort to the spawn request", async () => {
     const { host, calls } = stubHost();
     const result = await run('await agent("deep", { effort: "xhigh" });\nreturn null;', { host });
@@ -940,7 +960,7 @@ describe("Claude Code option compatibility", () => {
   it("accepts every option a Claude Code script actually uses", async () => {
     const stub = stubHost();
     const result = await run(
-      "return await agent('go', { label: 'L', phase: 'P', agentType: 'general-purpose', model: 'haiku', effort: 'high', isolation: 'worktree' });",
+      "return await agent('go', { label: 'L', phase: 'P', agentType: 'general-purpose', model: 'haiku', fallbackModels: ['sonnet'], effort: 'high', isolation: 'worktree' });",
       { host: stub.host },
     );
 

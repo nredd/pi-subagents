@@ -415,6 +415,12 @@ export interface RunOptions {
    */
   resumeSessionFile?: string;
   /**
+   * Rebind an existing in-memory or persisted conversation to a newly created
+   * AgentSession. Used only for confirmed mid-run quota recovery, where the
+   * continuation keeps history but must select a different provider model.
+   */
+  resumeSessionManager?: SessionManager;
+  /**
    * True when another agent spawned this one. Only top-level agents get a
    * handle, so only they can be reopened by name — which is the whole reason
    * `rememberAgents` persists a session at all. A nested run's transcript would
@@ -959,12 +965,13 @@ export async function runAgent(
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
   const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
-  const sessionManager = options.resumeSessionFile
-    // Reopening an existing conversation: the file already carries its own
-    // header (cwd, parent) and history, so none of the create-time options
-    // apply. `sessionDir` still matters for a later /new or /branch off it.
-    ? SessionManager.open(options.resumeSessionFile, configuredSessionDir ?? defaultSessionDir)
-    : persistSession
+  const sessionManager = options.resumeSessionManager
+    ?? (options.resumeSessionFile
+      // Reopening an existing conversation: the file already carries its own
+      // header (cwd, parent) and history, so none of the create-time options
+      // apply. `sessionDir` still matters for a later /new or /branch off it.
+      ? SessionManager.open(options.resumeSessionFile, configuredSessionDir ?? defaultSessionDir)
+      : persistSession
       ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, {
           // Optional metadata — it only nests the subagent under its spawner in
           // `/resume`. Until `rememberAgents` this ran solely for the rare
@@ -973,7 +980,7 @@ export async function runAgent(
           // still persist rather than take the whole spawn down.
           parentSession: ctx.sessionManager?.getSessionFile?.(),
         })
-      : SessionManager.inMemory(effectiveCwd);
+        : SessionManager.inMemory(effectiveCwd));
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.

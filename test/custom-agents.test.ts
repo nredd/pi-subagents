@@ -769,6 +769,63 @@ All tools.`);
     expect(result.get("unrestricted")!.disallowedTools).toBeUndefined();
   });
 
+  it("parses fallback_models as a YAML array", () => {
+    writeAgent("chained", `---
+description: Chained
+fallback_models:
+  - openai-codex/gpt-5.6-terra
+  - anthropic/claude-sonnet-5
+---
+
+Chained.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("chained")!.fallbackModels).toEqual(["openai-codex/gpt-5.6-terra", "anthropic/claude-sonnet-5"]);
+  });
+
+  it("parses fallback_models as CSV", () => {
+    writeAgent("chained-csv", `---
+description: Chained CSV
+fallback_models: openai-codex/gpt-5.6-terra, anthropic/claude-sonnet-5
+---
+
+Chained.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("chained-csv")!.fallbackModels).toEqual(["openai-codex/gpt-5.6-terra", "anthropic/claude-sonnet-5"]);
+  });
+
+  it("leaves fallback_models undefined when omitted (falls through to caller/global)", () => {
+    writeAgent("no-chain", `---
+description: No chain
+---
+
+No chain.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("no-chain")!.fallbackModels).toBeUndefined();
+  });
+
+  it.each([
+    ["none", "fallback_models: none"],
+    ["empty string", "fallback_models: \"\""],
+    ["empty YAML list", "fallback_models: []"],
+  ])("parses fallback_models: %s as an explicit empty chain, not absence", (_name, line) => {
+    writeAgent("disabled-chain", `---
+description: Disabled chain
+${line}
+---
+
+Disabled.`);
+
+    const result = loadCustomAgents(tmpDir);
+    // [] (defined, empty) must be distinguishable from undefined (absent) by
+    // reference equality of "is this key present" — toEqual([]) confirms the
+    // value, and the important assertion is that it is NOT undefined.
+    expect(result.get("disabled-chain")!.fallbackModels).toEqual([]);
+    expect(result.get("disabled-chain")!.fallbackModels).not.toBeUndefined();
+  });
+
   it("parses memory scope", () => {
     writeAgent("rememberer", `---
 description: Agent with memory
@@ -1123,6 +1180,19 @@ Good body.`);
     // dropping it flips the ejected agent to background.
     it("preserves an explicit run_in_background: false instead of dropping it", () => {
       expect(roundTrip({ runInBackground: false }).runInBackground).toBe(false);
+    });
+
+    it("preserves a non-empty fallbackModels chain", () => {
+      expect(roundTrip({ fallbackModels: ["openai-codex/gpt-5.6-terra"] }).fallbackModels)
+        .toEqual(["openai-codex/gpt-5.6-terra"]);
+    });
+
+    it("preserves an explicit empty fallbackModels chain instead of dropping it to undefined", () => {
+      expect(roundTrip({ fallbackModels: [] }).fallbackModels).toEqual([]);
+    });
+
+    it("leaves fallbackModels unset when the config doesn't declare it", () => {
+      expect(roundTrip({}).fallbackModels).toBeUndefined();
     });
 
     it("leaves run_in_background unset when the config doesn't pin it", () => {
