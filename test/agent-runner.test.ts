@@ -2632,6 +2632,26 @@ describe("agent-runner turn limits", () => {
     expect(session.steer).not.toHaveBeenCalled();
   });
 
+  it("counts a quota continuation's turns on top of the prior run's (priorTurns)", async () => {
+    // 4 spent before the rebind + 3 here: soft limit at 5, hard abort at 5 + 2.
+    setGraceTurns(2);
+    const onTurnEnd = vi.fn();
+    const { session, result } = await runWithTurns(3, { maxTurns: 5, priorTurns: 4, onTurnEnd });
+    expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([5, 6, 7]);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+  });
+
+  it("keeps a soft limit crossed before the rebind latched, without re-steering", async () => {
+    setGraceTurns(2);
+    const { session, result } = await runWithTurns(2, { maxTurns: 5, priorTurns: 5 });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.steered).toBe(true);
+    expect(result.aborted).toBe(true);
+  });
+
   it("reports each turn to the caller's counter", async () => {
     const onTurnEnd = vi.fn();
     await runWithTurns(3, { maxTurns: 10, onTurnEnd });

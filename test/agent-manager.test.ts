@@ -32,6 +32,13 @@ const mockCtx = { cwd: "/tmp" } as any;
 
 const mockSession = () => ({ dispose: vi.fn() } as any);
 
+/**
+ * A snapshot that marks the provider's cache as fresh, so `warmQuota` has
+ * nothing to read. For stubs whose `get` stands in for a wait's recheck, not a
+ * pre-admission warm.
+ */
+const WARM = { status: "available" };
+
 const resolvedRun = () =>
   vi.mocked(runAgent).mockResolvedValue({
     responseText: "done",
@@ -47,7 +54,7 @@ describe("AgentManager — subscription quota", () => {
 
   it("stamps workflow ownership before the first usage message", async () => {
     const onUsage = vi.fn();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, onUsage);
+    manager = new AgentManager({ onUsage });
     const session = mockSession();
     vi.mocked(runAgent).mockImplementation(async (_pi, _type, _prompt, options) => {
       options.onSessionCreated?.(session);
@@ -70,7 +77,7 @@ describe("AgentManager — subscription quota", () => {
 
   it("reports the resolved session before its first usage message", async () => {
     const onSession = vi.fn();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onSession);
+    manager = new AgentManager({ onSession });
     const model = { provider: "openai-codex", id: "gpt-5.6-luna" } as any;
     const session = { ...mockSession(), model };
     vi.mocked(runAgent).mockImplementation(async (_pi, _type, _prompt, options) => {
@@ -95,7 +102,7 @@ describe("AgentManager — subscription quota", () => {
         message: "Subscription quota blocked anthropic/claude-sonnet-5",
       })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const model = { provider: "anthropic", id: "claude-sonnet-5" } as any;
     vi.mocked(runAgent).mockClear();
 
@@ -116,7 +123,7 @@ describe("AgentManager — subscription quota", () => {
         ? { block: true, message: "Subscription quota blocked anthropic/claude-sonnet-5" }
         : { block: false }),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const model = { provider: "anthropic", id: "claude-sonnet-5" } as any;
     const session = { ...mockSession(), model };
     vi.mocked(runAgent).mockResolvedValue({
@@ -196,7 +203,7 @@ describe("AgentManager — fallback model capture", () => {
         : { block: false }),
     };
     resolvedRun();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
       description: "test",
@@ -245,7 +252,7 @@ describe("AgentManager — fallback model capture", () => {
         options.onSessionCreated?.(fallbackSession);
         return { responseText: "done", session: fallbackSession, aborted: false, steered: false };
       });
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
       description: "test",
@@ -303,7 +310,7 @@ describe("AgentManager — fallback model capture", () => {
       options.onSessionCreated?.(fallbackSession);
       return { responseText: "done", session: fallbackSession, aborted: false, steered: false };
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any, events);
+    manager = new AgentManager({ maxConcurrent: 1, subscriptionUsage: quota as any, onQuotaWait: events });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
       description: "test",
@@ -349,7 +356,7 @@ describe("AgentManager — fallback model capture", () => {
         failure: "tool protocol failed",
       };
     });
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
       description: "test",
@@ -381,7 +388,7 @@ describe("AgentManager — fallback model capture", () => {
         failure: "429 rate limit exceeded",
       };
     });
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "original", {
       description: "test",
@@ -403,7 +410,7 @@ describe("AgentManager — fallback model capture", () => {
         window: "included",
       })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     expect(() => manager.spawn(mockPi, ctx, "general-purpose", "test", {
       description: "test",
@@ -455,7 +462,7 @@ describe("AgentManager — quota waiting", () => {
     };
     const onQuotaWait = vi.fn();
     resolvedRun();
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any, onQuotaWait);
+    manager = new AgentManager({ maxConcurrent: 1, subscriptionUsage: quota as any, onQuotaWait });
 
     const parkedId = manager.spawn(mockPi, ctx, "general-purpose", "parked", {
       description: "parked",
@@ -501,17 +508,9 @@ describe("AgentManager — quota waiting", () => {
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
     let dispatch: any;
-    const first = new AgentManager(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      quota as any,
-      (_record, event) => {
+    const first = new AgentManager({ subscriptionUsage: quota as any, onQuotaWait: (_record, event) => {
         if (event.transition === "parked") dispatch = event.dispatch;
-      },
+      } }
     );
     const id = first.spawn(mockPi, ctx, "general-purpose", "persist me", {
       description: "persist me",
@@ -522,7 +521,7 @@ describe("AgentManager — quota waiting", () => {
     await first.dispose();
 
     vi.setSystemTime(1_700_000_030_000);
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const restoredId = manager.restoreQuotaWait(mockPi, ctx, dispatch);
 
     expect(restoredId).toBe(id);
@@ -551,7 +550,7 @@ describe("AgentManager — quota waiting", () => {
       get: vi.fn(async () => { blocked = false; }),
     };
     resolvedRun();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const continuation = "Continue from the preserved conversation after the provider quota interruption.";
 
     const id = manager.restoreQuotaWait(mockPi, ctx, {
@@ -594,8 +593,8 @@ describe("AgentManager — quota waiting", () => {
     let blocked = false;
     const quota = {
       decisionFor: vi.fn(() => blocked
-        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000 }
-        : { block: false }),
+        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000, snapshot: WARM }
+        : { block: false, snapshot: WARM }),
       get: vi.fn(async () => { blocked = false; }),
     };
     const session = { ...mockSession(), model, sessionManager: { getSessionFile: () => "/sessions/agent.jsonl" } } as any;
@@ -604,7 +603,7 @@ describe("AgentManager — quota waiting", () => {
       return { responseText: "first", session, aborted: false, steered: false };
     });
     vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "continued" });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ maxConcurrent: 1, subscriptionUsage: quota as any });
     const id = manager.spawn(mockPi, ctx, "general-purpose", "first", {
       description: "resume later",
       isBackground: true,
@@ -631,8 +630,8 @@ describe("AgentManager — quota waiting", () => {
     let blocked = false;
     const quota = {
       decisionFor: vi.fn(() => blocked
-        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000 }
-        : { block: false }),
+        ? { block: true, message: "exhausted", window: "five_hour", resetAt: 1_700_000_060_000, snapshot: WARM }
+        : { block: false, snapshot: WARM }),
       get: vi.fn(async () => { blocked = false; }),
     };
     const session = { ...mockSession(), model, sessionManager: {} } as any;
@@ -641,7 +640,7 @@ describe("AgentManager — quota waiting", () => {
       return { responseText: "first", session, aborted: false, steered: false };
     });
     vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "continued" });
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const id = manager.spawn(mockPi, ctx, "general-purpose", "first", {
       description: "nested resume",
       parentAgentId: "parent",
@@ -665,10 +664,10 @@ describe("AgentManager — quota waiting", () => {
   it("fails a top-level foreground call immediately under wait-async", async () => {
     setQuotaExhaustionPolicy("wait-async");
     const quota = {
-      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour", snapshot: WARM })),
       get: vi.fn(),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     await expect(manager.spawnAndWait(mockPi, ctx, "general-purpose", "foreground", {
       description: "foreground",
@@ -684,15 +683,15 @@ describe("AgentManager — quota waiting", () => {
     let blocked = true;
     const quota = {
       decisionFor: vi.fn(() => blocked
-        ? { block: true, message: "exhausted", window: "five_hour" }
-        : { block: false }),
+        ? { block: true, message: "exhausted", window: "five_hour", snapshot: WARM }
+        : { block: false, snapshot: WARM }),
       get: vi.fn(async () => {
         blocked = false;
         return { snapshot: {}, refreshed: true };
       }),
     };
     resolvedRun();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
 
     const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "nested", {
       description: "nested",
@@ -716,15 +715,15 @@ describe("AgentManager — quota waiting", () => {
     const onComplete = vi.fn();
     const quota = {
       decisionFor: vi.fn(() => blocked
-        ? { block: true, message: "exhausted", window: "five_hour" }
-        : { block: false }),
+        ? { block: true, message: "exhausted", window: "five_hour", snapshot: WARM }
+        : { block: false, snapshot: WARM }),
       get: vi.fn(async () => {
         blocked = false;
         return { snapshot: {}, refreshed: true };
       }),
     };
     vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
-    manager = new AgentManager(onComplete, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ onComplete, subscriptionUsage: quota as any });
     const id = manager.spawn(mockPi, ctx, "general-purpose", "startup failure", {
       description: "startup failure",
       isBackground: true,
@@ -750,10 +749,10 @@ describe("AgentManager — quota waiting", () => {
     setQuotaWaitTimeoutMinutes(1);
     const onComplete = vi.fn();
     const quota = {
-      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour", snapshot: WARM })),
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
-    manager = new AgentManager(onComplete, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ onComplete, subscriptionUsage: quota as any });
 
     const id = manager.spawn(mockPi, ctx, "general-purpose", "timeout", {
       description: "timeout",
@@ -775,10 +774,10 @@ describe("AgentManager — quota waiting", () => {
     vi.setSystemTime(1_700_000_000_000);
     setQuotaExhaustionPolicy("wait-async");
     const quota = {
-      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour", snapshot: WARM })),
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "cancel", {
       description: "cancel",
       model,
@@ -799,10 +798,10 @@ describe("AgentManager — quota waiting", () => {
     vi.setSystemTime(1_700_000_000_000);
     setQuotaExhaustionPolicy("wait-async");
     const quota = {
-      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour", snapshot: WARM })),
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "cancel all", {
       description: "cancel all",
       model,
@@ -819,10 +818,10 @@ describe("AgentManager — quota waiting", () => {
     vi.setSystemTime(1_700_000_000_000);
     setQuotaExhaustionPolicy("wait-async");
     const quota = {
-      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
+      decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour", snapshot: WARM })),
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const waiting = manager.spawnAndWait(mockPi, ctx, "general-purpose", "dispose", {
       description: "dispose",
       model,
@@ -848,7 +847,7 @@ describe("AgentManager — quota waiting", () => {
       }),
     };
     resolvedRun();
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const id = manager.spawn(mockPi, ctx, "general-purpose", "wait for all", {
       description: "wait for all",
       isBackground: true,
@@ -873,7 +872,7 @@ describe("AgentManager — quota waiting", () => {
       decisionFor: vi.fn(() => ({ block: true, message: "exhausted", window: "five_hour" })),
       get: vi.fn(async () => ({ snapshot: {}, refreshed: true })),
     };
-    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, undefined, quota as any);
+    manager = new AgentManager({ subscriptionUsage: quota as any });
     const id = manager.spawn(mockPi, ctx, "general-purpose", "cancel", {
       description: "cancel",
       isBackground: true,
@@ -898,9 +897,9 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
 
   it("reproduces bug: onComplete fires with resultConsumed=false when set after await", async () => {
     let seenConsumed: boolean | undefined;
-    manager = new AgentManager((r) => {
+    manager = new AgentManager({ onComplete: (r) => {
       seenConsumed = r.resultConsumed;
-    });
+    } });
     resolvedRun();
 
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
@@ -919,9 +918,9 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
 
   it("fix: onComplete sees resultConsumed=true when pre-marked before await", async () => {
     let seenConsumed: boolean | undefined;
-    manager = new AgentManager((r) => {
+    manager = new AgentManager({ onComplete: (r) => {
       seenConsumed = r.resultConsumed;
-    });
+    } });
     resolvedRun();
 
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
@@ -939,9 +938,9 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
 
   it("normal case: onComplete fires with resultConsumed falsy when no explicit polling", async () => {
     let completedRecord: AgentRecord | undefined;
-    manager = new AgentManager((r) => {
+    manager = new AgentManager({ onComplete: (r) => {
       completedRecord = r;
-    });
+    } });
     resolvedRun();
 
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
@@ -956,9 +955,9 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
 
   it("onComplete IS called for foreground agents (lifecycle symmetry)", async () => {
     let completedRecord: AgentRecord | undefined;
-    manager = new AgentManager((r) => {
+    manager = new AgentManager({ onComplete: (r) => {
       completedRecord = r;
-    });
+    } });
     resolvedRun();
 
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
@@ -1057,7 +1056,7 @@ describe("AgentManager — spawnAndWait onSpawned + foreground output file wirin
     // The .then path is covered by the lifecycle-symmetry test above; this guards
     // the .catch path which lacks try/catch around onComplete (a known asymmetry).
     let completedRecord: AgentRecord | undefined;
-    manager = new AgentManager((r) => { completedRecord = r; });
+    manager = new AgentManager({ onComplete: (r) => { completedRecord = r; } });
     vi.mocked(runAgent).mockRejectedValue(new Error("agent failed"));
 
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
@@ -1151,7 +1150,7 @@ describe("AgentManager — nested runtime propagation", () => {
     // A parent holding the only slot and waiting on its own child would
     // otherwise deadlock: the child can never be drained from the queue.
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
       description: "parent",
@@ -1178,7 +1177,7 @@ describe("AgentManager — nested runtime propagation", () => {
     // pool as well would let one run fill it and starve everything else — and
     // the run itself is not in the pool to be drained behind them.
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     const holder = manager.spawn(mockPi, mockCtx, "general-purpose", "holder", {
       description: "holder",
@@ -1297,9 +1296,9 @@ describe("AgentManager — completion callbacks", () => {
   });
 
   it("does not let onComplete errors turn a completed agent into a failed run", async () => {
-    manager = new AgentManager(() => {
+    manager = new AgentManager({ onComplete: () => {
       throw new Error("stale extension context");
-    });
+    } });
     resolvedRun();
 
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
@@ -1350,7 +1349,7 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
 
   it("clearCompleted does not remove running or queued agents", async () => {
     // Use maxConcurrent=0 to keep agents queued, then spawn one running via foreground
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     // Mock runAgent to never resolve (keeps agent "running")
     vi.mocked(runAgent).mockImplementation(
@@ -1483,7 +1482,7 @@ describe("AgentManager — the usage hook fires once per assistant message", () 
 
   it("fires once per message, with the same delta the record accumulates", async () => {
     const seen: any[] = [];
-    manager = new AgentManager(undefined, undefined, undefined, undefined, (r, u) => seen.push({ id: r.id, u }));
+    manager = new AgentManager({ onUsage: (r, u) => seen.push({ id: r.id, u }) });
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
       opts.onAssistantUsage?.({ input: 100, output: 50, cacheWrite: 10, cost: 0.01 });
       opts.onAssistantUsage?.({ input: 200, output: 80, cacheWrite: 20, cost: 0.02 });
@@ -1508,7 +1507,7 @@ describe("AgentManager — the usage hook fires once per assistant message", () 
     // ancestor chain. If the hook sat below that walk — or if accounting read
     // the records it writes — one child message would be billed twice.
     const seen: any[] = [];
-    manager = new AgentManager(undefined, undefined, undefined, undefined, (_r, u) => seen.push(u));
+    manager = new AgentManager({ onUsage: (_r, u) => seen.push(u) });
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
       opts.onAssistantUsage?.({ input: 10, output: 5, cacheWrite: 0, cost: 0.001 });
       return { responseText: "done", session: mockSession(), aborted: false, steered: false };
@@ -1601,9 +1600,9 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
       return { responseText: "done", session: mockSession(), aborted: false, steered: false };
     });
 
-    manager = new AgentManager(undefined, undefined, undefined, (record, info) => {
+    manager = new AgentManager({ onCompact: (record, info) => {
       compactSeen.push({ count: record.compactionCount, reason: info.reason });
-    });
+    } });
 
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
@@ -1715,7 +1714,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     vi.mocked(runAgent).mockClear();
     resolvedRun();
 
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     const slowId = manager.spawn(mockPi, mockCtx, "X", "slow", {
       description: "slow", isBackground: true, isolation: "worktree",
     });
@@ -2153,7 +2152,7 @@ describe("AgentManager — abort() state machine", () => {
 
   it("removes a queued agent from the queue and marks it stopped", () => {
     // Concurrency=1: the second background spawn queues behind the first
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
 
     manager.spawn(mockPi, mockCtx, "X", "blocker", { description: "block", isBackground: true });
@@ -2332,7 +2331,7 @@ describe("AgentManager — abortAll", () => {
   afterEach(() => manager?.dispose());
 
   it("stops both queued and running agents and returns the total count", () => {
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
 
     const running = manager.spawn(mockPi, mockCtx, "X", "r", {
@@ -2378,7 +2377,7 @@ describe("AgentManager — hasRunning", () => {
   });
 
   it("is true when an agent is queued behind the concurrency limit", () => {
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
 
     manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
@@ -2450,7 +2449,7 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
 
   it("onComplete sees the error status (routes to subagents:failed in the host)", async () => {
     let completed: AgentRecord | undefined;
-    manager = new AgentManager((r) => { completed = r; });
+    manager = new AgentManager({ onComplete: (r) => { completed = r; } });
     failedRun("boom");
 
     const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "x", isBackground: true });
@@ -2546,7 +2545,7 @@ describe("AgentManager — pool slot accounting on settle", () => {
 
   it("a nested child settling does not free a pool slot it never held", async () => {
     const resolvers = controllableRuns();
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
       description: "parent", isBackground: true,
@@ -2574,7 +2573,7 @@ describe("AgentManager — pool slot accounting on settle", () => {
         rejectors.set(prompt as string, reject);
       }),
     );
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
       description: "parent", isBackground: true,
@@ -2597,7 +2596,7 @@ describe("AgentManager — pool slot accounting on settle", () => {
     // The other half of the rule — guards against over-correcting the fix into
     // "never decrement", which would wedge the queue permanently.
     const resolvers = controllableRuns();
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
       description: "parent", isBackground: true,
@@ -2626,7 +2625,7 @@ describe("AgentManager — drainQueue failure handling", () => {
     // be stranded forever — a hang, not an error.
     const { createWorktree } = await import("../src/worktree.js");
     const completed: AgentRecord[] = [];
-    manager = new AgentManager(r => { completed.push(r); }, 1);
+    manager = new AgentManager({ onComplete: r => { completed.push(r); }, maxConcurrent: 1 });
 
     let blocker: ((v: any) => void) | undefined;
     vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any) =>
@@ -2661,7 +2660,7 @@ describe("AgentManager — drainQueue failure handling", () => {
     // spawn() validated this cwd when it was still there. startAgent checks
     // again precisely because a queued agent can start minutes later (TOCTOU) —
     // that second check has never run in a test.
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     let blocker: ((v: any) => void) | undefined;
     vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any) =>
@@ -2691,7 +2690,7 @@ describe("AgentManager — drainQueue failure handling", () => {
 
   it("raising maxConcurrent releases queued agents immediately", async () => {
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
 
     manager.spawn(mockPi, mockCtx, "X", "a", { description: "a", isBackground: true });
     const bId = manager.spawn(mockPi, mockCtx, "X", "b", { description: "b", isBackground: true });
@@ -2702,7 +2701,7 @@ describe("AgentManager — drainQueue failure handling", () => {
   });
 
   it("setMaxConcurrent clamps to at least 1", () => {
-    manager = new AgentManager(undefined, 4);
+    manager = new AgentManager({ maxConcurrent: 4 });
     manager.setMaxConcurrent(0);
     expect(manager.getMaxConcurrent()).toBe(1);
   });
@@ -2787,7 +2786,7 @@ describe("AgentManager — waitForAll", () => {
       }),
     );
 
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     const ids = ["a", "b", "c"].map(p =>
       manager.spawn(mockPi, mockCtx, "X", p, { description: p, isBackground: true }),
     );
@@ -2921,7 +2920,7 @@ describe("AgentManager — background resume", () => {
 
   it("returns immediately with a running record + promise, then settles and fires onComplete", async () => {
     const onComplete = vi.fn();
-    manager = new AgentManager(onComplete);
+    manager = new AgentManager({ onComplete });
     const id = await spawnSettled(manager);
     onComplete.mockClear(); // drop the spawn's own completion
 
@@ -2947,7 +2946,7 @@ describe("AgentManager — background resume", () => {
 
   it("a failed final turn on a background resume maps to error and still notifies", async () => {
     const onComplete = vi.fn();
-    manager = new AgentManager(onComplete);
+    manager = new AgentManager({ onComplete });
     const id = await spawnSettled(manager);
     onComplete.mockClear();
 
@@ -2992,7 +2991,7 @@ describe("AgentManager — background resume", () => {
   });
 
   it("queues a background resume when the concurrency pool is full", async () => {
-    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    manager = new AgentManager({ maxConcurrent: 1 }); // maxConcurrent = 1
     const id = await spawnSettled(manager);
 
     // Occupy the single slot with a never-settling background spawn.
@@ -3013,7 +3012,7 @@ describe("AgentManager — background resume", () => {
 
   it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {
     const onComplete = vi.fn();
-    manager = new AgentManager(onComplete);
+    manager = new AgentManager({ onComplete });
     const id = await spawnSettled(manager);
     onComplete.mockClear();
 
@@ -3033,7 +3032,7 @@ describe("AgentManager — background resume", () => {
   // would report a failure and abort the children of a run still in progress.
   it("refuses to background-resume an agent whose run is still in flight", async () => {
     const onComplete = vi.fn();
-    manager = new AgentManager(onComplete);
+    manager = new AgentManager({ onComplete });
     const id = await spawnSettled(manager);
     onComplete.mockClear();
 
@@ -3059,7 +3058,7 @@ describe("AgentManager — background resume", () => {
   });
 
   it("refuses to background-resume an agent that is still queued", async () => {
-    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    manager = new AgentManager({ maxConcurrent: 1 }); // maxConcurrent = 1
     const id = await spawnSettled(manager);
 
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
@@ -3082,7 +3081,7 @@ describe("AgentManager — background resume", () => {
   // drops a queued record without reaching settle(), which is what tears that
   // subscription down.
   it("fires onStarted when the run starts, not when a queued resume is registered", async () => {
-    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    manager = new AgentManager({ maxConcurrent: 1 }); // maxConcurrent = 1
     const id = await spawnSettled(manager);
 
     // Occupy the only slot with a run we can release on demand.
@@ -3109,7 +3108,7 @@ describe("AgentManager — background resume", () => {
   });
 
   it("never fires onStarted for a queued resume that is stopped before it drains", async () => {
-    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    manager = new AgentManager({ maxConcurrent: 1 }); // maxConcurrent = 1
     const id = await spawnSettled(manager);
 
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));

@@ -30,6 +30,7 @@ describe("cross-extension RPC", () => {
     events = createEventBus();
     manager = {
       spawn: vi.fn().mockReturnValue("agent-42"),
+      warmQuota: vi.fn().mockResolvedValue(undefined),
       awaitStartup: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockReturnValue(true),
       getRecord: vi.fn().mockReturnValue({}),

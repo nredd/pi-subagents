@@ -182,7 +182,7 @@ describe("maxConcurrentForeground", () => {
   // full background pool must never block the main session's blocking work.
   it("is independent of the background pool, in both directions", async () => {
     controllableRuns();
-    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    manager = new AgentManager({ maxConcurrent: 1 }); // maxConcurrent = 1
     manager.setMaxConcurrentForeground(1);
 
     bg(manager, "bg1");
@@ -535,7 +535,7 @@ describe("maxConcurrentForeground", () => {
   // head must not stall background agents behind it.
   it("does not let a full foreground queue head-of-line-block the background pool", async () => {
     const resolvers = controllableRuns();
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     manager.setMaxConcurrentForeground(1);
 
     void fg(manager, "fg-holder");

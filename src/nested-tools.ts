@@ -80,6 +80,12 @@ export interface NestedAgentManager {
   ): string;
   /** Resolves once the spawned agent is running; rejects on a startup failure. */
   awaitStartup(id: string): Promise<void>;
+  /** Warm quota for the chain `spawn` will admit against (undefined when already warm); `spawnAndWait` does this itself. */
+  warmQuota(
+    ctx: ExtensionContext,
+    type: string,
+    options: Pick<NestedSpawnOptions, "model" | "fallbackModels" | "configCwd" | "signal">,
+  ): Promise<void> | undefined;
   spawnAndWait(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
@@ -339,6 +345,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // letting it escape into the child's turn.
       try {
         if (invocation.runInBackground) {
+          // `spawn` admits from cached quota; warm it so a cold cache cannot
+          // start a child on an exhausted provider.
+          await context.manager.warmQuota(ctx, resolvedType, { ...options, signal });
           const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
             ...options,
             isBackground: true,

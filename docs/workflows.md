@@ -240,7 +240,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku` |
-| `fallbackModels` | string[] | Explicit ordered quota fallbacks. `[]` disables agent/global fallbacks for this call |
+| `fallbackModels` | string[] | Explicit ordered quota fallbacks. Agent-definition `fallback_models` still win over this; `[]` only disables the global `quotaFallbackModels` for this call |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
@@ -249,7 +249,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `fallbackModels`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model chain and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `fallbackModels`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, fallback chain and tree it was started with, and its session predates the `StructuredOutput` tool. It continues on its session model; if quota blocks that model, it moves to the first usable model in its original chain (or waits, or fails, per `quotaExhaustionPolicy`).
 
 ### `pipeline()` and `parallel()`
 

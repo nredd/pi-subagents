@@ -20,18 +20,22 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type RunOptions, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import { getAgentConfig } from "./agent-types.js";
-import {
-  chooseQuotaModel,
-  getQuotaExhaustionPolicy,
-  getQuotaFallbackModels,
-  getQuotaWaitTimeoutMinutes,
-  resolveEffectiveFallbackModels,
-} from "./fallback-models.js";
 import { assignHandle, handleBase } from "./mention.js";
-import { describeModel, resolveModel } from "./model-resolver.js";
-import { nextQuotaCheckAt } from "./quota-wait.js";
-import { getSubscriptionUsageService, type SubscriptionUsageService } from "./subscription-usage.js";
+import { describeModel } from "./model-resolver.js";
+import {
+  allModelsBlockedMessage,
+  buildQuotaModelChain,
+  isQuotaFailure,
+  mayWaitForQuota,
+  QUOTA_CONTINUATION_PROMPT,
+  type QuotaChainSpec,
+  type QuotaModelChoice,
+  type QuotaUsage,
+  QuotaWaiter,
+  resolveQuotaModelIds,
+  warmProviders,
+} from "./quota-waiter.js";
+import { getSubscriptionUsageService } from "./subscription-usage.js";
 import type {
   AgentInvocation,
   AgentQuotaWaitEvent,
@@ -39,7 +43,6 @@ import type {
   AgentTombstone,
   IsolationMode,
   MentionResolution,
-  QuotaBlockedModel,
   QuotaWaitDispatch,
   QuotaWaitInfo,
   SubagentType,
@@ -89,8 +92,6 @@ const DEFAULT_MAX_CONCURRENT = 10;
  * cache (#253) — opt in; everyone else keeps today's behaviour exactly.
  */
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
-const QUOTA_FAILURE_PATTERN = /(?:\b429\b|quota|rate[ _-]?limit|too many requests|usage limit|credit balance)/i;
-const QUOTA_CONTINUATION_PROMPT = "Continue from the preserved conversation after the provider quota interruption. Do not restart the original task.";
 
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
@@ -184,7 +185,17 @@ function occupiesForegroundSlot(
 /** Which concurrency pool a spawn is charged to, if any. */
 type Pool = "background" | "foreground";
 
-interface SpawnArgs {
+/**
+ * When a `launch` runs relative to the `spawn()` that created the record.
+ * "immediate" is the same tick, so a startup failure can drop the record as if
+ * `spawn()` had thrown. "deferred" is later — a pool-queue drain or a quota
+ * wake — when someone already holds the id, so the failure must stay on the
+ * record as status "error".
+ */
+type LaunchTiming = "immediate" | "deferred";
+
+/** Everything a start needs, captured at spawn time. */
+export interface SpawnArgs {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
   type: SubagentType;
@@ -199,7 +210,7 @@ interface AgentRuntimeContext {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions {
   description: string;
   /**
    * Optional memorable name for this instance, becoming a second handle
@@ -346,25 +357,28 @@ interface SpawnOptions {
   quotaModels?: Model<any>[];
   /** Absolute wait state restored from durable storage. */
   quotaWaitRestore?: QuotaWaitInfo;
+  /**
+   * Turns already spent by the run this spawn continues. Set on a mid-run
+   * quota wait's options so a wait restored after a restart keeps counting
+   * against the original `maxTurns` instead of granting a fresh budget.
+   */
+  priorTurns?: number;
 }
 
-interface QuotaWaitStateBase {
-  args: SpawnArgs;
-  models: Model<any>[];
-  timer?: ReturnType<typeof setTimeout>;
+/** Lifecycle hooks and dependencies for an `AgentManager`. All optional. */
+export interface AgentManagerOptions {
+  onComplete?: OnAgentComplete;
+  /** Max concurrent background agents. Default {@link DEFAULT_MAX_CONCURRENT}. */
+  maxConcurrent?: number;
+  onStart?: OnAgentStart;
+  onCompact?: OnAgentCompact;
+  onUsage?: OnAgentUsage;
+  onSession?: OnAgentSession;
+  /** Quota source for admission and waits. Default: the process-wide service. */
+  subscriptionUsage?: QuotaUsage;
+  /** Every quota-wait transition (parked, updated, released, cancelled, timed-out). */
+  onQuotaWait?: OnAgentQuotaWait;
 }
-
-interface PreflightQuotaWaitState extends QuotaWaitStateBase {
-  kind: "preflight";
-  release: () => void;
-}
-
-interface MidRunQuotaWaitState extends QuotaWaitStateBase {
-  kind: "mid-run";
-  resolve: (selection: { model: Model<any>; index: number } | undefined) => void;
-}
-
-type QuotaWaitState = PreflightQuotaWaitState | MidRunQuotaWaitState;
 
 interface ResumeOptions {
   /**
@@ -431,7 +445,9 @@ export class AgentManager {
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
   private onSession?: OnAgentSession;
-  private onQuotaWait?: OnAgentQuotaWait;
+  private readonly subscriptionUsage: QuotaUsage;
+  /** Parked quota waits; see quota-waiter.ts for what lives on which side. */
+  private readonly quota: QuotaWaiter;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -476,29 +492,27 @@ export class AgentManager {
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
   private runningForeground = 0;
-  /** Preflight waits own no concurrency slot and are not part of the ordinary pool queue. */
-  private quotaWaits = new Map<string, QuotaWaitState>();
   /** Runtime-only spawn context needed to park a detached resume safely. */
   private runtimeContexts = new Map<string, AgentRuntimeContext>();
 
-  constructor(
-    onComplete?: OnAgentComplete,
-    maxConcurrent = DEFAULT_MAX_CONCURRENT,
-    onStart?: OnAgentStart,
-    onCompact?: OnAgentCompact,
-    onUsage?: OnAgentUsage,
-    onSession?: OnAgentSession,
-    private readonly subscriptionUsage: Pick<SubscriptionUsageService, "decisionFor"> &
-      Partial<Pick<SubscriptionUsageService, "get">> = getSubscriptionUsageService(),
-    onQuotaWait?: OnAgentQuotaWait,
-  ) {
-    this.onComplete = onComplete;
-    this.onStart = onStart;
-    this.onCompact = onCompact;
-    this.onUsage = onUsage;
-    this.onSession = onSession;
-    this.onQuotaWait = onQuotaWait;
-    this.maxConcurrent = maxConcurrent;
+  constructor(options: AgentManagerOptions = {}) {
+    this.onComplete = options.onComplete;
+    this.onStart = options.onStart;
+    this.onCompact = options.onCompact;
+    this.onUsage = options.onUsage;
+    this.onSession = options.onSession;
+    this.maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+    this.subscriptionUsage = options.subscriptionUsage ?? getSubscriptionUsageService();
+    const onQuotaWait = options.onQuotaWait;
+    this.quota = new QuotaWaiter(this.subscriptionUsage, {
+      getRecord: id => this.agents.get(id),
+      armQueuedAbort: (id, signal) => this.armQueuedAbort(id, signal),
+      startParked: (record, args, release) => this.startParked(record, args, release),
+      completed: record => {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      },
+      onTransition: onQuotaWait,
+    });
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
@@ -585,309 +599,57 @@ export class AgentManager {
     return this.agents.get(record.id)?.status === "running";
   }
 
-  private mayWaitForQuota(options: SpawnOptions): boolean {
-    if (getQuotaExhaustionPolicy() !== "wait-async") return false;
-    if (options.parentAgentId !== undefined || options.workflowId !== undefined) return true;
-    return options.blocking !== true;
-  }
-
-  private allModelsBlockedMessage(
-    blocked: ReadonlyArray<{ model: Model<any>; decision: { resetAt?: number } }>,
-    earliestResetAt: number | undefined,
-  ): string {
-    const modelIds = blocked.map(({ model }) => describeModel(model).modelId).join(", ");
-    const reset = earliestResetAt === undefined
-      ? "an unknown reset time"
-      : new Date(earliestResetAt).toISOString();
-    return `Subscription quota blocked dispatch: all configured models are blocked by fresh included quota (${modelIds}); earliest reset is ${reset}.`;
-  }
-
-  private quotaWaitDispatch(
-    record: AgentRecord,
-    state: Pick<QuotaWaitState, "args" | "models">,
-    wait: QuotaWaitInfo,
-  ): QuotaWaitDispatch {
-    const options = state.args.options;
-    return {
-      version: 1,
+  /**
+   * Put a not-yet-started record on its pool's queue. `release` fires once the
+   * queued start settles (see `queue`).
+   */
+  private enqueue(record: AgentRecord, args: SpawnArgs, pool: Pool, release: () => void): void {
+    record.status = "queued";
+    this.queue.push({
       id: record.id,
-      type: state.args.type,
-      prompt: state.args.prompt,
-      modelChain: state.models.map(model => describeModel(model).modelId),
-      wait: { ...wait, blocked: wait.blocked.map(item => ({ ...item })) },
-      options: {
-        description: options.description,
-        name: options.name,
-        resumeSessionFile: options.resumeSessionFile,
-        reclaim: record.handle
-          ? { handle: record.handle, alias: record.alias }
-          : options.reclaim ? { ...options.reclaim } : undefined,
-        maxTurns: options.maxTurns,
-        isolated: options.isolated,
-        inheritContext: options.inheritContext,
-        thinkingLevel: options.thinkingLevel,
-        isBackground: options.isBackground,
-        isolation: options.isolation,
-        invocation: options.invocation ? { ...options.invocation } : undefined,
-        depth: options.depth,
-        maxSubagentDepth: options.maxSubagentDepth,
-        configCwd: options.configCwd,
-        cwd: options.cwd ?? undefined,
-        rootSessionId: options.rootSessionId,
-        scheduleId: options.scheduleId,
-      },
-    };
-  }
-
-  private emitQuotaWait(
-    record: AgentRecord,
-    state: Pick<QuotaWaitState, "args" | "models">,
-    transition: AgentQuotaWaitEvent["transition"],
-    wait: QuotaWaitInfo,
-  ): void {
-    try {
-      this.onQuotaWait?.(record, {
-        transition,
-        wait: { ...wait, blocked: wait.blocked.map(item => ({ ...item })) },
-        dispatch: this.quotaWaitDispatch(record, state, wait),
-      });
-    } catch { /* ignore wait-observer errors */ }
-  }
-
-  private parkForQuota(
-    record: AgentRecord,
-    args: SpawnArgs,
-    models: Model<any>[],
-    blockedDecisions: ReadonlyArray<{
-      model: Model<any>;
-      decision: { window?: string; resetAt?: number };
-    }>,
-  ): void {
-    const now = Date.now();
-    const restored = args.options.quotaWaitRestore;
-    const parkedAt = restored?.parkedAt ?? now;
-    const deadlineAt = restored?.deadlineAt ?? parkedAt + getQuotaWaitTimeoutMinutes() * 60_000;
-    const unknownPollAttempt = restored?.unknownPollAttempt ?? 0;
-    const blocked = this.describeBlockedModels(blockedDecisions);
-    const nextCheckAt = nextQuotaCheckAt({
-      now,
-      deadline: deadlineAt,
-      unknownPollAttempt,
-      blocked,
+      pool,
+      start: () => this.launch(record.id, record, args, "deferred"),
+      release,
     });
-
-    record.status = "queued";
-    let release!: () => void;
-    record.startGate = new Promise<void>(resolve => { release = resolve; });
-    if (!this.armQueuedAbort(record.id, args.options.signal)) {
-      record.startGate = undefined;
-      release();
-      return;
-    }
-    record.quotaWait = {
-      phase: restored?.phase ?? "preflight",
-      parkedAt,
-      deadlineAt,
-      nextCheckAt,
-      unknownPollAttempt,
-      blocked,
-      persistence: args.options.scheduleId !== undefined
-        ? "schedule"
-        : args.options.parentAgentId !== undefined || args.options.workflowId !== undefined
-          ? "process"
-          : "session",
-    };
-    const state: PreflightQuotaWaitState = { kind: "preflight", args, models, release };
-    this.quotaWaits.set(record.id, state);
-    this.emitQuotaWait(record, state, "parked", record.quotaWait);
-    if (now >= deadlineAt) {
-      this.finishQuotaTimeout(record.id, record, state);
-      return;
-    }
-    this.scheduleQuotaWake(record.id, state);
+    args.options.onQueued?.(record.id, this.queue.filter(entry => entry.pool === pool).length - 1);
   }
 
-  private parkMidRunQuota(
-    record: AgentRecord,
-    args: SpawnArgs,
-    models: Model<any>[],
-    blockedDecisions: ReadonlyArray<{
-      model: Model<any>;
-      decision: { window?: string; resetAt?: number };
-    }>,
-    phase: QuotaWaitInfo["phase"] = "mid-run",
-  ): Promise<{ model: Model<any>; index: number } | undefined> {
-    const parkedAt = Date.now();
-    const deadlineAt = parkedAt + getQuotaWaitTimeoutMinutes() * 60_000;
-    const blocked = this.describeBlockedModels(blockedDecisions);
-    record.status = "queued";
-    record.quotaWait = {
-      phase,
-      parkedAt,
-      deadlineAt,
-      nextCheckAt: nextQuotaCheckAt({
-        now: parkedAt,
-        deadline: deadlineAt,
-        unknownPollAttempt: 0,
-        blocked,
-      }),
-      unknownPollAttempt: 0,
-      blocked,
-      persistence: args.options.scheduleId !== undefined
-        ? "schedule"
-        : args.options.resumeSessionFile !== undefined && isTopLevelAgent(args.options)
-          ? "session"
-          : "process",
-    };
-    return new Promise(resolve => {
-      const state: MidRunQuotaWaitState = { kind: "mid-run", args, models, resolve };
-      this.quotaWaits.set(record.id, state);
-      this.emitQuotaWait(record, state, "parked", record.quotaWait!);
-      this.scheduleQuotaWake(record.id, state);
-    });
-  }
-
-  private describeBlockedModels(
-    blocked: ReadonlyArray<{
-      model: Model<any>;
-      decision: { window?: string; resetAt?: number };
-    }>,
-  ): QuotaBlockedModel[] {
-    return blocked.map(({ model, decision }) => ({
-      modelId: describeModel(model).modelId,
-      window: decision.window ?? "included quota",
-      resetAt: decision.resetAt,
-    }));
-  }
-
-  private scheduleQuotaWake(id: string, state: QuotaWaitState): void {
-    const record = this.agents.get(id);
-    if (!record?.quotaWait || this.quotaWaits.get(id) !== state) return;
-    const delay = Math.max(0, record.quotaWait.nextCheckAt - Date.now());
-    const timerDelay = Math.min(delay, 2_147_483_647);
-    state.timer = setTimeout(() => {
-      state.timer = undefined;
-      void this.wakeQuotaWait(id, state);
-    }, timerDelay);
-    state.timer.unref();
-  }
-
-  private async wakeQuotaWait(id: string, state: QuotaWaitState): Promise<void> {
-    const record = this.agents.get(id);
-    if (!record?.quotaWait || record.status !== "queued" || this.quotaWaits.get(id) !== state) return;
-    const now = Date.now();
-    if (now >= record.quotaWait.deadlineAt) {
-      this.finishQuotaTimeout(id, record, state);
-      return;
-    }
-    // A wait beyond Node's maximum timer range is re-armed without refreshing.
-    if (now < record.quotaWait.nextCheckAt) {
-      this.scheduleQuotaWake(id, state);
-      return;
-    }
-
-    if (this.subscriptionUsage.get) {
-      const providers = [...new Set(state.models.map(model => model.provider))];
-      await Promise.all(providers.map(provider => this.subscriptionUsage.get!(
-        state.args.ctx,
-        provider,
-        { fresh: true, signal: record.abortController?.signal },
-      ).catch(() => undefined)));
-    }
-
-    if (!record.quotaWait || record.status !== "queued" || this.quotaWaits.get(id) !== state) return;
-    const selection = chooseQuotaModel(state.models, candidate => this.subscriptionUsage.decisionFor(candidate));
-    if (selection.selected) {
-      record.quotaModelIndex = selection.selectedIndex;
-      state.args.options.model = selection.selected;
-      if (state.kind === "preflight") {
-        this.startQuotaWait(id, record, state);
-      } else {
-        if (state.timer) clearTimeout(state.timer);
-        this.quotaWaits.delete(id);
-        const wait = record.quotaWait;
-        if (wait) this.emitQuotaWait(record, state, "released", wait);
-        record.quotaWait = undefined;
-        state.resolve({ model: selection.selected, index: selection.selectedIndex ?? 0 });
-      }
-      return;
-    }
-
-    const checkedAt = Date.now();
-    if (checkedAt >= record.quotaWait.deadlineAt) {
-      this.finishQuotaTimeout(id, record, state);
-      return;
-    }
-    const blocked = this.describeBlockedModels(selection.blocked);
-    const unknownPollAttempt = record.quotaWait.unknownPollAttempt + 1;
-    record.quotaWait = {
-      ...record.quotaWait,
-      blocked,
-      unknownPollAttempt,
-      nextCheckAt: nextQuotaCheckAt({
-        now: checkedAt,
-        deadline: record.quotaWait.deadlineAt,
-        unknownPollAttempt,
-        blocked,
-      }),
-    };
-    this.emitQuotaWait(record, state, "updated", record.quotaWait);
-    this.scheduleQuotaWake(id, state);
-  }
-
-  private startQuotaWait(id: string, record: AgentRecord, state: PreflightQuotaWaitState): void {
-    if (state.timer) clearTimeout(state.timer);
-    this.quotaWaits.delete(id);
-    const wait = record.quotaWait;
-    if (wait) this.emitQuotaWait(record, state, "released", wait);
-    record.quotaWait = undefined;
+  /**
+   * `QuotaWaiterHost.startParked`: a preflight wait found a usable model. A
+   * parked record held no slot, so it goes through the same pool check as a
+   * fresh spawn — waking into a full pool queues it rather than oversubscribing.
+   */
+  private startParked(record: AgentRecord, args: SpawnArgs, release: () => void): void {
     const pool = this.poolFor(record);
-    if (pool !== undefined && !state.args.options.bypassQueue && !this.poolHasRoom(pool)) {
-      record.status = "queued";
-      this.queue.push({
-        id,
-        pool,
-        start: () => this.launch(id, record, state.args, pool),
-        release: state.release,
-      });
-      state.args.options.onQueued?.(id, this.queue.filter(entry => entry.pool === pool).length - 1);
+    if (pool !== undefined && !args.options.bypassQueue && !this.poolHasRoom(pool)) {
+      this.enqueue(record, args, pool, release);
       return;
     }
-    void this.launch(id, record, state.args, "quota").then(state.release, state.release);
+    void this.launch(record.id, record, args, "deferred").then(release, release);
   }
 
-  private finishQuotaTimeout(id: string, record: AgentRecord, state: QuotaWaitState): void {
-    if (state.timer) clearTimeout(state.timer);
-    if (this.quotaWaits.get(id) !== state) return;
-    this.quotaWaits.delete(id);
-    const wait = record.quotaWait;
-    if (wait) this.emitQuotaWait(record, state, "timed-out", wait);
-    record.quotaWait = undefined;
-    record.status = "error";
-    record.error = `Subscription quota wait timed out after ${getQuotaWaitTimeoutMinutes()} minute(s).`;
-    record.completedAt = Date.now();
-    if (state.kind === "mid-run") {
-      state.resolve(undefined);
-      return;
+  /**
+   * Warm the usage cache for every provider in the chain a spawn with these
+   * options would be admitted against, so the synchronous `spawn()` that
+   * follows decides from real data rather than failing open on a cold or
+   * expired cache. Not a fresh read: a still-valid cache entry is reused.
+   *
+   * Returns undefined, synchronously, when the whole chain is already warm
+   * (see `warmProviders`). Never rejects; a failed read just leaves that
+   * provider undecided.
+   */
+  warmQuota(
+    ctx: ExtensionContext,
+    type: SubagentType,
+    options: QuotaChainSpec & { signal?: AbortSignal },
+  ): Promise<void> | undefined {
+    let models: Model<any>[];
+    try {
+      models = buildQuotaModelChain(ctx, type, options).models;
+    } catch {
+      return undefined;
     }
-    if (!record.isBackground) record.resultConsumed = true;
-    state.release();
-    try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-  }
-
-  private cancelQuotaWait(id: string, notify = true): boolean {
-    const state = this.quotaWaits.get(id);
-    if (!state) return false;
-    if (state.timer) clearTimeout(state.timer);
-    this.quotaWaits.delete(id);
-    const record = this.agents.get(id);
-    if (record?.quotaWait) {
-      if (notify) this.emitQuotaWait(record, state, "cancelled", record.quotaWait);
-      record.quotaWait = undefined;
-    }
-    if (state.kind === "preflight") state.release();
-    else state.resolve(undefined);
-    return true;
+    return warmProviders(this.subscriptionUsage, ctx, models, options.signal);
   }
 
   /**
@@ -910,70 +672,30 @@ export class AgentManager {
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
+    const id = options.recordId ?? randomUUID().slice(0, 17);
+    if (this.agents.has(id)) throw new Error(`Agent ${id} already exists.`);
 
-    // The parent tool warms the service asynchronously. Every other dispatch
-    // route still funnels through here, so fresh cached included-quota state is
-    // enforced consistently before a record, queue position or worktree exists.
-    const agentConfig = getAgentConfig(type);
-    const configuredModel = agentConfig?.model;
-    const resolvedConfigured = configuredModel ? resolveModel(configuredModel, ctx.modelRegistry) : undefined;
-    const defaultPrimary = options.model
-      ?? (typeof resolvedConfigured === "string" ? undefined : resolvedConfigured)
-      ?? ctx.model;
-    const modelChain: Model<any>[] = [];
-
-    if (options.quotaModelChain !== undefined) {
-      if (!ctx.modelRegistry) throw new Error("Cannot restore quota wait without a model registry.");
-      for (const modelId of options.quotaModelChain) {
-        const resolved = resolveModel(modelId, ctx.modelRegistry);
-        if (typeof resolved !== "string") modelChain.push(resolved);
-      }
-      if (modelChain.length === 0) {
-        throw new Error("Persisted quota wait has no currently available model.");
-      }
-    } else {
-      if (defaultPrimary) modelChain.push(defaultPrimary);
-      const globalFallbackModels = getQuotaFallbackModels();
-      const hasFallbackDeclaration = agentConfig?.fallbackModels !== undefined
-        || options.fallbackModels !== undefined
-        || globalFallbackModels !== undefined;
-      if (hasFallbackDeclaration && defaultPrimary && ctx.modelRegistry) {
-        const resolvedFallbacks = resolveEffectiveFallbackModels({
-          primaryModel: defaultPrimary,
-          sources: {
-            agentFrontmatter: agentConfig?.fallbackModels,
-            call: options.fallbackModels,
-            global: globalFallbackModels,
-          },
-          modelRegistry: ctx.modelRegistry,
-          cwd: options.configCwd ?? ctx.cwd,
-        });
-        options.invocation = {
-          ...options.invocation,
-          fallbackModels: resolvedFallbacks.fallbackModels,
-        };
-        for (const warning of resolvedFallbacks.warnings) {
-          ctx.ui?.notify?.(warning, "warning");
-        }
-        for (const modelId of resolvedFallbacks.fallbackModels) {
-          const resolved = resolveModel(modelId, ctx.modelRegistry);
-          if (typeof resolved !== "string") modelChain.push(resolved);
-        }
-      }
+    // Admission decides from CACHED quota state, synchronously, before a
+    // record, queue position or worktree exists. A cold or expired cache fails
+    // open here, so every dispatch route awaits `warmQuota` first (spawnAndWait
+    // and resume do it themselves); only the synchronous manager-registry
+    // `spawn` cannot.
+    const chain = buildQuotaModelChain(ctx, type, options);
+    if (chain.fallbackModels !== undefined) {
+      options.invocation = { ...options.invocation, fallbackModels: chain.fallbackModels };
     }
-
-    const quotaSelection = chooseQuotaModel(modelChain, candidate => this.subscriptionUsage.decisionFor(candidate));
+    for (const warning of chain.warnings) ctx.ui?.notify?.(warning, "warning");
+    const modelChain = chain.models;
+    const quotaSelection = this.quota.select(modelChain);
     const allModelsBlocked = modelChain.length > 0 && !quotaSelection.selected;
-    if (allModelsBlocked && !this.mayWaitForQuota(options)) {
-      throw new Error(this.allModelsBlockedMessage(quotaSelection.blocked, quotaSelection.earliestResetAt));
+    if (allModelsBlocked && !mayWaitForQuota(options)) {
+      throw new Error(allModelsBlockedMessage(quotaSelection.blocked, quotaSelection.earliestResetAt));
     }
     if (quotaSelection.selected) options.model = quotaSelection.selected;
     options.quotaModels = modelChain;
     const quotaModelChain = modelChain.map(candidate => describeModel(candidate).modelId);
     const quotaModelIndex = quotaSelection.selectedIndex;
 
-    const id = options.recordId ?? randomUUID().slice(0, 17);
-    if (this.agents.has(id)) throw new Error(`Agent ${id} already exists.`);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -1032,7 +754,7 @@ export class AgentManager {
     this.runtimeContexts.set(id, { pi, ctx, type, options });
 
     if (allModelsBlocked) {
-      this.parkForQuota(record, args, modelChain, quotaSelection.blocked);
+      this.quota.parkPreflight(record, args, modelChain, quotaSelection.blocked);
       return id;
     }
 
@@ -1047,21 +769,19 @@ export class AgentManager {
       if (!this.armQueuedAbort(id, options.signal)) return id;
       let release!: () => void;
       record.startGate = new Promise<void>(resolve => { release = resolve; });
-      this.queue.push({
-        id,
-        pool,
-        start: () => this.launch(id, record, args, pool),
-        release: () => release(),
-      });
-      options.onQueued?.(id, this.queue.filter(e => e.pool === pool).length - 1);
+      this.enqueue(record, args, pool, () => release());
       return id;
     }
 
-    this.launch(id, record, args, undefined);
+    this.launch(id, record, args, "immediate");
     return id;
   }
 
-  /** Restore one validated, serializable wait from session or schedule storage. */
+  /**
+   * Restore one validated, serializable wait from session or schedule storage.
+   * Idempotent: a dispatch whose id already has a record (restored earlier, or
+   * never torn down) returns that id rather than parking a second copy.
+   */
   restoreQuotaWait(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
@@ -1081,6 +801,11 @@ export class AgentManager {
     ]) {
       if (!Number.isFinite(value) || value < 0) throw new Error("Persisted quota wait has invalid timing state.");
     }
+    const priorTurns = dispatch.options.priorTurns;
+    if (priorTurns !== undefined && (!Number.isInteger(priorTurns) || priorTurns < 0)) {
+      throw new Error("Persisted quota wait has an invalid turn count.");
+    }
+    if (this.agents.has(dispatch.id)) return dispatch.id;
     return this.spawn(pi, ctx, dispatch.type, dispatch.prompt, {
       ...dispatch.options,
       model: undefined,
@@ -1128,19 +853,18 @@ export class AgentManager {
    * promise never rejects — the failure is delivered through `awaitStartup`,
    * and to the record.
    *
-   * @param queuedPool - The pool this start was queued on, `"quota"` for a
-   *   delayed quota wake that owned no pool, or undefined for an immediate
-   *   start. A delayed start can be minutes after `spawn()` returned, so a
-   *   failure has to live on the record as status "error". An immediate start
-   *   instead drops the record, exactly as the throw out of `spawn()` did: no
-   *   orphan in `listAgents()`, and the handle goes back.
+   * @param timing - See {@link LaunchTiming}. A deferred start can be minutes
+   *   after `spawn()` returned, so a failure has to live on the record as
+   *   status "error". An immediate start instead drops the record, exactly as
+   *   the throw out of `spawn()` did: no orphan in `listAgents()`, and the
+   *   handle goes back.
    */
-  private launch(id: string, record: AgentRecord, args: SpawnArgs, queuedPool: Pool | "quota" | undefined): Promise<void> {
+  private launch(id: string, record: AgentRecord, args: SpawnArgs, timing: LaunchTiming): Promise<void> {
     const startup = this.startAgent(id, record, args).then(
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
+        if (timing === "deferred") {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
@@ -1276,11 +1000,13 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
+    let turnsUsed = options.priorTurns ?? 0;
     const runOptions: RunOptions = {
       pi,
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
+      priorTurns: options.priorTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
@@ -1303,7 +1029,12 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onTurnEnd: options.onTurnEnd,
+      // Cumulative across quota rebinds (see `priorTurns`), so this is also
+      // what the next rebind starts counting from.
+      onTurnEnd: (turnCount) => {
+        turnsUsed = turnCount;
+        options.onTurnEnd?.(turnCount);
+      },
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
@@ -1370,50 +1101,33 @@ export class AgentManager {
     // startup failures observable to `awaitStartup`, this preserves the
     // long-standing synchronous-throw contract used by mention dispatch.
     const initialRun = runAgent(ctx, type, prompt, runOptions);
+
+    /**
+     * Confirmed mid-run exhaustion rebinds the preserved conversation to the
+     * next usable chain model (parking, slot released, when there is none) and
+     * runs again. Each rebind is a fresh `runAgent`, so the turns already spent
+     * are carried in as `priorTurns` — otherwise every switch would grant a
+     * whole new `maxTurns` + grace budget.
+     */
     const runWithQuotaRecovery = async () => {
-      let nextPrompt = prompt;
-      let nextOptions = runOptions;
+      let currentOptions = runOptions;
       let pendingRun = initialRun;
       for (;;) {
         const result = await pendingRun;
-        if (
-          result.aborted
-          || !result.failure
-          || !QUOTA_FAILURE_PATTERN.test(result.failure)
-          || !this.subscriptionUsage.get
-          || !options.quotaModels?.length
-        ) return result;
+        const chain = options.quotaModels;
+        if (result.aborted || !isQuotaFailure(result.failure) || !chain?.length) return result;
+        const failedModel = result.session.model ?? currentOptions.model;
+        if (!failedModel) return result;
 
-        const currentModel = result.session.model ?? nextOptions.model;
-        if (!currentModel) return result;
-        try {
-          await this.subscriptionUsage.get(ctx, currentModel.provider, {
-            fresh: true,
-            signal: record.abortController?.signal,
-          });
-        } catch {
-          return result;
-        }
-        if (!this.subscriptionUsage.decisionFor(currentModel).block) return result;
-
-        const providers = [...new Set(options.quotaModels.map(model => model.provider))];
-        await Promise.all(providers.map(provider => this.subscriptionUsage.get!(ctx, provider, {
-          fresh: true,
-          signal: record.abortController?.signal,
-        }).catch(() => undefined)));
-        const selection = chooseQuotaModel(
-          options.quotaModels,
-          candidate => this.subscriptionUsage.decisionFor(candidate),
-        );
-        let selected = selection.selected;
-        let selectedIndex = selection.selectedIndex;
-        const sessionManager = result.session.sessionManager;
-        if (!selected) {
-          if (!this.mayWaitForQuota(options)) {
-            return {
-              ...result,
-              failure: this.allModelsBlockedMessage(selection.blocked, selection.earliestResetAt),
-            };
+        const outcome = await this.quota.confirmMidRunExhaustion(ctx, failedModel, chain, record.abortController?.signal);
+        if (outcome.kind === "unconfirmed") return result;
+        let choice: QuotaModelChoice;
+        if (outcome.kind === "available") {
+          choice = outcome.choice;
+        } else {
+          const { selection } = outcome;
+          if (!mayWaitForQuota(options)) {
+            return { ...result, failure: allModelsBlockedMessage(selection.blocked, selection.earliestResetAt) };
           }
           const recoveryOptions: SpawnOptions = {
             ...options,
@@ -1421,34 +1135,37 @@ export class AgentManager {
             resumeSessionFile: record.sessionFile,
             recordId: undefined,
             quotaWaitRestore: undefined,
+            // Serialized with the wait; see `SpawnOptions.priorTurns`.
+            priorTurns: turnsUsed,
           };
           releaseSlot();
           this.drainQueue();
-          const recovered = await this.parkMidRunQuota(
+          const recovered = await this.quota.parkContinuation(
             record,
             { pi, ctx, type, prompt: QUOTA_CONTINUATION_PROMPT, options: recoveryOptions },
-            options.quotaModels,
+            chain,
             selection.blocked,
+            "mid-run",
           );
           if (!recovered) return { ...result, failure: record.error ?? result.failure };
-          selected = recovered.model;
-          selectedIndex = recovered.index;
           if (!await this.reacquirePoolSlot(record, pool)) return result;
           slotHeld = pool !== undefined;
+          choice = recovered;
         }
 
-        record.quotaModelIndex = selectedIndex;
+        record.quotaModelIndex = choice.index;
+        const sessionManager = result.session.sessionManager;
         await shutdownChildSession(result.session);
         record.session = undefined;
         record.error = undefined;
-        nextPrompt = QUOTA_CONTINUATION_PROMPT;
-        nextOptions = {
+        currentOptions = {
           ...runOptions,
-          model: selected,
+          model: choice.model,
           resumeSessionFile: undefined,
           resumeSessionManager: sessionManager,
+          priorTurns: turnsUsed,
         };
-        pendingRun = runAgent(ctx, type, nextPrompt, nextOptions);
+        pendingRun = runAgent(ctx, type, QUOTA_CONTINUATION_PROMPT, currentOptions);
       }
     };
 
@@ -1680,6 +1397,10 @@ export class AgentManager {
     // manager: a queued spawn starts at drain time, long after any install/
     // restore pair around this call would have put the field back — and it now
     // fires after an await (worktree creation) even on the immediate path.
+    // Warmed here rather than by each caller: `spawn` admits from the cache, and
+    // every foreground route (Agent tool, nested, workflow) funnels through this.
+    const warming = this.warmQuota(ctx, type, options);
+    if (warming) await warming;
     const id = this.spawn(pi, ctx, type, prompt, {
       ...options,
       isBackground: false,
@@ -1713,111 +1434,33 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    const background = options?.isBackground === true;
 
-    const sessionModel = record.session.model;
-    if (sessionModel) {
-      const quotaDecision = this.subscriptionUsage.decisionFor(sessionModel);
-      if (quotaDecision.block) {
-        const runtime = this.runtimeContexts.get(id);
-        const mayWaitOwned = record.parentAgentId !== undefined || record.workflowId !== undefined;
-        let quotaCleared = false;
-        if (!options?.isBackground && mayWaitOwned && runtime && getQuotaExhaustionPolicy() === "wait-async") {
-          record.result = undefined;
-          record.error = undefined;
-          record.completedAt = undefined;
-          record.abortController = new AbortController();
-          const recoveryOptions: SpawnOptions = {
-            ...runtime.options,
-            model: sessionModel,
-            quotaModels: [sessionModel],
-            resumeSessionFile: record.sessionFile,
-            signal: undefined,
-          };
-          const parked = this.parkMidRunQuota(
-            record,
-            {
-              pi: runtime.pi,
-              ctx: runtime.ctx,
-              type: runtime.type,
-              prompt,
-              options: recoveryOptions,
-            },
-            [sessionModel],
-            [{ model: sessionModel, decision: quotaDecision }],
-            "preflight",
-          );
-          const stopWaiting = () => this.abort(id);
-          if (signal?.aborted) stopWaiting();
-          else signal?.addEventListener("abort", stopWaiting, { once: true });
-          const selection = await parked;
-          signal?.removeEventListener("abort", stopWaiting);
-          if (!selection || record.status === "stopped") return record;
-          quotaCleared = true;
-        } else if (options?.isBackground && runtime && getQuotaExhaustionPolicy() === "wait-async") {
-          record.isBackground = true;
-          record.resultConsumed = false;
-          record.result = undefined;
-          record.error = undefined;
-          record.completedAt = undefined;
-          record.abortController = new AbortController();
-          const recoveryOptions: SpawnOptions = {
-            ...runtime.options,
-            blocking: false,
-            isBackground: true,
-            model: sessionModel,
-            quotaModels: [sessionModel],
-            resumeSessionFile: record.sessionFile,
-            signal: undefined,
-          };
-          const parked = this.parkMidRunQuota(
-            record,
-            {
-              pi: runtime.pi,
-              ctx: runtime.ctx,
-              type: runtime.type,
-              prompt,
-              options: recoveryOptions,
-            },
-            [sessionModel],
-            [{ model: sessionModel, decision: quotaDecision }],
-            "preflight",
-          );
-          let detachWaitSignal: (() => void) | undefined;
-          if (signal) {
-            const stopWaiting = () => this.abort(id);
-            if (signal.aborted) stopWaiting();
-            else {
-              signal.addEventListener("abort", stopWaiting, { once: true });
-              detachWaitSignal = () => signal.removeEventListener("abort", stopWaiting);
-            }
-          }
-          record.promise = parked.then(selection => {
-            detachWaitSignal?.();
-            if (!selection || record.status === "stopped") {
-              if (record.status === "error") {
-                try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-              }
-              return "";
-            }
-            const start = () => this.startResume(id, record, prompt, signal, options);
-            if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
-              record.status = "queued";
-              this.queue.push({
-                id,
-                pool: "background",
-                start: async () => start(),
-                release: () => {},
-              });
-            } else {
-              start();
-            }
-            return "";
-          });
-          return record;
-        }
-        if (!quotaCleared) throw new Error(quotaDecision.message);
-      }
+    // Warm every provider the resume could be admitted against, so admission
+    // below decides from real data rather than failing open on a cold cache.
+    // Before the in-flight check: a run that starts during this await must
+    // still be refused.
+    const runtime = this.runtimeContexts.get(id);
+    const warming = runtime && warmProviders(this.subscriptionUsage, runtime.ctx, this.resumeQuotaChain(record, runtime.ctx), signal);
+    if (warming) {
+      await warming;
+      if (!record.session) return undefined;
     }
+
+    // Never re-enter a detached run that is still in flight. Detaching means
+    // the caller gets control back while the record stays "running", so nothing
+    // stops the model from resuming the same agent again. Starting a second run
+    // would overwrite record.abortController — orphaning the live run beyond
+    // the reach of `/agents` stop and abortAll() — double-count the pool slot,
+    // and then reject from session.prompt() with "Agent is already processing",
+    // whose settle path would abort the LIVE run's children and report a
+    // failure for a run that is still going. Refuse instead, leaving the record
+    // untouched; the caller decides whether to wait or steer. Checked before
+    // quota admission, which would otherwise park the live record.
+    if (background && (record.status === "running" || record.status === "queued")) return undefined;
+
+    const admission = await this.admitResume(id, record, prompt, signal, options);
+    if (admission !== "proceed") return record;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1825,50 +1468,14 @@ export class AgentManager {
     // run_in_background was ignored on resume (the Agent tool's resume branch
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
-    if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
-      // gets control back while the record stays "running", so nothing stops the
-      // model from resuming the same agent again. Starting a second run would
-      // overwrite record.abortController — orphaning the live run beyond the
-      // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-      // then reject from session.prompt() with "Agent is already processing",
-      // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
+    if (background) {
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
       record.completedAt = undefined;
       record.status = "queued";
-
-      const start = () => this.startResume(id, record, prompt, signal, options);
-      if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
-        // At the concurrency limit — queue it, drains when a slot frees. A
-        // detached resume has no inline caller, hence nothing to release. The
-        // queue is shared with spawns, whose startup is async, so entries are
-        // promise-shaped even though a resume starts synchronously; failures
-        // land on the record here, since drainQueue no longer catches.
-        this.queue.push({
-          id,
-          pool: "background",
-          start: async () => {
-            try {
-              start();
-            } catch (err) {
-              record.status = "error";
-              record.error = err instanceof Error ? err.message : String(err);
-              record.completedAt = Date.now();
-              this.onComplete?.(record);
-            }
-          },
-          release: () => {},
-        });
-      } else {
-        start();
-      }
+      this.startOrQueueResume(id, record, prompt, signal, options ?? {});
       return record;
     }
 
@@ -1914,6 +1521,178 @@ export class AgentManager {
     this.abortOwnedChildren(id);
 
     return record;
+  }
+
+  /**
+   * Quota admission for `resume()`: the session's own model first, then the
+   * rest of the chain the record was spawned with, so a resumed agent can move
+   * to an available fallback instead of failing or waiting on its old model.
+   *
+   * - "proceed": run now, on the session's model or one switched to here.
+   * - "settled": a foreground wait ended with no model (timeout, stop); the
+   *   record says why.
+   * - "detached": a background resume parked; it starts itself on release.
+   *
+   * Throws, leaving the record untouched, when every candidate is blocked and
+   * this caller may not wait.
+   */
+  private async admitResume(
+    id: string,
+    record: AgentRecord,
+    prompt: string,
+    signal: AbortSignal | undefined,
+    options: ResumeOptions | undefined,
+  ): Promise<"proceed" | "settled" | "detached"> {
+    const sessionModel = record.session?.model;
+    if (!sessionModel || !this.subscriptionUsage.decisionFor(sessionModel).block) return "proceed";
+
+    const runtime = this.runtimeContexts.get(id);
+    const chain = this.resumeQuotaChain(record, runtime?.ctx);
+    const selection = this.quota.select(chain);
+    if (selection.selected) {
+      await this.switchResumeModel(record, selection.selected);
+      return "proceed";
+    }
+
+    const background = options?.isBackground === true;
+    const mayWait = runtime !== undefined && mayWaitForQuota({
+      parentAgentId: record.parentAgentId,
+      workflowId: record.workflowId,
+      blocking: !background,
+    });
+    if (!mayWait) throw new Error(allModelsBlockedMessage(selection.blocked, selection.earliestResetAt));
+
+    if (background) {
+      record.isBackground = true;
+      record.resultConsumed = false;
+    }
+    record.result = undefined;
+    record.error = undefined;
+    record.completedAt = undefined;
+    record.abortController = new AbortController();
+    const parked = this.quota.parkContinuation(
+      record,
+      {
+        pi: runtime.pi,
+        ctx: runtime.ctx,
+        type: runtime.type,
+        prompt,
+        options: {
+          ...runtime.options,
+          ...(background ? { blocking: false, isBackground: true } : {}),
+          model: sessionModel,
+          quotaModels: chain,
+          resumeSessionFile: record.sessionFile,
+          // A resume is a new prompt with its own turn budget; turns carried by
+          // the spawn that created this record do not apply to it.
+          priorTurns: undefined,
+          signal: undefined,
+        },
+      },
+      chain,
+      selection.blocked,
+      "preflight",
+    );
+    let detachSignal = () => {};
+    if (signal?.aborted) this.abort(id);
+    else if (signal) {
+      const stopWaiting = () => this.abort(id);
+      signal.addEventListener("abort", stopWaiting, { once: true });
+      detachSignal = () => signal.removeEventListener("abort", stopWaiting);
+    }
+
+    /** Bind the released model; false (record now terminal) when the wait or the switch failed. */
+    const bindReleased = async (): Promise<boolean> => {
+      const choice = await parked;
+      detachSignal();
+      if (!choice || record.status === "stopped") return false;
+      try {
+        await this.switchResumeModel(record, choice.model);
+        return true;
+      } catch (err) {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt = Date.now();
+        return false;
+      }
+    };
+
+    if (!background) return await bindReleased() ? "proceed" : "settled";
+    record.promise = bindReleased().then(bound => {
+      if (bound) this.startOrQueueResume(id, record, prompt, signal, options ?? {});
+      else if (record.status === "error") {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      }
+      return "";
+    });
+    return "detached";
+  }
+
+  /**
+   * The models a resume may run on: the session's own model first, then the
+   * rest of the chain the record was spawned with. Without a registry to
+   * resolve that chain, only the session model.
+   */
+  private resumeQuotaChain(record: AgentRecord, ctx: ExtensionContext | undefined): Model<any>[] {
+    const sessionModel = record.session?.model;
+    if (!sessionModel) return [];
+    const sessionModelId = describeModel(sessionModel).modelId;
+    const registry = ctx?.modelRegistry;
+    const fallbacks = registry && record.quotaModelChain
+      ? resolveQuotaModelIds(record.quotaModelChain, registry)
+        .filter(model => describeModel(model).modelId !== sessionModelId)
+      : [];
+    return [sessionModel, ...fallbacks];
+  }
+
+  /**
+   * Point a resumed session at the model quota admission chose, when that is
+   * not the one it already runs on, and keep the record's model fields in step.
+   */
+  private async switchResumeModel(record: AgentRecord, model: Model<any>): Promise<void> {
+    const target = describeModel(model);
+    const index = record.quotaModelChain?.indexOf(target.modelId) ?? -1;
+    if (index >= 0) record.quotaModelIndex = index;
+    const session = record.session;
+    if (!session || (session.model && describeModel(session.model).modelId === target.modelId)) return;
+    await session.setModel(model);
+    record.invocation = { ...record.invocation, ...target };
+  }
+
+  /** Start a detached resume now, or queue it for a background slot. */
+  private startOrQueueResume(
+    id: string,
+    record: AgentRecord,
+    prompt: string,
+    signal: AbortSignal | undefined,
+    options: ResumeOptions,
+  ): void {
+    const start = () => this.startResume(id, record, prompt, signal, options);
+    if (!occupiesPoolSlot(record) || this.poolHasRoom("background")) {
+      start();
+      return;
+    }
+    // At the concurrency limit — queue it, drains when a slot frees. A
+    // detached resume has no inline caller, hence nothing to release. The
+    // queue is shared with spawns, whose startup is async, so entries are
+    // promise-shaped even though a resume starts synchronously; failures
+    // land on the record here, since drainQueue no longer catches.
+    record.status = "queued";
+    this.queue.push({
+      id,
+      pool: "background",
+      start: async () => {
+        try {
+          start();
+        } catch (err) {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+          this.onComplete?.(record);
+        }
+      },
+      release: () => {},
+    });
   }
 
   /**
@@ -2118,7 +1897,7 @@ export class AgentManager {
     // and no onComplete, matching what a queued background abort has always
     // done; a blocking caller learns of the stop from its own tool result.
     if (record.status === "queued") {
-      const wasQuotaWait = this.cancelQuotaWait(id);
+      const wasQuotaWait = this.quota.cancel(id);
       if (wasQuotaWait) record.abortController?.abort();
       this.dequeue(q => q.id === id);
       record.status = "stopped";
@@ -2267,14 +2046,14 @@ export class AgentManager {
     // Clear quota waits before the ordinary queue. They are deliberately not
     // queue entries, but own the same kind of start gate and must wake every
     // blocking caller before records disappear.
-    for (const id of [...this.quotaWaits.keys()]) {
+    for (const id of this.quota.ids()) {
       const record = this.agents.get(id);
       if (record?.status === "queued") {
         record.status = "stopped";
         record.completedAt = Date.now();
         record.abortController?.abort();
       }
-      this.cancelQuotaWait(id, false);
+      this.quota.cancel(id, false);
     }
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.

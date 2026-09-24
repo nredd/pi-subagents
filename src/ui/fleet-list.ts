@@ -27,6 +27,12 @@ const MAX_AGENT_ROWS = 5;
 const TICK_MS = 200;
 /** How long a finished agent lingers in the list before it drops out. */
 const FINISHED_LINGER_MS = 4000;
+/**
+ * Wall-clock time per spinner frame. The frame is derived from `Date.now()`
+ * rather than a counter, so it keeps the Agent tool's 80ms rhythm even though
+ * the list only repaints every `TICK_MS`.
+ */
+const SPINNER_FRAME_MS = 80;
 
 /** Minimal UI surface the FleetView needs from `ctx.ui` (structural subset). */
 export type FleetUICtx = {
@@ -546,7 +552,7 @@ export class FleetList {
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
       : { fallbackColor: "muted" });
     const activity = this.agentActivity.get(record.id);
-    const spinner = record.status === "running" ? `${theme.fg("accent", SPINNER[Math.floor(Date.now() / 80) % SPINNER.length])} ` : "";
+    const spinner = record.status === "running" ? `${theme.fg("accent", SPINNER[Math.floor(Date.now() / SPINNER_FRAME_MS) % SPINNER.length])} ` : "";
     const detail = record.quotaWait
       ? `${record.description} · waiting for quota`
       : activity && (activity.activeTools.size > 0 || activity.responseText.trim())

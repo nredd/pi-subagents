@@ -204,6 +204,8 @@ export interface QuotaWaitDispatch {
     cwd?: string;
     rootSessionId?: string;
     scheduleId?: string;
+    /** Turns a mid-run wait's interrupted run already spent; see `SpawnOptions.priorTurns`. */
+    priorTurns?: number;
   };
 }
 

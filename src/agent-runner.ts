@@ -421,6 +421,16 @@ export interface RunOptions {
    */
   resumeSessionManager?: SessionManager;
   /**
+   * Turns an earlier run of the same logical agent already spent. Set only by
+   * quota recovery, which rebinds the conversation to a new session and calls
+   * `runAgent` again: without it every rebind would hand out a fresh
+   * `maxTurns` + grace budget, so a run hopping between exhausted providers
+   * could exceed its cap without bound. Counting starts here, `onTurnEnd`
+   * keeps reporting the cumulative total, and a soft limit already crossed
+   * stays latched (its wrap-up steer is in the preserved history).
+   */
+  priorTurns?: number;
+  /**
    * True when another agent spawned this one. Only top-level agents get a
    * handle, so only they can be reopened by name — which is the whole reason
    * `rememberAgents` persists a session at all. A nested run's transcript would
@@ -1052,9 +1062,9 @@ export async function runAgent(
   options.onSessionCreated?.(session);
 
   // Track turns for graceful max_turns enforcement
-  let turnCount = 0;
+  let turnCount = Math.max(0, options.priorTurns ?? 0);
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
-  let softLimitReached = false;
+  let softLimitReached = maxTurns != null && turnCount >= maxTurns;
   let aborted = false;
 
   let currentMessageText = "";

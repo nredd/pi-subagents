@@ -310,7 +310,7 @@ All fields are optional — sensible defaults for everything.
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
-| `fallback_models` | `subagents.json` `quotaFallbackModels` | Ordered CSV or YAML list used only when fresh included quota blocks `model`. `none`, an empty string, or `[]` explicitly disables lower-precedence fallbacks |
+| `fallback_models` | `subagents.json` `quotaFallbackModels` | Ordered CSV or YAML list used only when included quota blocks `model`. `none`, an empty string, or `[]` explicitly disables lower-precedence fallbacks |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -589,20 +589,50 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 ## Subscription Usage
 
-The extension can inspect the consumer-subscription windows used by the active Pi providers and expose them to the parent model through the `subscription_usage` tool and a compact turn-level context summary. It is decision support, not a prediction that a task will fit in a remaining window.
-
-Initial collectors use the providers' undocumented OAuth endpoints: Anthropic Claude Code (`anthropic`) and ChatGPT Codex (`openai-codex`). Other providers report `unavailable` until a collector is implemented. The service keeps only normalized windows, freshness and optional credit metadata in memory; it never persists OAuth credentials or provider response bodies.
+The extension reads the consumer-subscription windows of the active Pi providers, exposes them to the parent model through the `subscription_usage` tool, `/subscription-usage` and a compact turn-level summary, and uses them to gate dispatch. The numbers are decision support, not a prediction that a task will fit in a remaining window.
 
 | `subscription_usage` parameter | Type | Behavior |
 |---|---|---|
 | `provider` | string, optional | Provider to inspect; defaults to the parent session's active provider |
 | `refresh` | boolean, optional | Request a live read; manual refresh is throttled independently per provider |
 
-Successful reads are cached for five minutes. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute per provider. Authentication, rate-limit, malformed-response and network failures are non-sensitive and advisory: stale data remains visible, but never blocks a dispatch.
+**Collectors.** A collector knows one usage endpoint and normalizes its payload into windows (percent used, reset time, provider- or model-family scope). Built in: Anthropic Claude Code (`anthropic`, `/api/oauth/usage`) and ChatGPT Codex (`openai-codex`, `wham/usage`), both undocumented OAuth endpoints. Other providers report `unavailable`. The service keeps only normalized windows, freshness and credit flags in memory; OAuth credentials and response bodies never leave it.
 
-A fresh exhausted included window blocks dispatch before it takes a queue slot or creates a worktree; creating a future schedule is configuration and remains allowed. The response names the resolved provider/model, exhausted window and reset time. Paid extra-usage credits do not count as subscription capacity, so they do not bypass this guard. Future collectors implement the normalized `SubscriptionUsageTransport` and return provider/model-scoped windows.
+Collectors live in a process-global registry (`Symbol.for("pi-subagents.subscription-collectors")`), so another extension can add one even though it loads its own copy of the module. The collector's `id` is matched against the provider name; the token comes from pi's model registry for that provider:
 
-**Fallback chains.** `fallback_models` on an agent definition, `fallback_models` on an `Agent` call (or `fallbackModels` in workflow/RPC APIs), and global `quotaFallbackModels` are the three sources, in that precedence order. The first *defined* source wins; an explicit empty list means no fallback and does not fall through. The primary model always stays first. Invalid, unavailable and out-of-scope fallback entries are dropped with warnings rather than invalidating a usable primary. Dispatch picks the first model in this explicit chain that fresh quota does not block; it never scans arbitrary enabled models.
+```ts
+import { registerSubscriptionCollector } from "@tintinweb/pi-subagents/src/subscription-usage.ts";
+
+registerSubscriptionCollector({
+  id: "acme",
+  url: "https://api.acme.example/v1/usage",
+  headers: token => ({ Authorization: `Bearer ${token}` }),
+  // Return undefined for a payload you do not recognize.
+  parse: payload => {
+    const day = (payload as { day?: { used_percent?: number; resets_at?: string } }).day;
+    if (typeof day?.used_percent !== "number") return undefined;
+    return { windows: [{ name: "daily", usedPercent: day.used_percent, resetAt: day.resets_at ? Date.parse(day.resets_at) : undefined, scope: "provider" }] };
+  },
+});
+```
+
+`subscriptionProviderAliases` points extra provider names, e.g. a proxy or a second login, at an existing collector. The aliased provider keeps its own credential and cache entry; only the endpoint and parser are borrowed. Because it decides which endpoint receives a provider's OAuth token, it is read from the global `~/.pi/agent/subagents.json` only; a project `.pi/subagents.json` value is ignored with a warning, so a cloned repo cannot reroute your credentials:
+
+```json
+{ "subscriptionProviderAliases": { "anthropic-max": "anthropic" } }
+```
+
+**Reads.** Successful reads are cached for five minutes. Internal `fresh` reads (quota-wait wakes, mid-run confirmation, session restore) bypass that cache but share any read from the last 60 seconds, so many waiters cost one request. A manual `subscription_usage({ refresh: true })` or `/subscription-usage refresh` is limited to once per minute per provider. A failed read backs the provider off for 1, 2, 5, then 15 minutes (longer if the server sends `Retry-After`, capped at an hour); during backoff no request is made and the last snapshot is served as `stale` (or an `error` snapshot when there is none). Anthropic API-key auth (`sk-ant-api…`) and providers without an OAuth credential report `unavailable` without a request.
+
+**What blocks.** A window at 100% blocks dispatch on its provider (or, for model-scoped windows like `seven_day_opus`, on matching model families). A known reset that has passed never blocks, fresh or stale, since the window has refilled. Otherwise fresh data blocks, and stale data blocks only while its known reset is still in the future, since staleness cannot refill a window early. Everything else (stale with an unknown reset, `error`, `unavailable`, no data) is advisory and fails open. A Codex plan reporting `credits.unlimited` never blocks. A paid credit balance never bypasses an exhausted included window. Creating a future schedule is configuration and is always allowed.
+
+**Admission.** Every dispatch route (the `Agent` tool in both modes, `@handle` mentions, cross-extension RPC `spawn`, nested `Agent` calls, scheduled fires, workflow `agent()` and resume) warms the usage cache for every provider in the dispatch's model chain, then admits before a record, queue slot or worktree exists. The one exception is the synchronous `Symbol.for("pi-subagents:manager")` registry `spawn`, which cannot await and decides from whatever is cached. When the whole chain is blocked the call fails with each model's window and reset:
+
+```text
+Subscription quota blocked dispatch: all configured models are blocked by exhausted included quota: anthropic/claude-opus-4-6 (five_hour, resets 2026-01-01T15:00:00.000Z), openai-codex/gpt-5.6-terra (7d, resets 2026-01-03T09:00:00.000Z); earliest reset is 2026-01-01T15:00:00.000Z.
+```
+
+**Fallback chains.** `fallback_models` on an agent definition, `fallback_models` on an `Agent` call (or `fallbackModels` in workflow/RPC APIs), and global `quotaFallbackModels` are the three sources, in that precedence order. The first *defined* source wins; an explicit empty list means no fallback and does not fall through. The primary model always stays first. Invalid, unavailable and out-of-scope fallback entries are dropped with warnings rather than invalidating a usable primary. Dispatch picks the first model in this explicit chain that quota does not block; it never scans arbitrary enabled models. A resume tries the agent's session model, then the rest of the chain it was originally spawned with, switching the session to the first usable one; with all of them blocked it parks or fails exactly like a spawn.
 
 ```json
 {
@@ -615,11 +645,13 @@ A fresh exhausted included window blocks dispatch before it takes a queue slot o
 }
 ```
 
-`quotaExhaustionPolicy` defaults to `"fail"`. `"wait-async"` parks only detached/background, scheduled, nested and workflow-owned work; a top-level blocking call still fails immediately with reset guidance. A parked dispatch owns no concurrency slot. Known reset times wake at the earliest reset; unknown or past resets poll after 1 minute, 2 minutes, then every 5 minutes, bounded by the fixed timeout (seven days by default).
+`quotaExhaustionPolicy` defaults to `"fail"`. `"wait-async"` parks only detached/background, scheduled, nested and workflow-owned work; a top-level blocking call still fails immediately with the message above. A parked dispatch owns no concurrency slot. Known reset times wake at the earliest reset; unknown or past resets poll after 1 minute, 2 minutes, then every 5 minutes, bounded by the fixed timeout (seven days by default). Each wake re-reads usage fresh.
 
-Standalone top-level waits are journaled in the parent session and restored on `/resume`. Scheduled waits remain in the session's schedule store, keep one-shot jobs enabled, and suppress duplicate interval/cron fires until release. Nested and workflow waits are process-local; after an interrupted workflow, use its journal's normal manual resume path. FleetView shows parked agents and their next retry.
+Standalone top-level waits are journaled in the parent session and restored on `/resume`, after a fresh read of their chain. Scheduled waits remain in the session's schedule store, keep one-shot jobs enabled, and suppress duplicate interval/cron fires until the wait ends (released, cancelled or timed out). Nested and workflow waits are process-local; after an interrupted workflow, use its journal's normal manual resume path. FleetView shows parked agents and their next retry.
 
-A provider failure during a run triggers fallback only when its text looks quota-related **and** a fresh usage read confirms included-quota exhaustion. The existing child history is rebound to a new session on the next explicit model and receives a continuation prompt; the original task is never restarted. If confirmation fails, data is stale, or no collector supports the provider, the original failure is reported unchanged.
+**Mid-run exhaustion.** A provider failure during a run triggers recovery only when its text looks quota-related **and** a fresh read of that provider confirms an exhausted window. The whole chain is then re-read and the first unblocked model is picked, scanning from the primary, so a primary whose window has reset since dispatch wins again. The existing child history is rebound to a session on that model with a continuation prompt; the original task is never restarted. With nothing usable it parks (under `wait-async`, for work that may wait) or ends the run with the message above. The `maxTurns` budget spans every switch, including a mid-run wait restored after a restart. If confirmation fails or no collector supports the provider, the original failure is reported unchanged.
+
+**System-prompt summary.** Each turn's prompt gets one line per provider of the session's scoped models and current model, e.g. `anthropic: five_hour 25-50%; seven_day <25%`. It uses cached data only and never waits on a read: a provider whose cache expired keeps showing its last-known buckets, one never read shows `usage unavailable`, and either gets a background read, so the next turn has data. Usage is bucketed (`<25%`, `25-50%`, `50-75%`, `75-100%`, `exhausted until <UTC minute>`) so the text, and with it the prompt-cache prefix, only changes when capacity meaningfully changes. `subscription_usage` and `/subscription-usage` show exact percentages.
 
 ## Model Scope
 
@@ -646,7 +678,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Quota fallback, policy and timeout settings are currently file-only. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Quota fallback, policy and timeout settings are currently file-only, and `subscriptionProviderAliases` is global-file-only. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -995,6 +1027,7 @@ src/
   subscription-usage.ts # OAuth-backed subscription collectors, normalized cache and dispatch decisions
   fallback-models.ts # Explicit fallback precedence, model-chain resolution and quota selection
   quota-wait.ts      # Reset-aware retry scheduling and bounded unknown-reset polling
+  quota-waiter.ts    # Quota admission: chain building, pre-dispatch cache warm, parked waits (wake/timeout/cancel/restore DTO), mid-run confirmation
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)
@@ -1026,6 +1059,7 @@ src/
     progress.ts       # Progress event log and every derived view of it (pure)
     host.ts           # WorkflowHost adapter over AgentManager
     task.ts           # local_workflow task record and batched progress updates
+    usage.ts          # Live token/cost totals per workflow, attributed up nested agent trees
     tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
     agent-widget.ts       # Shared compact activity, spinner and status formatting

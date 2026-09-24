@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, type SpawnOptions } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -33,6 +33,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { quotaWaitEventPayload, refreshProviders, resolveQuotaModelIds } from "./quota-waiter.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -434,11 +435,16 @@ export default function (pi: ExtensionAPI) {
   // OAuth credentials or provider response bodies.
   const subscriptionUsage = getSubscriptionUsageService();
 
-  const quotaWaitSessionManagers = new Map<string, SessionManager>();
+  /**
+   * Extensions see the session manager typed read-only, but the live object can
+   * append; `appendQuotaWaitEntry` feature-checks that rather than casting.
+   */
+  type QuotaWaitSessionManager = ExtensionContext["sessionManager"] & Partial<Pick<SessionManager, "appendCustomEntry">>;
+  const quotaWaitSessionManagers = new Map<string, QuotaWaitSessionManager>();
   const appendQuotaWaitEntry = (
     data: QuotaWaitEntryData,
-    sessionManager: SessionManager | undefined = quotaWaitSessionManagers.get(data.id)
-      ?? currentCtx?.sessionManager as SessionManager | undefined,
+    sessionManager: QuotaWaitSessionManager | undefined = quotaWaitSessionManagers.get(data.id)
+      ?? currentCtx?.sessionManager,
   ): void => {
     if (typeof sessionManager?.appendCustomEntry === "function") {
       sessionManager.appendCustomEntry(QUOTA_WAIT_ENTRY_TYPE, data);
@@ -447,13 +453,23 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  /** Distinct providers of the session's scoped models and its current model. */
+  const sessionProviders = (ctx: ExtensionContext): string[] => {
     const providers = new Set(ctx.scopedModels.map(({ model }) => model.provider));
     if (ctx.model) providers.add(ctx.model.provider);
-    const summaries = await Promise.all([...providers].map(async provider => {
-      const { snapshot } = await subscriptionUsage.get(ctx, provider, { signal: ctx.signal });
-      return `${provider}: ${subscriptionUsage.format(snapshot)}`;
-    }));
+    return [...providers];
+  };
+
+  // Cached data only, never an awaited read: a slow usage endpoint must not
+  // delay the turn, and `formatForPrompt`'s coarse buckets keep the text (and
+  // so the prompt-cache prefix) stable across ordinary turns. A provider with
+  // no fresh cache gets a background read, so the NEXT turn has data.
+  pi.on("before_agent_start", (event, ctx) => {
+    const summaries = sessionProviders(ctx).map(provider => {
+      const snapshot = subscriptionUsage.peek(provider);
+      if (snapshot?.status !== "available") void subscriptionUsage.get(ctx, provider).catch(() => undefined);
+      return `${provider}: ${subscriptionUsage.formatForPrompt(snapshot)}`;
+    });
     return {
       systemPrompt: `${event.systemPrompt}\n\nSubscription usage:\n- ${summaries.join("\n- ")}\n- Treat usage as decision support, not a task-fit prediction. Check subscription_usage before fan-out, prefer available cheaper models for bounded reconnaissance, and reduce parallelism or defer nonessential work when capacity is low.`,
     };
@@ -463,9 +479,7 @@ export default function (pi: ExtensionAPI) {
     description: "Show or refresh subscription usage for configured providers",
     handler: async (args, ctx) => {
       const force = args.trim() === "refresh";
-      const providers = new Set(ctx.scopedModels.map(({ model }) => model.provider));
-      if (ctx.model) providers.add(ctx.model.provider);
-      const results = await Promise.all([...providers].map(provider => subscriptionUsage.get(ctx, provider, { force })));
+      const results = await Promise.all(sessionProviders(ctx).map(provider => subscriptionUsage.get(ctx, provider, { force })));
       ctx.ui.notify(results.map(({ snapshot }) => `${snapshot.provider}: ${subscriptionUsage.format(snapshot)}`).join("\n"), "info");
     },
   });
@@ -473,7 +487,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(defineTool({
     name: "subscription_usage",
     label: "Subscription Usage",
-    description: "Inspect live subscription quota windows for configured providers. Results are advisory except exhausted fresh included limits, which block new subagents on that provider.",
+    description: "Inspect live subscription quota windows for configured providers. Results are advisory except exhausted included windows, which block new subagents on that provider until they reset.",
     promptSnippet: "Inspect subscription quota before expensive subagent fan-out",
     promptGuidelines: ["Use subscription_usage before subagent fan-out or when choosing a subagent model."],
     parameters: Type.Object({
@@ -653,7 +667,7 @@ export default function (pi: ExtensionAPI) {
   const workflowUsage = new WorkflowUsageTracker();
 
   // Background completion: route through group join or send individual nudge
-  const manager = new AgentManager((record) => {
+  const manager = new AgentManager({ onComplete: (record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -699,7 +713,7 @@ export default function (pi: ExtensionAPI) {
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
-  }, undefined, (record) => {
+  }, onStart: (record) => {
     if (!isTopLevelAgent(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
@@ -715,7 +729,7 @@ export default function (pi: ExtensionAPI) {
       type: record.type,
       description: record.description,
     });
-  }, (record, info) => {
+  }, onCompact: (record, info) => {
     if (!isTopLevelAgent(record)) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
@@ -726,7 +740,7 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (record, usage) => {
+  }, onUsage: (record, usage) => {
     // Every assistant message from every agent — nested included, exactly once.
     // Attribute the raw delta to its owning workflow before nested-tools folds
     // it into ancestors, so workflow totals stay live without double-counting.
@@ -736,7 +750,7 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
-  }, (record) => {
+  }, onSession: (record) => {
     // Warm quota state from the model the session actually resolved, including
     // workflow, nested, RPC and scheduled agents that bypass the Agent tool's
     // eager dispatch refresh. Cache hits are in-memory and do not call the
@@ -745,9 +759,9 @@ export default function (pi: ExtensionAPI) {
     const startedModel = record.session?.model;
     if (currentCtx && startedModel) {
       void subscriptionUsage.get(currentCtx, startedModel.provider, { signal: currentCtx.signal })
-        .then(() => fleet.update());
+        .then(() => fleet.update(), () => undefined);
     }
-  }, subscriptionUsage, (record, event) => {
+  }, subscriptionUsage, onQuotaWait: (record, event) => {
     if (event.wait.persistence === "schedule") scheduler.handleQuotaWait(record, event);
     if (!isTopLevelAgent(record)) return;
     if (currentCtx?.hasUI) {
@@ -756,7 +770,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (event.wait.persistence === "session") {
       if (event.transition === "parked" && currentCtx) {
-        quotaWaitSessionManagers.set(record.id, currentCtx.sessionManager as SessionManager);
+        quotaWaitSessionManagers.set(record.id, currentCtx.sessionManager);
       }
       if (event.transition === "parked" || event.transition === "updated") {
         appendQuotaWaitEntry({ version: 1, id: record.id, status: "active", dispatch: event.dispatch });
@@ -765,18 +779,8 @@ export default function (pi: ExtensionAPI) {
         quotaWaitSessionManagers.delete(record.id);
       }
     }
-    pi.events.emit("subagents:waiting", {
-      id: record.id,
-      type: record.type,
-      description: record.description,
-      transition: event.transition,
-      phase: event.wait.phase,
-      nextCheckAt: event.wait.nextCheckAt,
-      deadlineAt: event.wait.deadlineAt,
-      blocked: event.wait.blocked,
-      persistence: event.wait.persistence,
-    });
-  });
+    pi.events.emit("subagents:waiting", quotaWaitEventPayload(record, event));
+  } });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -854,6 +858,21 @@ export default function (pi: ExtensionAPI) {
   };
 
   /**
+   * Warm quota for a dispatch about to go through `spawnResolved`/`spawnTopLevel`,
+   * against the type those will resolve. Both are synchronous and admit from
+   * cached usage, so every caller that can await (RPC, `@handle` mentions) does
+   * this first. An unresolvable type is left for the spawn to reject.
+   */
+  const warmTopLevelQuota = async (
+    ctxRef: ExtensionContext,
+    type: string,
+    options: Pick<SpawnOptions, "model" | "fallbackModels" | "signal">,
+  ): Promise<void> => {
+    const dispatch = resolveSpawnType(type);
+    if (dispatch.ok) await manager.warmQuota(ctxRef, dispatch.type, options);
+  };
+
+  /**
    * Resolve a tool's `agent_id` as an id OR a handle, so the model addresses
    * agents by the same names the user types. Ids are tried first, keeping the
    * existing behaviour exact — a handle is only consulted when the string is
@@ -903,21 +922,23 @@ export default function (pi: ExtensionAPI) {
   async function restoreSessionQuotaWaits(ctx: ExtensionContext): Promise<void> {
     const dispatches = restoredQuotaWaitDispatches(ctx.sessionManager.getBranch?.() ?? []);
     const pending = dispatches.filter(dispatch => manager.getRecord(dispatch.id) === undefined);
-    const providers = [...new Set(pending.flatMap(dispatch =>
-      dispatch.modelChain.map(modelId => modelId.split("/", 1)[0]).filter(Boolean),
-    ))];
-    await Promise.all(providers.map(provider =>
-      subscriptionUsage.get(ctx, provider, { fresh: true, signal: ctx.signal }).catch(() => undefined),
-    ));
+    // Fresh, not cached: these waits parked on data from a previous process,
+    // and a window may have reset while pi was down.
+    await refreshProviders(
+      subscriptionUsage,
+      ctx,
+      pending.flatMap(dispatch => resolveQuotaModelIds(dispatch.modelChain, ctx.modelRegistry)),
+      { fresh: true, signal: ctx.signal },
+    );
 
     for (const dispatch of pending) {
       try {
         const id = manager.restoreQuotaWait(pi, ctx, dispatch);
         if (!manager.getRecord(id)?.quotaWait) {
-          appendQuotaWaitEntry({ version: 1, id, status: "released" }, ctx.sessionManager as SessionManager);
+          appendQuotaWaitEntry({ version: 1, id, status: "released" }, ctx.sessionManager);
         }
       } catch (error) {
-        appendQuotaWaitEntry({ version: 1, id: dispatch.id, status: "cancelled" }, ctx.sessionManager as SessionManager);
+        appendQuotaWaitEntry({ version: 1, id: dispatch.id, status: "cancelled" }, ctx.sessionManager);
         ctx.ui?.notify?.(
           `Unable to restore quota wait ${dispatch.id}: ${error instanceof Error ? error.message : String(error)}`,
           "warning",
@@ -960,6 +981,7 @@ export default function (pi: ExtensionAPI) {
         getCtx: () => currentCtx,
         manager: {
           spawn: spawnTopLevel,
+          warmQuota: (ctxRef, type, options) => warmTopLevelQuota(ctxRef as ExtensionContext, type, options),
           awaitStartup: (id) => manager.awaitStartup(id),
           getRecord: (id) => manager.getRecord(id),
           // Unguarded on purpose: the stop handler now runs the top-level check
@@ -1143,6 +1165,7 @@ export default function (pi: ExtensionAPI) {
         // spawnResolved, not spawnTopLevel: the latter strips
         // `resumeSessionFile` and `reclaim` as untrusted. This path is the
         // exception — both come from a tombstone this extension wrote.
+        await warmTopLevelQuota(ctx, dispatch.type, {});
         const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
           description: entry.description,
           reclaim: { handle: entry.handle, alias: entry.alias },
@@ -1207,6 +1230,7 @@ export default function (pi: ExtensionAPI) {
           // agent the direct way rather than leaving the user with a toast and
           // nothing running.
           try {
+            await warmTopLevelQuota(ctx, type, {});
             const id = spawnTopLevel(pi, ctx, type, mention.message, {
               description: describeMention(mention.message),
               isBackground: true,
@@ -1231,6 +1255,7 @@ export default function (pi: ExtensionAPI) {
       // manager's onStart/onComplete callbacks own the widget, the fleet list
       // and the completion notification — the same contract the scheduler and
       // cross-extension RPC spawns run under.
+      await warmTopLevelQuota(ctx, type, {});
       const id = spawnTopLevel(pi, ctx, type, mention.message, {
         description: describeMention(mention.message),
         isBackground: true,
@@ -1587,6 +1612,7 @@ export default function (pi: ExtensionAPI) {
       setQuotaFallbackModels,
       setQuotaExhaustionPolicy,
       setQuotaWaitTimeoutMinutes,
+      setSubscriptionProviderAliases: aliases => subscriptionUsage.setProviderAliases(aliases),
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -2121,7 +2147,7 @@ Terse command-style prompts produce shallow, generic work.
             subagent_type: requestedType,
             prompt: params.prompt as string,
             model: params.model as string | undefined,
-            fallbackModels: params.fallback_models as string[] | undefined,
+            fallbackModels: params.fallback_models,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2148,17 +2174,9 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
 
-        // A resume keeps its existing session model regardless of invocation
-        // parameters, so refresh and decide against that model before mutating
-        // the record or taking a queue slot.
-        const resumeModel = existing.session.model;
-        if (resumeModel) {
-          await subscriptionUsage.get(ctx, resumeModel.provider, { signal });
-          const resumeQuota = subscriptionUsage.decisionFor(resumeModel);
-          if (resumeQuota.block && !runInBackground) {
-            return textResult(resumeQuota.message ?? "Subscription quota is exhausted.");
-          }
-        }
+        // Quota admission (warm, then the session model and its original
+        // fallback chain) happens inside manager.resume, before the record is
+        // mutated or takes a queue slot.
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2215,14 +2233,13 @@ Terse command-style prompts produce shallow, generic work.
         );
       }
 
-      // Warm the primary provider before dispatch. AgentManager is the one
-      // admission point for the primary and its explicit fallback chain; doing
-      // a primary-only check here would reject a spawn before a fallback could
-      // be selected. Failed, unavailable and stale reads remain advisory.
-      if (model) await subscriptionUsage.get(ctx, model.provider, { signal });
-
       // Background execution
       if (runInBackground) {
+        // `spawn` admits from cached quota; warm the whole chain it will be
+        // admitted against first. The foreground path's spawnAndWait does this
+        // itself.
+        await manager.warmQuota(ctx, subagentType, { model, fallbackModels: params.fallback_models, signal });
+
         const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
         // Wrap onSessionCreated to wire output file streaming.
@@ -2245,7 +2262,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
-          fallbackModels: params.fallback_models as string[] | undefined,
+          fallbackModels: params.fallback_models,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2404,7 +2421,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
-          fallbackModels: params.fallback_models as string[] | undefined,
+          fallbackModels: params.fallback_models,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -3672,6 +3689,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       quotaFallbackModels: getQuotaFallbackModels(),
       quotaExhaustionPolicy: getQuotaExhaustionPolicy(),
       quotaWaitTimeoutMinutes: getQuotaWaitTimeoutMinutes(),
+      // Global-only (see loadSettings): never written into the project file.
+      subscriptionProviderAliases: undefined,
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),

@@ -503,12 +503,12 @@ async function agentIn(scope, prompt, opts) {
     }
     if (model !== undefined) {
       throw new Error(
-        "agent() opts.resume and opts.model are mutually exclusive: a resumed agent keeps the model it was started with."
+        "agent() opts.resume and opts.model are mutually exclusive: a resumed agent continues on its session model, moving only along the fallback chain it was started with when quota blocks it."
       );
     }
     if (fallbackModels !== undefined) {
       throw new Error(
-        "agent() opts.resume and opts.fallbackModels are mutually exclusive: a resumed agent keeps the fallback chain it was started with."
+        "agent() opts.resume and opts.fallbackModels are mutually exclusive: a resumed agent falls back only along the chain it was started with."
       );
     }
     if (isolation !== undefined) {

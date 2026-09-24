@@ -127,7 +127,7 @@ describe("AgentManager — record GC", () => {
 
   it("never evicts a queued agent", async () => {
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    manager = new AgentManager(undefined, 1);
+    manager = new AgentManager({ maxConcurrent: 1 });
     manager.spawn(mockPi, mockCtx, "X", "holder", { description: "holder", isBackground: true });
     const queuedId = manager.spawn(mockPi, mockCtx, "X", "waiter", { description: "waiter", isBackground: true });
     const queued = manager.getRecord(queuedId)!;

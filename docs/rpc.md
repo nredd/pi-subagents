@@ -79,6 +79,7 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
 | `fallback_models must be an array of model strings` | malformed RPC fallback option |
+| `Subscription quota blocked dispatch: all configured models are blocked by exhausted included quota: ...` | `src/quota-waiter.ts` — every model in the resolved chain is blocked and `quotaExhaustionPolicy` is `fail`. See [Subscription Usage](../README.md#subscription-usage) |
 | `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
 | `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |
 | `<reason> The configured fallbackSubagent "<x>" is itself unknown or disabled. Available: <list>.` | `src/agent-types.ts:205-207` |
@@ -91,6 +92,8 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `Agent is owned by another agent or workflow` | stop — `:178` |
 | `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
 | `Agent not found or still running` | consume — `:193` |
+
+**Quota admission happens before the reply.** An RPC spawn first reads subscription usage for every provider in the resolved model chain (primary plus fallbacks, served from cache when warm), then admits against it before any record, queue slot or worktree exists. So a blocked chain comes back as the error above, not as a success followed by a failed agent, and a cold cache can add one usage request of latency to the reply. Under `wait-async` the spawn succeeds and the agent parks as `queued` until quota returns.
 
 Three things the table cannot show:
 
@@ -139,7 +142,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 |---|---|---|
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
 | `hasRunning()` | `() => boolean` | |
-| `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
+| `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically. Synchronous, so unlike the bus it cannot warm the usage cache first: quota admission sees only what is already cached and fails open on a cold cache |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).

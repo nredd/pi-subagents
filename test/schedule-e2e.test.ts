@@ -40,6 +40,11 @@ function makeFaithfulManager(initialStatus = "completed") {
       return id;
     }),
     awaitStartup: vi.fn(async () => {}),
+    warmQuota: vi.fn(async () => {}),
+    waitForCompletion: vi.fn(async (id: string) => {
+      await records.get(id)?.promise;
+      return records.get(id);
+    }),
     getRecord: vi.fn(function (this: any, id: string) {
       return records.get(id);
     }),

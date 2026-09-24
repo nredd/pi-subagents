@@ -78,6 +78,7 @@ beforeEach(() => {
   manager = {
     spawn,
     spawnAndWait,
+    warmQuota: vi.fn(async () => {}),
     awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),

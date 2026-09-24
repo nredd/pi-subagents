@@ -30,8 +30,16 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, type ModelScopeVerdict } from "./model-scope.js";
 import type { QuotaExhaustionPolicy } from "./settings.js";
 
+/** A week: long enough to outlast the weekly included-quota window a wait usually parks on. */
 const DEFAULT_QUOTA_WAIT_TIMEOUT_MINUTES = 7 * 24 * 60;
 
+/*
+ * Quota settings state lives here (rather than in an index.ts closure) for the
+ * same reason `scopeModels` lives in model-scope.ts: several entry points read
+ * it (the manager's admission and wait paths, the scheduler, workflow and
+ * nested dispatch), and `/agents -> Settings` rewrites it live through the
+ * setters below.
+ */
 let quotaFallbackModels: string[] | undefined;
 let quotaExhaustionPolicy: QuotaExhaustionPolicy = "fail";
 let quotaWaitTimeoutMinutes = DEFAULT_QUOTA_WAIT_TIMEOUT_MINUTES;
@@ -46,18 +54,22 @@ export function setQuotaFallbackModels(models: string[] | undefined): void {
   quotaFallbackModels = models === undefined ? undefined : [...models];
 }
 
+/** What dispatch does when every model in a chain is quota-blocked: fail now, or park and wait. */
 export function getQuotaExhaustionPolicy(): QuotaExhaustionPolicy {
   return quotaExhaustionPolicy;
 }
 
+/** Set the exhaustion policy; `undefined` restores the default (`"fail"`). */
 export function setQuotaExhaustionPolicy(policy: QuotaExhaustionPolicy | undefined): void {
   quotaExhaustionPolicy = policy ?? "fail";
 }
 
+/** How long a parked quota wait may last before it fails, in minutes. */
 export function getQuotaWaitTimeoutMinutes(): number {
   return quotaWaitTimeoutMinutes;
 }
 
+/** Set the wait timeout; anything but a positive integer restores the 7-day default. */
 export function setQuotaWaitTimeoutMinutes(minutes: number | undefined): void {
   quotaWaitTimeoutMinutes = Number.isInteger(minutes) && (minutes ?? 0) >= 1
     ? (minutes as number)

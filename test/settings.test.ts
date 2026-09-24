@@ -71,6 +71,18 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 8, defaultJoinMode: "group" });
   });
 
+  it("reads subscriptionProviderAliases from the global file only", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    writeGlobal({ subscriptionProviderAliases: { "anthropic-max": "anthropic" } });
+    writeProject({ subscriptionProviderAliases: { "openai-codex": "anthropic" }, maxConcurrent: 2 });
+    expect(loadSettings(projectDir)).toEqual({
+      subscriptionProviderAliases: { "anthropic-max": "anthropic" },
+      maxConcurrent: 2,
+    });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("global file only"));
+    warn.mockRestore();
+  });
+
   it("merges global + project with project winning on conflicts", () => {
     writeGlobal({ maxConcurrent: 16, graceTurns: 10, defaultJoinMode: "async" });
     writeProject({ maxConcurrent: 4, defaultMaxTurns: 50 });
@@ -274,6 +286,31 @@ describe("settings persistence", () => {
   });
 
   describe("sanitizer", () => {
+    it("keeps valid subscriptionProviderAliases and warns on each dropped entry", () => {
+      const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        writeGlobal({ subscriptionProviderAliases: { "anthropic-max": " anthropic ", bad: 3, empty: "", " ": "anthropic" } });
+        expect(loadSettings(projectDir).subscriptionProviderAliases).toEqual({ "anthropic-max": "anthropic" });
+        expect(spy).toHaveBeenCalledTimes(3);
+        expect(String(spy.mock.calls[0][0])).toMatch(/Ignoring subscriptionProviderAliases entry "bad"/);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("drops a non-object subscriptionProviderAliases with a warning", () => {
+      const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        for (const value of [["anthropic"], "anthropic", null]) {
+          writeProject({ subscriptionProviderAliases: value });
+          expect(loadSettings(projectDir).subscriptionProviderAliases).toBeUndefined();
+        }
+        expect(spy).toHaveBeenCalledTimes(3);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it("drops maxConcurrent < 1", () => {
       writeProject({ maxConcurrent: 0, graceTurns: 5 });
       expect(loadSettings(projectDir)).toEqual({ graceTurns: 5 });
@@ -555,6 +592,7 @@ describe("settings persistence", () => {
         setQuotaFallbackModels: vi.fn(),
         setQuotaExhaustionPolicy: vi.fn(),
         setQuotaWaitTimeoutMinutes: vi.fn(),
+        setSubscriptionProviderAliases: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
@@ -612,9 +650,11 @@ describe("settings persistence", () => {
           quotaFallbackModels: ["openai-codex/gpt-5.6-terra"],
           quotaExhaustionPolicy: "wait-async",
           quotaWaitTimeoutMinutes: 60,
+          subscriptionProviderAliases: { "anthropic-max": "anthropic" },
         },
         appliers,
       );
+      expect(appliers.setSubscriptionProviderAliases).toHaveBeenLastCalledWith({ "anthropic-max": "anthropic" });
       expect(appliers.setQuotaFallbackModels).toHaveBeenLastCalledWith(["openai-codex/gpt-5.6-terra"]);
       expect(appliers.setQuotaExhaustionPolicy).toHaveBeenLastCalledWith("wait-async");
       expect(appliers.setQuotaWaitTimeoutMinutes).toHaveBeenLastCalledWith(60);
@@ -623,6 +663,7 @@ describe("settings persistence", () => {
       expect(appliers.setQuotaFallbackModels).toHaveBeenLastCalledWith(undefined);
       expect(appliers.setQuotaExhaustionPolicy).toHaveBeenLastCalledWith(undefined);
       expect(appliers.setQuotaWaitTimeoutMinutes).toHaveBeenLastCalledWith(undefined);
+      expect(appliers.setSubscriptionProviderAliases).toHaveBeenLastCalledWith(undefined);
     });
 
     it("applies fallbackSubagent through to the registry", () => {
@@ -828,6 +869,7 @@ describe("settings persistence", () => {
         setQuotaFallbackModels: vi.fn(),
         setQuotaExhaustionPolicy: vi.fn(),
         setQuotaWaitTimeoutMinutes: vi.fn(),
+        setSubscriptionProviderAliases: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),

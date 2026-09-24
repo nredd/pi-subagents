@@ -253,22 +253,20 @@ export interface SubagentsSettings {
    */
   quotaFallbackModels?: string[];
   /**
-   * What happens when every model in a spawn's effective fallback chain
-   * (primary + `quotaFallbackModels`/frontmatter/call-level fallbacks) is
-   * blocked by exhausted, fresh, included subscription quota.
+   * What happens when every model in a dispatch's effective fallback chain
+   * (primary + frontmatter/call-level/`quotaFallbackModels` fallbacks) is
+   * blocked by an exhausted included subscription window.
    *
-   *   - `fail` (default): today's behavior — the spawn (or resume) is refused
-   *     immediately with the quota message, exactly as when there is no
-   *     fallback chain at all.
-   *   - `wait-async`: reserved for asynchronously-owned work (background/
-   *     detached top-level spawns and resumes, scheduled jobs, workflow and
-   *     nested children) to park until a candidate in the chain becomes
-   *     available instead of failing outright. A top-level FOREGROUND call
-   *     still fails immediately under this policy — there is no caller to wait
-   *     asynchronously on.
-   *
-   * This setting currently only declares the policy; see the changelog for
-   * which behaviors are wired to it in a given release.
+   *   - `fail` (default): the spawn or resume is refused immediately with a
+   *     message naming each model's blocking window and reset time; a
+   *     confirmed mid-run exhaustion ends the run with that message.
+   *   - `wait-async`: asynchronously-owned work (background/detached
+   *     top-level spawns and resumes, scheduled jobs, workflow and nested
+   *     children) parks instead, re-checking usage until a chain model is
+   *     usable or `quotaWaitTimeoutMinutes` elapses. Session and scheduler
+   *     waits are persisted and restored after a restart. A top-level
+   *     FOREGROUND call still fails immediately — parking it would freeze the
+   *     main session.
    */
   quotaExhaustionPolicy?: "fail" | "wait-async";
   /**
@@ -278,6 +276,16 @@ export interface SubagentsSettings {
    * `fail`.
    */
   quotaWaitTimeoutMinutes?: number;
+  /**
+   * Provider name -> subscription usage collector id, for providers that bill
+   * against a subscription a built-in collector already understands under a
+   * different name (e.g. `{ "anthropic-max": "anthropic" }` for a second
+   * Claude login). The aliased provider still uses its OWN credential and its
+   * own cache entry; only the usage endpoint and parser are borrowed. Unset =
+   * no aliases. Entries that are not non-empty string -> string pairs are
+   * dropped with a warning.
+   */
+  subscriptionProviderAliases?: Record<string, string>;
   /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
@@ -370,6 +378,7 @@ export interface SettingsAppliers {
   setQuotaFallbackModels: (v: string[] | undefined) => void;
   setQuotaExhaustionPolicy: (v: QuotaExhaustionPolicy | undefined) => void;
   setQuotaWaitTimeoutMinutes: (n: number | undefined) => void;
+  setSubscriptionProviderAliases: (v: Record<string, string> | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -529,7 +538,32 @@ function sanitize(raw: unknown): SubagentsSettings {
   ) {
     out.quotaWaitTimeoutMinutes = r.quotaWaitTimeoutMinutes as number;
   }
+  if (r.subscriptionProviderAliases !== undefined) {
+    const aliases = sanitizeProviderAliases(r.subscriptionProviderAliases);
+    if (aliases) out.subscriptionProviderAliases = aliases;
+  }
   return out;
+}
+
+/**
+ * Keep the non-empty string -> string entries of `subscriptionProviderAliases`,
+ * warning once per dropped entry (or once for a non-object value) so a typo'd
+ * alias does not silently leave a provider unmetered.
+ */
+function sanitizeProviderAliases(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn("[pi-subagents] Ignoring subscriptionProviderAliases: expected an object of provider -> collector id.");
+    return undefined;
+  }
+  const aliases: Record<string, string> = {};
+  for (const [provider, collector] of Object.entries(raw)) {
+    if (provider.trim() && typeof collector === "string" && collector.trim()) {
+      aliases[provider.trim()] = collector.trim();
+    } else {
+      console.warn(`[pi-subagents] Ignoring subscriptionProviderAliases entry "${provider}": expected a non-empty collector id string.`);
+    }
+  }
+  return aliases;
 }
 
 function globalPath(): string {
@@ -558,7 +592,14 @@ function readSettingsFile(path: string): SubagentsSettings {
 
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  // `subscriptionProviderAliases` decides which endpoint receives a provider's
+  // OAuth token, so it is machine configuration: a project file from a cloned
+  // repo could otherwise route e.g. the ChatGPT token to another vendor.
+  const { subscriptionProviderAliases: projectAliases, ...project } = readSettingsFile(projectPath(cwd));
+  if (projectAliases !== undefined) {
+    console.warn("[pi-subagents] Ignoring subscriptionProviderAliases in project .pi/subagents.json: it routes OAuth credentials and is read from the global file only.");
+  }
+  return { ...readSettingsFile(globalPath()), ...project };
 }
 
 /**
@@ -592,6 +633,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   appliers.setQuotaFallbackModels(s.quotaFallbackModels);
   appliers.setQuotaExhaustionPolicy(s.quotaExhaustionPolicy);
   appliers.setQuotaWaitTimeoutMinutes(s.quotaWaitTimeoutMinutes);
+  appliers.setSubscriptionProviderAliases(s.subscriptionProviderAliases);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

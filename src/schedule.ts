@@ -8,17 +8,18 @@
  *
  * Differences vs pi-cron-schedule:
  *   - Persistence is via ScheduleStore (PID-locked, session-scoped, atomic).
- *   - `executeJob` calls `manager.spawn(..., { bypassQueue: true })` instead
+ *   - `executeJob` warms quota, then calls `manager.spawn(..., { bypassQueue: true })` instead
  *     of dispatching a user message — schedule fires bypass maxConcurrent so
  *     a 5-minute interval can't be deferred behind 4 long-running agents.
  *   - Result delivery is implicit: spawn → background completion → existing
  *     `subagent-notification` followUp path. No new delivery code.
  */
 
+import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import { nanoid } from "nanoid";
-import type { AgentManager } from "./agent-manager.js";
+import type { AgentManager, SpawnOptions } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
@@ -48,16 +49,19 @@ export interface NewJobInput {
   isolation?: IsolationMode;
 }
 
+/** The slice of `AgentManager` the scheduler drives. */
+export type SchedulerManager = Pick<AgentManager, "spawn" | "warmQuota" | "restoreQuotaWait" | "waitForCompletion" | "getRecord">;
+
 export class SubagentScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
   private ctx: ExtensionContext | undefined;
-  private manager: AgentManager | undefined;
+  private manager: SchedulerManager | undefined;
 
   /** Start the scheduler: bind to a session's store and arm enabled jobs. */
-  start(pi: ExtensionAPI, ctx: ExtensionContext, manager: AgentManager, store: ScheduleStore): void {
+  start(pi: ExtensionAPI, ctx: ExtensionContext, manager: SchedulerManager, store: ScheduleStore): void {
     this.pi = pi;
     this.ctx = ctx;
     this.manager = manager;
@@ -177,17 +181,17 @@ export class SubagentScheduler {
         && job.pendingAgentId
         && (job.quotaDispatch !== undefined || job.quotaModelChain?.length)
       ) {
-        this.executeJob(job.id, true);
+        void this.executeJob(job.id, true);
         return;
       }
       if (job.scheduleType === "interval" && job.intervalMs) {
-        const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
+        const t = setInterval(() => void this.executeJob(job.id), job.intervalMs);
         this.intervals.set(job.id, t);
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
         const delay = target - Date.now();
         if (delay > 0) {
-          const t = setTimeout(() => this.executeJob(job.id), delay);
+          const t = setTimeout(() => void this.executeJob(job.id), delay);
           this.intervals.set(job.id, t);
         } else {
           // Past timestamp — disable, mark error, never fire
@@ -195,7 +199,7 @@ export class SubagentScheduler {
           this.emit({ type: "error", jobId: job.id, error: `Scheduled time ${job.schedule} is in the past` });
         }
       } else {
-        const cron = new Cron(job.schedule, () => this.executeJob(job.id));
+        const cron = new Cron(job.schedule, () => void this.executeJob(job.id));
         this.jobs.set(job.id, cron);
       }
     } catch (err) {
@@ -218,11 +222,11 @@ export class SubagentScheduler {
   }
 
   /**
-   * Fire a job: persist running state, spawn (bypassing the concurrency
-   * queue), persist completion. Fire-and-forget: the timer tick returns
-   * immediately so other jobs keep firing.
+   * Fire a job: warm quota, persist running state, spawn (bypassing the
+   * concurrency queue), persist completion. Fire-and-forget: timer ticks call
+   * it with `void`, so other jobs keep firing.
    */
-  private executeJob(id: string, restoringQuotaWait = false): void {
+  private async executeJob(id: string, restoringQuotaWait = false): Promise<void> {
     const store = this.store;
     const pi = this.pi;
     const ctx = this.ctx;
@@ -232,12 +236,10 @@ export class SubagentScheduler {
     if (!job?.enabled) return;
     if (job.quotaWait && !restoringQuotaWait) return;
 
-    store.update(id, { lastStatus: "running" });
-
     // Resolve model at fire time — registry contents may have changed since the
     // job was created (auth added/removed). Fall back silently to spawn-default
     // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
+    let resolvedModel: Model<any> | undefined;
     if (job.model) {
       const r = resolveModel(job.model, ctx.modelRegistry);
       if (typeof r !== "string") resolvedModel = r;
@@ -252,39 +254,49 @@ export class SubagentScheduler {
       // this into lastStatus: "error" plus an error event, like any other
       // fire-time failure.
       if (restoringQuotaWait && job.quotaDispatch) {
-        agentId = manager.restoreQuotaWait(pi, ctx, job.quotaDispatch);
+        const restored = job.quotaDispatch;
+        await manager.warmQuota(ctx, restored.type, { quotaModelChain: restored.modelChain });
+        // Stopped or rebound to another session during the read: not ours to fire.
+        if (this.store !== store) return;
+        store.update(id, { lastStatus: "running" });
+        agentId = manager.restoreQuotaWait(pi, ctx, restored);
       } else {
         const dispatch = resolveSpawnType(job.subagent_type);
         if (!dispatch.ok) throw new Error(dispatch.message);
-        agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
-        description: job.description,
-        isBackground: true,
-        bypassQueue: true,
-        model: resolvedModel,
-        fallbackModels: job.fallbackModels,
-        maxTurns: job.max_turns,
-        isolated: job.isolated,
-        thinkingLevel: job.thinking,
-        isolation: job.isolation,
-        scheduleId: job.id,
-        recordId: restoringQuotaWait ? job.pendingAgentId : undefined,
-        quotaModelChain: restoringQuotaWait ? job.quotaModelChain : undefined,
-        quotaWaitRestore: restoringQuotaWait ? job.quotaWait : undefined,
-        // A scheduled run has no tool call to build this, so without it the
-        // conversation viewer shows nothing about how the job was configured.
-        // The model is left out on purpose: agent-manager fills in the effective
-        // one when the session reports it, and naming the pre-session pick here
-        // would only be right until then.
-        invocation: {
-          thinking: job.thinking,
-          // Normalized like the Agent tool's own snapshot: `0` means unlimited,
-          // and rendering it as "max turns: 0" would read as a limit of none.
-          maxTurns: normalizeMaxTurns(job.max_turns),
+        const options: SpawnOptions = {
+          description: job.description,
+          isBackground: true,
+          bypassQueue: true,
+          model: resolvedModel,
+          fallbackModels: job.fallbackModels,
+          maxTurns: job.max_turns,
           isolated: job.isolated,
-          runInBackground: true,
+          thinkingLevel: job.thinking,
+          isolation: job.isolation,
+          scheduleId: job.id,
+          recordId: restoringQuotaWait ? job.pendingAgentId : undefined,
+          quotaModelChain: restoringQuotaWait ? job.quotaModelChain : undefined,
+          quotaWaitRestore: restoringQuotaWait ? job.quotaWait : undefined,
+          // A scheduled run has no tool call to build this, so without it the
+          // conversation viewer shows nothing about how the job was configured.
+          // The model is left out on purpose: agent-manager fills in the effective
+          // one when the session reports it, and naming the pre-session pick here
+          // would only be right until then.
+          invocation: {
+            thinking: job.thinking,
+            // Normalized like the Agent tool's own snapshot: `0` means unlimited,
+            // and rendering it as "max turns: 0" would read as a limit of none.
+            maxTurns: normalizeMaxTurns(job.max_turns),
+            isolated: job.isolated,
+            runInBackground: true,
             isolation: job.isolation,
           },
-        });
+        };
+        // `spawn` admits from cached quota; a cold cache would fail open.
+        await manager.warmQuota(ctx, dispatch.type, options);
+        if (this.store !== store) return;
+        store.update(id, { lastStatus: "running" });
+        agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, options);
       }
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
@@ -341,16 +353,9 @@ export class SubagentScheduler {
     // AgentManager's promise resolves either way (its .catch returns ""), so we
     // can't infer success/failure from the promise — read record.status instead.
     // Terminal states: completed/steered = success; error/aborted/stopped = error.
-    // awaitStartup first: with isolation: "worktree" the run promise only exists
-    // once the repo copy is made, and a failed copy rejects here.
-    const waitForCompletion = typeof manager.waitForCompletion === "function"
-      ? manager.waitForCompletion(agentId)
-      : manager.awaitStartup(agentId).then(async () => {
-          const record = manager.getRecord(agentId);
-          if (record?.promise) await record.promise;
-          return record;
-        });
-    void waitForCompletion
+    // waitForCompletion covers a quota park, startup (a failed worktree copy
+    // rejects) and the run itself.
+    void manager.waitForCompletion(agentId)
       .then((record) => {
         const r = record ?? manager.getRecord(agentId);
         const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
@@ -375,9 +380,10 @@ export class SubagentScheduler {
       });
       return;
     }
-    if (event.transition === "released") {
-      store.update(job.id, { quotaWait: undefined, quotaDispatch: undefined });
-    }
+    // released, cancelled, timed-out: the wait is over either way, and a
+    // persisted one would be restored as a live wait on the next start.
+    // `pendingAgentId` stays so `finalize` still recognizes this run.
+    store.update(job.id, { quotaWait: undefined, quotaDispatch: undefined });
   }
 
   private emit(event: ScheduleChangeEvent): void {
