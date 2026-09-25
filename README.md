@@ -303,7 +303,7 @@ An unreadable or unparseable agent file is skipped, not fatal — a warning name
 color: red
 description: Security Code Reviewer
 tools: read, grep, find, bash
-model: anthropic/claude-opus-4-6
+model: claude-opus-4-6
 thinking: high
 max_turns: 30
 ---
@@ -340,7 +340,7 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). Workflow scripts are the exception: as in Claude Code, only their `agent()` option decides. `none`, `no`, and `false` are accepted spellings of `off` |
-| `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `model` | inherit parent | Default model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). An explicit `Agent({ model })` selection overrides this default. Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -353,7 +353,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. Other spawn paths differ per field:
+Frontmatter is authoritative for `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`. An agent file's `model` is its portable default; an explicit `Agent({ model })` selection overrides it. Other `Agent` tool parameters only fill fields the agent config leaves unspecified. Other spawn paths differ per field:
 
 - `isolated` holds on every spawn path, including `@handle` mentions, workflows and [cross-extension RPC](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md).
 - `isolation` holds on every path except workflows: as in Claude Code, only the script's `agent()` option decides there.
@@ -670,10 +670,10 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 |---|---|
 | Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
 | Caller-supplied via cross-extension RPC (`subagents:rpc:spawn`, e.g. pi-tasks `TaskExecute`) | Hard error returned to the calling extension, listing allowed models |
-| Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
+| Agent-frontmatter default (no caller model) | Warning toast + the configured default runs |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
-**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).
+**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. An explicit caller model is an orchestrator-level choice and is therefore refused when out of scope; an agent's default or an inherited parent model warns and proceeds. This preserves portable agent definitions while letting an orchestrator deliberately select a target-local logical alias.
 
 **Nested spawns** ([nested subagents](#nested-subagents)) apply the same table against the parent's config root. The hard-error case is identical; the warning cases proceed silently, since a subagent session has no UI to toast to.
 

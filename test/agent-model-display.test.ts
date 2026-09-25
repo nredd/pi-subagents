@@ -232,10 +232,18 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.tags).toContain("thinking: low (asked max)");
   });
 
-  it("discloses a model an agent file pinned over the caller's (#182)", async () => {
-    pinnedAgent("model: anthropic/claude-haiku-4-5\n");
+  it("runs an explicitly requested model over a pinned agent default", async () => {
+    // The frontmatter supplies a portable default. A caller that chose a model
+    // for this dispatch must not silently run that default instead.
+    pinnedAgent("model: claude-haiku-4-5\n");
     const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    let dispatchedModel: { provider: string; id: string } | undefined;
+    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
+      dispatchedModel = options.model;
+      const s = session("anthropic", "claude-opus-4-6", "high");
+      options.onSessionCreated?.(s);
+      return { responseText: "done", session: s, aborted: false, steered: false } as never;
+    });
 
     const result = await tool.execute(
       "tc-5",
@@ -244,49 +252,15 @@ describe("Agent tool result — effective model", () => {
         description: "d",
         subagent_type: "pinned",
         model: "anthropic/claude-opus-4-6",
-        run_in_background: true,
+        run_in_background: false,
       },
       undefined,
       undefined,
       ctx(),
     );
 
-    expect(result.details.modelName).toBe("haiku 4.5 (asked anthropic/claude-opus-4-6)");
-  });
-
-  it("stays quiet when the caller's spelling names the model that won", async () => {
-    // Model input is fuzzy: `"haiku"` and `"anthropic/claude-haiku-4-5"` are the
-    // same model, and the frontmatter did not take anything away from the
-    // caller. Comparing the raw strings would print "haiku 4.5 (asked haiku)".
-    pinnedAgent("model: anthropic/claude-haiku-4-5\n");
-    const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-
-    const result = await tool.execute(
-      "tc-5b",
-      { prompt: "go", description: "d", subagent_type: "pinned", model: "haiku", run_in_background: true },
-      undefined,
-      undefined,
-      ctx(),
-    );
-
-    expect(result.details.modelName).toBe("haiku 4.5");
-  });
-
-  it("discloses a spelling that names no available model at all", async () => {
-    pinnedAgent("model: anthropic/claude-haiku-4-5\n");
-    const tool = agentTool();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-
-    const result = await tool.execute(
-      "tc-5c",
-      { prompt: "go", description: "d", subagent_type: "pinned", model: "gpt-9", run_in_background: true },
-      undefined,
-      undefined,
-      ctx(),
-    );
-
-    expect(result.details.modelName).toBe("haiku 4.5 (asked gpt-9)");
+    expect(dispatchedModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+    expect(result.details.modelName).toBe("opus 4.6");
   });
 
   it("says nothing about a request that was honored", async () => {
