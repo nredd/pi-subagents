@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import { readEnterpriseLocalManifest } from "./enterprise-local.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
@@ -286,6 +287,8 @@ export interface SubagentsSettings {
    * dropped with a warning.
    */
   subscriptionProviderAliases?: Record<string, string>;
+  /** Trusted-global logical name -> ordered canonical provider/model candidates. */
+  modelAliases?: Record<string, string[]>;
   /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
@@ -379,6 +382,8 @@ export interface SettingsAppliers {
   setQuotaExhaustionPolicy: (v: QuotaExhaustionPolicy | undefined) => void;
   setQuotaWaitTimeoutMinutes: (n: number | undefined) => void;
   setSubscriptionProviderAliases: (v: Record<string, string> | undefined) => void;
+  /** Optional during extension upgrades where an older caller supplies appliers. */
+  setModelAliases?: (v: Record<string, string[]> | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -542,6 +547,10 @@ function sanitize(raw: unknown): SubagentsSettings {
     const aliases = sanitizeProviderAliases(r.subscriptionProviderAliases);
     if (aliases) out.subscriptionProviderAliases = aliases;
   }
+  if (r.modelAliases !== undefined) {
+    const aliases = sanitizeModelAliases(r.modelAliases);
+    if (aliases) out.modelAliases = aliases;
+  }
   return out;
 }
 
@@ -562,6 +571,31 @@ function sanitizeProviderAliases(raw: unknown): Record<string, string> | undefin
     } else {
       console.warn(`[pi-subagents] Ignoring subscriptionProviderAliases entry "${provider}": expected a non-empty collector id string.`);
     }
+  }
+  return aliases;
+}
+
+/** Validate one-way logical aliases without interpreting provider details. */
+function sanitizeModelAliases(raw: unknown): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn("[pi-subagents] Ignoring modelAliases: expected an object of alias -> provider/model candidates.");
+    return undefined;
+  }
+  const aliases: Record<string, string[]> = {};
+  const seen = new Set<string>();
+  for (const [alias, rawCandidates] of Object.entries(raw)) {
+    const normalized = alias.trim().toLowerCase();
+    const candidates = Array.isArray(rawCandidates)
+      ? rawCandidates.filter((candidate): candidate is string => typeof candidate === "string")
+        .map(candidate => candidate.trim()).filter(Boolean)
+      : [];
+    if (!normalized || normalized.includes("/") || seen.has(normalized) || candidates.length === 0
+      || candidates.some(candidate => !candidate.includes("/"))) {
+      console.warn(`[pi-subagents] Ignoring invalid modelAliases entry "${alias}".`);
+      continue;
+    }
+    seen.add(normalized);
+    aliases[normalized] = [...new Set(candidates)];
   }
   return aliases;
 }
@@ -595,11 +629,16 @@ export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
   // `subscriptionProviderAliases` decides which endpoint receives a provider's
   // OAuth token, so it is machine configuration: a project file from a cloned
   // repo could otherwise route e.g. the ChatGPT token to another vendor.
-  const { subscriptionProviderAliases: projectAliases, ...project } = readSettingsFile(projectPath(cwd));
+  const { subscriptionProviderAliases: projectAliases, modelAliases: projectModelAliases, ...project } = readSettingsFile(projectPath(cwd));
   if (projectAliases !== undefined) {
     console.warn("[pi-subagents] Ignoring subscriptionProviderAliases in project .pi/subagents.json: it routes OAuth credentials and is read from the global file only.");
   }
-  return { ...readSettingsFile(globalPath()), ...project };
+  if (projectModelAliases !== undefined) {
+    console.warn("[pi-subagents] Ignoring modelAliases in project .pi/subagents.json: aliases are read from trusted global configuration only.");
+  }
+  const enterprise = readEnterpriseLocalManifest()?.subagents;
+  const enterpriseSettings = enterprise === undefined ? {} : sanitize(enterprise);
+  return { ...readSettingsFile(globalPath()), ...enterpriseSettings, ...project };
 }
 
 /**
@@ -634,6 +673,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   appliers.setQuotaExhaustionPolicy(s.quotaExhaustionPolicy);
   appliers.setQuotaWaitTimeoutMinutes(s.quotaWaitTimeoutMinutes);
   appliers.setSubscriptionProviderAliases(s.subscriptionProviderAliases);
+  appliers.setModelAliases?.(s.modelAliases);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

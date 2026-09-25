@@ -653,6 +653,23 @@ Standalone top-level waits are journaled in the parent session and restored on `
 
 **System-prompt summary.** Each turn's prompt gets one line per provider of the session's scoped models and current model, e.g. `anthropic: five_hour 25-50%; seven_day <25%`. It uses cached data only and never waits on a read: a provider whose cache expired keeps showing its last-known buckets, one never read shows `usage unavailable`, and either gets a background read, so the next turn has data. Usage is bucketed (`<25%`, `25-50%`, `50-75%`, `75-100%`, `exhausted until <UTC minute>`) so the text, and with it the prompt-cache prefix, only changes when capacity meaningfully changes. `subscription_usage` and `/subscription-usage` show exact percentages.
 
+## Machine-local model aliases
+
+`~/.pi/agent/enterprise.local.json` is an optional, owner-only (`0600`) machine-local manifest for provider configuration that must never enter a repository. Its `subagents.modelAliases` section maps a logical name to ordered canonical `provider/modelId` candidates. The extension loads it only from the user agent directory, never from a project, and only accepts manifest version `1`.
+
+```json
+{
+  "version": 1,
+  "subagents": {
+    "modelAliases": {
+      "logical-coding-model": ["example-provider/example-wire-model"]
+    }
+  }
+}
+```
+
+Alias candidates are resolved in order against authenticated models; Pi sessions, schedules, and quota waits retain only the selected canonical ID. Missing, malformed, group-readable, or unsupported manifests are ignored with a safe path-and-reason warning. Aliases may not contain `/`; candidates must be canonical IDs, so aliases cannot recurse. A request whose alias has no available candidate fails with its alias and candidate IDs, never credential data.
+
 ## Model Scope
 
 **Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
