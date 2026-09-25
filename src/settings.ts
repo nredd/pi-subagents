@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import { readEnterpriseLocalManifest } from "./enterprise-local.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
@@ -240,6 +241,8 @@ export interface SubagentsSettings {
    * meaning one thing here and another in the resolver.
    */
   fallbackSubagent?: string;
+  /** Trusted-global logical name -> ordered canonical provider/model candidates. */
+  modelAliases?: Record<string, string[]>;
   /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
@@ -328,6 +331,7 @@ export interface SettingsAppliers {
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
+  setModelAliases: (v: Record<string, string[]> | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -461,7 +465,36 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
+  if (r.modelAliases !== undefined) {
+    const aliases = sanitizeModelAliases(r.modelAliases);
+    if (aliases) out.modelAliases = aliases;
+  }
   return out;
+}
+
+/** Validate one-way logical aliases without interpreting provider details. */
+function sanitizeModelAliases(raw: unknown): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn("[pi-subagents] Ignoring modelAliases: expected an object of alias -> provider/model candidates.");
+    return undefined;
+  }
+  const aliases: Record<string, string[]> = {};
+  const seen = new Set<string>();
+  for (const [alias, rawCandidates] of Object.entries(raw)) {
+    const normalized = alias.trim().toLowerCase();
+    const candidates = Array.isArray(rawCandidates)
+      ? rawCandidates.filter((candidate): candidate is string => typeof candidate === "string")
+        .map(candidate => candidate.trim()).filter(Boolean)
+      : [];
+    if (!normalized || normalized.includes("/") || seen.has(normalized) || candidates.length === 0
+      || candidates.some(candidate => !candidate.includes("/"))) {
+      console.warn(`[pi-subagents] Ignoring invalid modelAliases entry "${alias}".`);
+      continue;
+    }
+    seen.add(normalized);
+    aliases[normalized] = [...new Set(candidates)];
+  }
+  return aliases;
 }
 
 function globalPath(): string {
@@ -490,7 +523,15 @@ function readSettingsFile(path: string): SubagentsSettings {
 
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  // Aliases pick the provider a subagent runs on, so they are machine
+  // configuration: a cloned repo's project file must not redirect them.
+  const { modelAliases: projectModelAliases, ...project } = readSettingsFile(projectPath(cwd));
+  if (projectModelAliases !== undefined) {
+    console.warn("[pi-subagents] Ignoring modelAliases in project .pi/subagents.json: aliases are read from trusted global configuration only.");
+  }
+  const enterprise = readEnterpriseLocalManifest()?.subagents;
+  const enterpriseSettings = enterprise === undefined ? {} : sanitize(enterprise);
+  return { ...readSettingsFile(globalPath()), ...enterpriseSettings, ...project };
 }
 
 /**
@@ -519,6 +560,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  // Module state: reset when a session omits it, or the previous activation's aliases leak.
+  appliers.setModelAliases(s.modelAliases);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

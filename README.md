@@ -319,7 +319,7 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
-| `model` | inherit parent | Default model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). An explicit `Agent({ model })` selection overrides this default. Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `model` | inherit parent | Default model — `provider/modelId`, [machine-local alias](#machine-local-model-aliases), or fuzzy name (`"haiku"`, `"sonnet"`). An explicit `Agent({ model })` selection overrides this default. Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -419,7 +419,7 @@ Launch a sub-agent.
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
 | `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
-| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
+| `model` | string | no | Model — `provider/modelId`, [machine-local alias](#machine-local-model-aliases), or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
@@ -594,6 +594,23 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
+
+## Machine-local model aliases
+
+`~/.pi/agent/enterprise.local.json` is an optional, owner-only (`0600`) machine-local manifest for provider configuration that must never enter a repository. Its `subagents.modelAliases` section maps a logical name to ordered canonical `provider/modelId` candidates. The extension loads it only from the user agent directory, never from a project, and only accepts manifest version `1`. The same `modelAliases` key is also accepted in the global `~/.pi/agent/subagents.json` (when both define it, the manifest's whole set replaces the global one); a project `.pi/subagents.json` value is ignored with a warning, so a cloned repo cannot redirect which provider a subagent runs on.
+
+```json
+{
+  "version": 1,
+  "subagents": {
+    "modelAliases": {
+      "logical-coding-model": ["example-provider/example-wire-model"]
+    }
+  }
+}
+```
+
+Alias candidates are resolved in order against authenticated models; Pi sessions and schedules retain only the selected canonical ID. Missing, malformed, group-readable, or unsupported manifests are ignored with a safe path-and-reason warning. Aliases may not contain `/`; candidates must be canonical IDs, so aliases cannot recurse. A request whose alias has no available candidate fails with its alias and candidate IDs, never credential data.
 
 ## Model Scope
 

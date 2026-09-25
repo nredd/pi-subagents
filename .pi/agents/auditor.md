@@ -1,7 +1,7 @@
 ---
 description: Security Code Reviewer
 tools: read, grep, find, bash
-model: anthropic/claude-haiku-4-5-20251001
+model: claude-haiku-4-5
 thinking: off
 max_turns: 10
 ---

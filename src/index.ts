@@ -29,7 +29,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, setModelAliases } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -1424,6 +1424,7 @@ export default function (pi: ExtensionAPI) {
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
+      setModelAliases,
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -3492,6 +3493,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // explicit configuration — which then fails loudly if general-purpose later
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
+      // Global-only (see loadSettings): never written into the project file.
+      modelAliases: undefined,
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),

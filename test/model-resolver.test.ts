@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeModel, type ModelRegistry, resolveModel } from "../src/model-resolver.js";
+import { describeModel, getModelAliases, type ModelRegistry, resolveModel, setModelAliases } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -23,6 +23,22 @@ function makeRegistry(models = MODELS, available?: typeof MODELS): ModelRegistry
 }
 
 describe("resolveModel", () => {
+  it("resolves a logical alias to its first available canonical candidate", () => {
+    setModelAliases({ "logical-sonnet": ["missing/model", "anthropic/claude-sonnet-4-6"] });
+    expect(getModelAliases().get("logical-sonnet")).toEqual(["missing/model", "anthropic/claude-sonnet-4-6"]);
+    expect(resolveModel("logical-sonnet", makeRegistry())).toEqual(MODELS[1]);
+  });
+
+  it("reports aliases whose configured candidates are unavailable without leaking configuration", () => {
+    setModelAliases({ unavailable: ["missing/model"] });
+    expect(resolveModel("unavailable", makeRegistry())).toContain('Model alias "unavailable" has no available candidate');
+  });
+
+  it("preserves exact canonical provider/model resolution when aliases exist", () => {
+    setModelAliases({ "logical-sonnet": ["anthropic/claude-sonnet-4-6"] });
+    expect(resolveModel("anthropic/claude-opus-4-6", makeRegistry())).toEqual(MODELS[0]);
+  });
+
   describe("exact match (provider/modelId)", () => {
     it("resolves exact provider/modelId", () => {
       const result = resolveModel("anthropic/claude-opus-4-6", makeRegistry());
