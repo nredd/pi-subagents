@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
 
+- **Machine-local model aliases.** `~/.pi/agent/enterprise.local.json` (owner-only, version `1`) can map a logical name to ordered canonical `provider/modelId` candidates under `subagents.modelAliases`, so agent definitions and `Agent({ model })` calls stay portable across machines whose providers differ, e.g. an enterprise proxy. Aliases are also read from the global `subagents.json`, never from a project file.
+
+### Changed
+- **`Explore` defaults to the provider-neutral `claude-haiku-4-5`** instead of `anthropic/claude-haiku-4-5`, so a machine-local alias or fuzzy match can pick the provider. With the stock `anthropic` provider it resolves to the same model.
+
 ### Fixed
 - **`typebox` and `@sinclair/typebox` are peer dependencies.** pi maps both to its own copy, and pi 0.99 warns on every startup when a package lists host-provided modules under `dependencies`.
 - **An explicit `Agent({ model })` selection now overrides an agent frontmatter model default.** Agent definitions are reusable specialist defaults, not a provider-policy boundary: a caller that deliberately selects a model (e.g. a `router/*` virtual model) now runs it instead of silently taking `Explore`'s Haiku default. Thinking and the remaining frontmatter execution policy stay authoritative. The same precedence applies to nested delegation.

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -271,6 +271,72 @@ describe("settings persistence", () => {
     writeGlobal({ graceTurns: 10 });
     writeProject({ maxConcurrent: 2 });
     expect(loadSettings(projectDir)).toEqual({ graceTurns: 10, maxConcurrent: 2 });
+  });
+
+  describe("modelAliases", () => {
+    const manifestFile = () => join(globalDir, "enterprise.local.json");
+    function writeManifest(obj: unknown, mode = 0o600) {
+      writeFileSync(manifestFile(), JSON.stringify(obj));
+      chmodSync(manifestFile(), mode);
+    }
+
+    it("loads aliases from the owner-only enterprise manifest", () => {
+      writeManifest({ version: 1, subagents: { modelAliases: { "Claude-Sonnet-5": ["corp/anthropic::claude-5-sonnet"] } } });
+      expect(loadSettings(projectDir).modelAliases).toEqual({ "claude-sonnet-5": ["corp/anthropic::claude-5-sonnet"] });
+    });
+
+    it("lets the manifest override global subagents.json aliases", () => {
+      writeGlobal({ modelAliases: { fast: ["anthropic/claude-haiku-4-5"] } });
+      writeManifest({ version: 1, subagents: { modelAliases: { fast: ["corp/haiku"] } } });
+      expect(loadSettings(projectDir).modelAliases).toEqual({ fast: ["corp/haiku"] });
+    });
+
+    it("ignores project aliases so a cloned repo cannot redirect providers", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeGlobal({ modelAliases: { fast: ["anthropic/claude-haiku-4-5"] } });
+      writeProject({ modelAliases: { fast: ["evil/model"] }, maxConcurrent: 2 });
+      expect(loadSettings(projectDir)).toEqual({ modelAliases: { fast: ["anthropic/claude-haiku-4-5"] }, maxConcurrent: 2 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring modelAliases in project"));
+      warn.mockRestore();
+    });
+
+    it("ignores a group- or world-readable manifest without printing its contents", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeManifest({ version: 1, subagents: { modelAliases: { fast: ["corp/secret-model"] } } }, 0o644);
+      expect(loadSettings(projectDir).modelAliases).toBeUndefined();
+      expect(warn.mock.calls.flat().join("\n")).not.toContain("secret-model");
+      warn.mockRestore();
+    });
+
+    it("ignores an unsupported manifest version", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeManifest({ version: 2, subagents: { modelAliases: { fast: ["corp/haiku"] } } });
+      expect(loadSettings(projectDir).modelAliases).toBeUndefined();
+      warn.mockRestore();
+    });
+
+    it("drops invalid entries and keeps valid ones", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeManifest({
+        version: 1,
+        subagents: {
+          modelAliases: {
+            good: ["corp/a", "corp/a", "corp/b"],
+            "has/slash": ["corp/a"],
+            bare: ["no-provider"],
+            empty: [],
+          },
+        },
+      });
+      expect(loadSettings(projectDir).modelAliases).toEqual({ good: ["corp/a", "corp/b"] });
+      warn.mockRestore();
+    });
+
+    it("applySettings resets aliases when a session omits them", () => {
+      const setModelAliases = vi.fn();
+      applySettings({}, { setModelAliases } as unknown as SettingsAppliers);
+      expect(setModelAliases).toHaveBeenCalledWith(undefined);
+    });
   });
 
   describe("sanitizer", () => {
@@ -552,6 +618,7 @@ describe("settings persistence", () => {
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
+        setModelAliases: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
@@ -803,6 +870,7 @@ describe("settings persistence", () => {
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
+        setModelAliases: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),

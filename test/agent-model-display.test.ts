@@ -7,7 +7,7 @@
  * reported as though it had been honored (#182), and a resume rendered the
  * parameters of the call rather than the session it reopened.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { setModelAliases } from "../src/model-resolver.js";
 
 function agentTool() {
   const tools = new Map<string, any>();
@@ -66,6 +67,7 @@ function session(provider: string, id: string, thinkingLevel: string, name?: str
 const MODELS = [
   { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" },
   { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+  { provider: "corp_anthropic", id: "anthropic::claude-5-sonnet", name: "Claude 5 Sonnet" },
 ];
 
 const MODEL_NAMES: Record<string, string> = Object.fromEntries(MODELS.map(m => [m.id, m.name]));
@@ -106,6 +108,7 @@ beforeEach(() => {
   originalHome = process.env.HOME;
   process.env.PI_CODING_AGENT_DIR = join(cwd, "agent-dir");
   process.env.HOME = cwd;
+  setModelAliases(undefined);
 });
 
 afterEach(() => {
@@ -118,6 +121,7 @@ afterEach(() => {
   registerAgents(new Map());
   rmSync(cwd, { recursive: true, force: true });
   vi.restoreAllMocks();
+  setModelAliases(undefined);
 });
 
 describe("Agent tool result — effective model", () => {
@@ -261,6 +265,38 @@ describe("Agent tool result — effective model", () => {
 
     expect(dispatchedModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
     expect(result.details.modelName).toBe("opus 4.6");
+  });
+
+  it("resolves a requested machine-local alias to its canonical model", async () => {
+    // Enterprise machines name models through aliases, e.g. `work-coder`
+    // -> a corporate proxy provider. The dispatch must carry the canonical model.
+    pinnedAgent("model: claude-haiku-4-5\n");
+    const agentDir = process.env.PI_CODING_AGENT_DIR as string;
+    mkdirSync(agentDir, { recursive: true });
+    const manifest = join(agentDir, "enterprise.local.json");
+    writeFileSync(
+      manifest,
+      JSON.stringify({ version: 1, subagents: { modelAliases: { "work-coder": ["corp_anthropic/anthropic::claude-5-sonnet"] } } }),
+    );
+    chmodSync(manifest, 0o600);
+    const tool = agentTool();
+    let dispatchedModel: { provider: string; id: string } | undefined;
+    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
+      dispatchedModel = options.model;
+      const s = session("corp_anthropic", "anthropic::claude-5-sonnet", "high", "Claude 5 Sonnet");
+      options.onSessionCreated?.(s);
+      return { responseText: "done", session: s, aborted: false, steered: false } as never;
+    });
+
+    await tool.execute(
+      "tc-alias",
+      { prompt: "go", description: "d", subagent_type: "pinned", model: "work-coder", run_in_background: false },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    expect(dispatchedModel).toMatchObject({ provider: "corp_anthropic", id: "anthropic::claude-5-sonnet" });
   });
 
   it("says nothing about a request that was honored", async () => {
