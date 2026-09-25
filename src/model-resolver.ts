@@ -14,6 +14,25 @@ export interface ModelRegistry {
   getAvailable?(): any[];
 }
 
+/** Logical model aliases supplied only by trusted global machine configuration. */
+let modelAliases = new Map<string, string[]>();
+
+/**
+ * Replace the configured logical aliases. Alias keys are case-insensitive;
+ * candidates are canonical provider/model IDs and are resolved against the
+ * available registry at dispatch time.
+ */
+export function setModelAliases(aliases: Record<string, string[]> | undefined): void {
+  modelAliases = new Map(
+    Object.entries(aliases ?? {}).map(([alias, candidates]) => [alias.toLowerCase(), [...candidates]]),
+  );
+}
+
+/** A copy for diagnostics and tests; callers cannot mutate resolver state. */
+export function getModelAliases(): ReadonlyMap<string, readonly string[]> {
+  return new Map([...modelAliases].map(([alias, candidates]) => [alias, [...candidates]]));
+}
+
 /**
  * Both display forms of a model. The short one goes on tight rows (the widget,
  * the Agent tool result), the canonical one where there is room to disambiguate
@@ -38,6 +57,22 @@ export function describeModel(
  * Returns the Model on success, or an error message string on failure.
  */
 export function resolveModel(
+  input: string,
+  registry: ModelRegistry,
+): any | string {
+  const aliasCandidates = modelAliases.get(input.trim().toLowerCase());
+  if (aliasCandidates) {
+    for (const candidate of aliasCandidates) {
+      const resolved = resolveCanonicalModel(candidate, registry);
+      if (typeof resolved !== "string") return resolved;
+    }
+    return `Model alias "${input}" has no available candidate.\n\nCandidates:\n${aliasCandidates.map(candidate => `  ${candidate}`).join("\n")}`;
+  }
+  return resolveCanonicalModel(input, registry);
+}
+
+/** Resolve an exact or fuzzy provider/model request without consulting aliases. */
+function resolveCanonicalModel(
   input: string,
   registry: ModelRegistry,
 ): any | string {
@@ -105,7 +140,7 @@ export function resolveModel(
   // named provider is preferred when present; this only kicks in when it isn't,
   // so the same model from another provider beats falling back to "inherit".
   if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry);
+    const bare = resolveCanonicalModel(input.slice(slashIdx + 1), registry);
     if (typeof bare !== "string") return bare;
   }
 
