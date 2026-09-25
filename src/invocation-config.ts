@@ -108,15 +108,15 @@ export function resolveAgentInvocationConfig(
   isolated: boolean;
   isolation?: IsolationMode;
   /**
-   * Caller parameters an agent file's frontmatter outranked, so the surfaces can
-   * say "(asked X)" instead of presenting the effective value as the requested
-   * one (#182). Populated only where both sides named something and they
-   * disagree — a caller who asked for what they got was still honored.
+   * Caller thinking levels an agent file's frontmatter outranked, so surfaces
+   * can say "(asked X)" instead of presenting the effective value as requested.
+   * `model` deliberately does not behave this way: an explicit `Agent` model is
+   * an intentional dispatch choice and takes precedence over an agent default.
    *
    * `max_turns` is deliberately absent: no surface renders a requested-vs-
    * effective turn limit, so recording one would be dead data.
    */
-  overridden?: { thinking?: ThinkingLevel; model?: string };
+  overridden?: { thinking?: ThinkingLevel };
 } {
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
@@ -128,14 +128,12 @@ export function resolveAgentInvocationConfig(
     && agentConfig.thinking !== params.thinking
     ? params.thinking as ThinkingLevel
     : undefined;
-  const overriddenModel = agentConfig?.model != null && params.model != null
-    && agentConfig.model !== params.model
-    ? params.model
-    : undefined;
-
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
+    // A frontmatter model is a portable default, not a policy boundary. An
+    // explicit model on the Agent call must win so an orchestrator can select a
+    // profile-neutral alias (e.g. `claude-sonnet-5`) for this dispatch.
+    modelInput: params.model ?? agentConfig?.model,
+    modelFromParams: params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
@@ -145,9 +143,7 @@ export function resolveAgentInvocationConfig(
     // Undefined rather than an empty object when nothing was overridden: callers
     // spread this into the invocation snapshot, and an always-present key would
     // put `requestedThinking: undefined` on every record.
-    overridden: overriddenThinking || overriddenModel
-      ? { thinking: overriddenThinking, model: overriddenModel }
-      : undefined,
+    overridden: overriddenThinking ? { thinking: overriddenThinking } : undefined,
   };
 }
 
