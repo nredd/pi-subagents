@@ -111,8 +111,8 @@ Restrictions:
 With a subscription router installed (e.g. [pi-subscription-router](https://github.com/nredd/pi-subscription-router)), a fresh `Agent` dispatch first asks it whether the model is out of included quota, over `pi.events`: `router:rpc:admit` `{ requestId, model: "provider/id" }`, replied on `router:rpc:admit:reply:<requestId>` as `{ success, data: { ok, resetAt? } }`.
 
 - Admitted, or no router answers within 100ms: the agent starts as usual
-- Refused, background, reset known, scheduling on: the dispatch is parked as a one-shot scheduled job a minute after the reset, persisted like any schedule. When it fires it asks again and re-parks at the new reset while still blocked
-- Refused otherwise: the call fails with the reset time and no agent starts
+- Refused, background, reset known, scheduling on: the dispatch is parked as a one-shot scheduled job a minute after the reset, persisted like any schedule. When it fires it asks again and re-parks at the new reset while still blocked. If pi was closed through the reset, it asks again 10s after the session starts, once the router has warmed its usage cache
+- Refused otherwise (foreground, `inherit_context`, scheduling off, or unknown reset): the call fails with the reset time and no agent starts
 
 Resumes, cron and interval jobs, and RPC or workflow spawns are not gated. A `router/*` virtual model still routes each request inside the child.
 
