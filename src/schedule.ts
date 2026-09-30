@@ -22,6 +22,7 @@ import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
+import { checkAdmission, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -45,6 +46,8 @@ export interface NewJobInput {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  /** Set by quota admission; see `ScheduledSubagent.quotaParked`. */
+  quotaParked?: boolean;
 }
 
 export class SubagentScheduler {
@@ -108,6 +111,7 @@ export class SubagentScheduler {
       max_turns: input.max_turns,
       isolated: input.isolated,
       isolation: input.isolation,
+      quotaParked: input.quotaParked,
       enabled: true,
       createdAt: new Date().toISOString(),
       runCount: 0,
@@ -237,6 +241,39 @@ export class SubagentScheduler {
       const r = resolveModel(job.model, ctx.modelRegistry);
       if (typeof r !== "string") resolvedModel = r;
     }
+
+    // A quota-parked job re-asks the router before starting: the window it
+    // waited for may have refilled while another is still exhausted.
+    const admissionModel = resolvedModel ?? ctx.model;
+    if (job.quotaParked && admissionModel) {
+      void checkAdmission(pi.events, modelRef(admissionModel)).then(block => {
+        if (block?.resetAt !== undefined && block.resetAt > Date.now()) this.repark(id, block.resetAt);
+        else this.spawnJob(id, resolvedModel);
+      });
+      return;
+    }
+    this.spawnJob(id, resolvedModel);
+  }
+
+  /** Re-arm a quota-parked one-shot at a later reset instead of starting it. */
+  private repark(id: string, resetAt: number): void {
+    if (!this.store?.get(id)) return;
+    this.updateJob(id, {
+      enabled: true,
+      schedule: new Date(resetAt + QUOTA_RESTART_GRACE_MS).toISOString(),
+      lastStatus: undefined,
+    });
+  }
+
+  /** Spawn a fired job (bypassing the concurrency queue) and persist its outcome. */
+  private spawnJob(id: string, resolvedModel: any | undefined): void {
+    const store = this.store;
+    const pi = this.pi;
+    const ctx = this.ctx;
+    const manager = this.manager;
+    if (!store || !pi || !ctx || !manager) return;
+    const job = store.get(id);
+    if (!job) return;
 
     let agentId: string;
     try {
