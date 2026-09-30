@@ -15,6 +15,7 @@ import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { nanoid } from "nanoid";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
@@ -32,6 +33,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { checkAdmission, describeBlock, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -2017,6 +2019,37 @@ Terse command-style prompts produce shallow, generic work.
         return textResult(
           record.result?.trim() || "No output.",
           buildDetails(detailBaseFor(record), record),
+        );
+      }
+
+      // Quota admission for fresh spawns; a resume keeps its session's model.
+      // A background dispatch parks as a one-shot scheduled job at the reset,
+      // which the schedule store persists across restarts. Anything else fails
+      // now, with the reset, rather than starting on an exhausted provider.
+      const dispatchModel = model ?? ctx.model;
+      const quotaBlock = dispatchModel ? await checkAdmission(pi.events, modelRef(dispatchModel)) : undefined;
+      if (quotaBlock) {
+        const canPark = runInBackground && !inheritContext && quotaBlock.resetAt !== undefined
+          && isSchedulingEnabled() && scheduler.isActive();
+        if (!canPark || quotaBlock.resetAt === undefined) {
+          throw new Error(`${describeBlock(quotaBlock)} The agent was not started.`);
+        }
+        const job = scheduler.addJob({
+          name: `${params.description} (quota ${nanoid(4)})`,
+          description: params.description as string,
+          schedule: new Date(quotaBlock.resetAt + QUOTA_RESTART_GRACE_MS).toISOString(),
+          subagent_type: requestedType,
+          prompt: params.prompt as string,
+          model: dispatchModel ? modelRef(dispatchModel) : undefined,
+          thinking,
+          max_turns: effectiveMaxTurns,
+          isolated,
+          isolation,
+          quotaParked: true,
+        });
+        return textResult(
+          `${fallbackNote}${describeBlock(quotaBlock)} Queued "${job.name}" (id: ${job.id}) to start at ` +
+          `${scheduler.getNextRun(job.id) ?? job.schedule}. Manage via /agents → Scheduled jobs.`,
         );
       }
 

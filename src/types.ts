@@ -365,6 +365,11 @@ export interface ScheduledSubagent {
   createdAt: string;
   lastRun?: string;
   lastStatus?: "success" | "error" | "running";
+  /**
+   * Parked by quota admission: re-check admission at fire time and re-park at
+   * the new reset while the model is still blocked. See `quota-admission.ts`.
+   */
+  quotaParked?: boolean;
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;

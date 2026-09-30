@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
+
 ### Fixed
 - **An explicit `Agent({ model })` selection now overrides an agent frontmatter model default.** Agent definitions are reusable specialist defaults, not a provider-policy boundary: a caller that deliberately selects a model (e.g. a `router/*` virtual model) now runs it instead of silently taking `Explore`'s Haiku default. Thinking and the remaining frontmatter execution policy stay authoritative. The same precedence applies to nested delegation.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
