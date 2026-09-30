@@ -22,7 +22,7 @@ import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
-import { checkAdmission, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
+import { checkAdmission, modelRef, PARKED_RESUME_DELAY_MS, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -179,7 +179,10 @@ export class SubagentScheduler {
         this.intervals.set(job.id, t);
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
-        const delay = target - Date.now();
+        let delay = target - Date.now();
+        // A quota-parked job whose reset passed while pi was closed still owes a
+        // dispatch: re-admit it shortly after start instead of erroring it.
+        if (delay <= 0 && job.quotaParked) delay = PARKED_RESUME_DELAY_MS;
         if (delay > 0) {
           const t = setTimeout(() => {
             this.executeJob(job.id);

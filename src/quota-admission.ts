@@ -73,3 +73,10 @@ export function describeBlock(block: QuotaBlock): string {
 
 /** Delay past a reported reset before a parked dispatch starts, so usage has refilled. */
 export const QUOTA_RESTART_GRACE_MS = 60_000;
+
+/**
+ * Delay before re-admitting a parked dispatch whose reset passed while pi was
+ * closed. The router warms its usage cache on session_start; asking before that
+ * finishes would always fail open.
+ */
+export const PARKED_RESUME_DELAY_MS = 10_000;
