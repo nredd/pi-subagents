@@ -18,7 +18,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import subagentsExtension from "../src/index.js";
-import { ADMIT_CHANNEL, checkAdmission, QUOTA_RESTART_GRACE_MS } from "../src/quota-admission.js";
+import { ADMIT_CHANNEL, checkAdmission, PARKED_RESUME_DELAY_MS, QUOTA_RESTART_GRACE_MS } from "../src/quota-admission.js";
 import { SubagentScheduler } from "../src/schedule.js";
 import { resolveStorePath, ScheduleStore } from "../src/schedule-store.js";
 import { ctx, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
@@ -226,6 +226,34 @@ describe("SubagentScheduler — quota-parked jobs", () => {
     park();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-admits a parked job whose reset passed while pi was closed", async () => {
+    // Persisted by a previous process whose timer never fired.
+    store.add({
+      id: "parked-while-closed", name: "parked", description: "parked", scheduleType: "once",
+      schedule: new Date(Date.now() - 60_000).toISOString(), subagent_type: "general-purpose",
+      prompt: "go", enabled: true, createdAt: new Date(Date.now() - 3_600_000).toISOString(),
+      runCount: 0, quotaParked: true,
+    } as any);
+    const bus = start(() => ({ ok: true }));
+    expect(store.get("parked-while-closed")?.lastStatus).not.toBe("error");
+    // Not at once: the router warms its usage cache on session_start first.
+    await vi.advanceTimersByTimeAsync(PARKED_RESUME_DELAY_MS - 1);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bus.asked).toEqual(["anthropic/claude-sonnet-5-5"]);
+    expect(manager.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("still errors an ordinary past one-shot on start", () => {
+    store.add({
+      id: "past", name: "past", description: "past", scheduleType: "once",
+      schedule: new Date(Date.now() - 60_000).toISOString(), subagent_type: "general-purpose",
+      prompt: "go", enabled: true, createdAt: new Date().toISOString(), runCount: 0,
+    } as any);
+    start(() => ({ ok: true }));
+    expect(store.get("past")).toMatchObject({ enabled: false, lastStatus: "error" });
   });
 
   it("leaves ordinary jobs on the synchronous upstream path", () => {
