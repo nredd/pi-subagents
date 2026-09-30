@@ -35,7 +35,6 @@ const INVOCATION = {
 /** The disclosure shape: both "(asked …)" annotations live, as #257 renders them. */
 const INVOCATION_DISCLOSED = {
   ...INVOCATION,
-  requestedModel: "google/gemini-3-pro",
   requestedThinking: "max",
 } as any;
 

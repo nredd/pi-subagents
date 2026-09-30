@@ -113,7 +113,6 @@ function resolvedInfo(record: AgentRecord | undefined) {
     modelId: invocation.modelId,
     thinking: invocation.thinking,
     requestedThinking: invocation.requestedThinking,
-    requestedModel: invocation.requestedModel,
   };
 }
 
@@ -315,12 +314,6 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // the effective half at session creation; without a seed there is
             // nothing for it to compare against, so a level pi clamped would be
             // indistinguishable from one that was honoured.
-            //
-            // Only the level. #182's other half — a caller parameter an agent
-            // file outranked — cannot arise here: this path resolves
-            // `request.model ?? config?.model`, so the script always wins and
-            // therefore always got what it asked for. Seeding a `requestedModel`
-            // would describe a precedence this path does not have.
             invocation: {
               ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
             },
