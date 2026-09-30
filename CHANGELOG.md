@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
+- **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires, including after a restart that slept through the reset; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
 
 - **Machine-local model aliases.** `~/.pi/agent/enterprise.local.json` (owner-only, version `1`) can map a logical name to ordered canonical `provider/modelId` candidates under `subagents.modelAliases`, so agent definitions and `Agent({ model })` calls stay portable across machines whose providers differ, e.g. an enterprise proxy. Aliases are also read from the global `subagents.json`, never from a project file.
 
