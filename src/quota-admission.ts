@@ -4,7 +4,7 @@
  * Quota tracking lives in a separate extension (nredd/pi-subscription-router),
  * reached over `pi.events` with the same envelope as `cross-extension-rpc.ts`:
  * emit `router:rpc:admit` `{ requestId, model }`, reply on
- * `router:rpc:admit:reply:<requestId>` as `{ success, data?: { ok, resetAt? } }`.
+ * `router:rpc:admit:reply:<requestId>` as `{ success, data?: { ok, resolvedModel?, resetAt? } }` (`resolvedModel` is ignored).
  *
  * Admission fails open. No router installed, a slow router, a malformed reply
  * or a router error all admit the dispatch: quota is advisory here, and the
