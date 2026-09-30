@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
+
 ### Fixed
 - **An explicit `Agent({ model })` selection now overrides an agent frontmatter model default.** Agent definitions are reusable specialist defaults, not a provider-policy boundary: a caller that deliberately selects a model (e.g. a `router/*` virtual model) now runs it instead of silently taking `Explore`'s Haiku default. Thinking and the remaining frontmatter execution policy stay authoritative. The same precedence applies to nested delegation.
 
