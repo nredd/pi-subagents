@@ -93,7 +93,6 @@ export interface WorkflowAgentEntry {
    * it.
    */
   requestedThinking?: string;
-  requestedModel?: string;
   fallbackModel?: string;
   isolation?: "worktree";
   error?: string;
