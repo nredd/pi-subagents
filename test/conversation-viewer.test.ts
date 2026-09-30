@@ -129,14 +129,13 @@ describe("ConversationViewer invocation line", () => {
       .toBe("↳ sonnet 4.6 · thinking: high");
   });
 
-  it("discloses a model and level the run did not honor", () => {
+  it("discloses a thinking level the run did not honor", () => {
     expect(invocationLine({
       modelName: "haiku 4.5",
       modelId: "anthropic/claude-haiku-4-5",
-      requestedModel: "google/gemini-3-pro",
       thinking: "low",
       requestedThinking: "max",
-    })).toBe("↳ anthropic/claude-haiku-4-5 (asked google/gemini-3-pro) · thinking: low (asked max)");
+    })).toBe("↳ anthropic/claude-haiku-4-5 · thinking: low (asked max)");
   });
 
   it("renders no row at all for a record with no invocation", () => {

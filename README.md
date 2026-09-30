@@ -687,7 +687,7 @@ Independent of `reportUsage`: this one is what you read, that one is what your s
 
 Off by default because the row already carries the description, turns, tool uses, tokens and elapsed time, and every character it gains is one the description loses on a narrow terminal. The other surfaces show the pair either way: the `Agent` tool result names the model beside its tags, and the conversation viewer's `↳` row spells out the canonical `provider/model-id`.
 
-Both places report what the run *actually* used, read back from the child session once pi has resolved its defaults and clamped the level to what the model supports — not what the call asked for. Where those differ, the request is kept beside the effective value rather than dropped, whether pi clamped it or an agent file's frontmatter outranked it:
+Both places report what the run *actually* used, read back from the child session once pi has resolved its defaults and clamped the level to what the model supports — not what the call asked for. Where the thinking level differs from the request, because pi clamped it or the agent file's frontmatter outranked it, the request is kept beside the effective value rather than dropped. An explicit `model` always wins over frontmatter, so there's no model request to disclose:
 
 ```text
   ↳ anthropic/claude-haiku-4-5 · thinking: low (asked max) · background

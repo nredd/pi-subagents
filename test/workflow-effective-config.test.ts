@@ -134,12 +134,8 @@ describe("the workflow host reports a child's effective configuration", () => {
     expect(reported[0]?.requestedThinking).toBe("max");
   });
 
-  // Why the workflow path never discloses a model override at all: unlike the
-  // Agent tool (`agentConfig?.model ?? params.model`), this path resolves
-  // `request.model ?? config?.model`, so the script outranks the agent file and
-  // therefore always got the model it asked for. Seeding a `requestedModel` here
-  // would describe a precedence that does not exist.
-  it("lets the script's model outrank the agent file's, so there is nothing to disclose", async () => {
+  // Same precedence as the Agent tool: `request.model ?? config?.model`.
+  it("lets the script's model outrank the agent file's", async () => {
     const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
     const opus = { provider: "anthropic", id: "claude-opus-4-6", name: "Opus 4.6" };
     registerAgents(new Map([["pinned", { name: "pinned", model: "anthropic/claude-opus-4-6" } as any]]));
@@ -158,16 +154,10 @@ describe("the workflow host reports a child's effective configuration", () => {
       }),
       manager,
     });
-    const reported: { requestedModel?: string }[] = [];
+    await host.spawnAgent(spawnRequest({ agentType: "pinned", model: "haiku" }));
 
-    await host.spawnAgent(
-      spawnRequest({ agentType: "pinned", model: "haiku", onResolved: configCollector(reported) }),
-    );
-
-    // The script's "haiku" won over the file's pinned opus...
+    // The script's "haiku" won over the file's pinned opus.
     expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({ model: haiku });
-    // ...so nothing was overridden, and nothing is disclosed.
-    expect(reported[0]?.requestedModel).toBeUndefined();
   });
 
   it("says nothing about a level that was honoured", async () => {

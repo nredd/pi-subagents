@@ -295,8 +295,6 @@ export interface AgentInvocation {
    * neither `requested*` field is overwritten once set.
    */
   requestedThinking?: EffectiveThinkingLevel;
-  /** The caller's `model` parameter, as written, when an agent file's pin won. */
-  requestedModel?: string;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;

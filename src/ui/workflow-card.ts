@@ -199,20 +199,12 @@ export function formatModel(
   entry: WorkflowAgentEntry,
   opts?: { canonical?: boolean },
 ): string | undefined {
-  const { fallbackModel, requestedModel } = entry;
+  const { fallbackModel } = entry;
   // `canonical` is for surfaces with the width for `provider/model-id`; the
   // tight rows take the short label. Chosen here rather than by the caller
   // swapping fields, which would leave `fallbackModel` in the other spelling.
   const model = opts?.canonical ? entry.modelId ?? entry.model : entry.model;
-  const primary = model && fallbackModel && model !== fallbackModel ? `${model}→${fallbackModel}` : model ?? fallbackModel;
-  if (primary === undefined) return undefined;
-  // Disclosed rather than substituted: a model an agent file pinned over the
-  // script's is still a model the script did not get (#182). Same rule as
-  // `buildInvocationTags`' `asked()` — only when the two actually differ, so a
-  // request that was honoured says nothing.
-  return requestedModel !== undefined && requestedModel !== primary
-    ? `${primary} (asked ${requestedModel})`
-    : primary;
+  return model && fallbackModel && model !== fallbackModel ? `${model}→${fallbackModel}` : model ?? fallbackModel;
 }
 
 /**
