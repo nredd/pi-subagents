@@ -96,6 +96,8 @@ Schedule formats:
 
 When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
 
+**Session switches.** `/new`, `/resume`, `/fork` and `/reload` do not stop running background agents. They finish on their own and the session that spawned them gets the completion notification when you return to it (immediately if it is already open). The preview is in the notification; the full output is in the transcript file it names, since `get_subagent_result` cannot reach an agent from a previous session. Quitting pi still aborts everything.
+
 Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
 
 **Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.

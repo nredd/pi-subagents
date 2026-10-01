@@ -25,6 +25,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { type DetachedResult, drainDetached, spoolDetached, watchDetached } from "./detached-results.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -566,6 +567,48 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  /**
+   * Set when a session switch left background agents running in this (now
+   * orphaned) instance; their results are spooled for that session to pick up.
+   */
+  let detachedSessionFile: string | undefined;
+
+  function spoolDetachedResult(sessionFile: string, record: AgentRecord) {
+    if (record.resultConsumed) return;
+    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : "";
+    try {
+      spoolDetached(sessionFile, {
+        id: record.id,
+        content: formatTaskNotification(record, 500, showCost) + footer,
+        details: buildNotificationDetails(record, 500),
+        record: {
+          id: record.id, type: record.type, description: record.description,
+          status: record.status, result: record.result, error: record.error,
+          startedAt: record.startedAt, completedAt: record.completedAt,
+        },
+      });
+    } catch { /* spool unwritable: the transcript file still has the result */ }
+  }
+
+  /** Re-announce agents that finished while this session was switched away. */
+  function deliverDetached(sessionFile: string) {
+    for (const result of drainDetached(sessionFile)) deliverDetachedResult(result);
+  }
+
+  function deliverDetachedResult(result: DetachedResult) {
+    try {
+      pi.appendEntry("subagents:record", result.record);
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: result.content,
+        display: true,
+        details: result.details as NotificationDetails,
+      }, { deliverAs: "followUp", triggerTurn: true });
+    } catch { /* session already gone again; the transcript file still has the result */ }
+  }
+
+  let unwatchDetached: (() => void) | undefined;
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
@@ -573,6 +616,13 @@ export default function (pi: ExtensionAPI) {
     // and dialog. Keep them out of top-level lifecycle, transcript,
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
+
+    // Orphaned by a session switch: this closure's `pi` is stale, so hand the
+    // result to the session it belongs to instead of announcing it here.
+    if (detachedSessionFile !== undefined) {
+      spoolDetachedResult(detachedSessionFile, record);
+      return;
+    }
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -795,6 +845,12 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted(true);
+    const sessionFile = ctx.sessionManager?.getSessionFile?.();
+    if (sessionFile) {
+      unwatchDetached?.();
+      unwatchDetached = watchDetached(sessionFile, () => deliverDetached(sessionFile));
+      deliverDetached(sessionFile);
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1094,9 +1150,15 @@ export default function (pi: ExtensionAPI) {
     scheduler.stop();
   });
 
-  // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
-  pi.on("session_shutdown", async () => {
+  // On quit, abort all agents immediately and clean up: the process is exiting.
+  // On /new, /resume, /fork and /reload the process lives on, so running background
+  // agents are detached instead and hand their results back when the user returns
+  // to this session (see detached-results.ts). Only agents that cannot outlive the
+  // session are aborted.
+  pi.on("session_shutdown", async (event: { reason?: string }) => {
+    const sessionFile = currentCtx?.sessionManager?.getSessionFile?.();
+    unwatchDetached?.();
+    unwatchDetached = undefined;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1113,10 +1175,17 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
-    manager.abortAll();
+    const detaching = event?.reason !== "quit" && sessionFile !== undefined && manager.detach() > 0;
+    if (!detaching) manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
+    if (detaching) {
+      // Disposal waits for the survivors; it also releases their sessions.
+      detachedSessionFile = sessionFile;
+      void manager.waitForAll().then(() => manager.dispose(), () => {});
+      return;
+    }
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those

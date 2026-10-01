@@ -1504,6 +1504,40 @@ export class AgentManager {
     );
   }
 
+  /**
+   * Abort everything that cannot outlive its session and let the rest finish.
+   * Survivors are running top-level background agents and their nested children:
+   * they own their own session and report through a notification. Queued agents
+   * would start later against a stale context, foreground agents belong to a
+   * tool call that is being torn down, and workflow children die with their
+   * workflow, so all of those are aborted.
+   *
+   * @returns how many agents keep running.
+   */
+  detach(): number {
+    for (const queued of this.queue) {
+      const record = this.agents.get(queued.id);
+      if (record) {
+        record.status = "stopped";
+        record.completedAt = Date.now();
+      }
+    }
+    this.dequeue(() => true);
+    let survivors = 0;
+    for (const record of this.agents.values()) {
+      if (record.status !== "running") continue;
+      const outlives = record.workflowId === undefined && (!!record.isBackground || record.parentAgentId !== undefined);
+      if (outlives) {
+        survivors++;
+        continue;
+      }
+      record.abortController?.abort();
+      record.status = "stopped";
+      record.completedAt = Date.now();
+    }
+    return survivors;
+  }
+
   /** Abort all running and queued agents immediately. */
   abortAll(): number {
     let count = 0;
