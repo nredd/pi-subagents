@@ -23,7 +23,7 @@ import { SubagentScheduler } from "../src/schedule.js";
 import { resolveStorePath, ScheduleStore } from "../src/schedule-store.js";
 import { ctx, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
-type Verdict = { ok: boolean; resetAt?: number } | "error" | "silent" | "garbage";
+type Verdict = { ok: boolean; resetAt?: number; wait?: boolean } | "error" | "silent" | "garbage";
 
 /** `pi.events` backed by an EventEmitter, with a fake router answering admission. */
 function routerBus(verdict: (model: string) => Verdict) {
@@ -56,6 +56,13 @@ describe("checkAdmission", () => {
     const { events, asked } = routerBus(() => ({ ok: false, resetAt: 1234 }));
     expect(await checkAdmission(events, "anthropic/x")).toEqual({ model: "anthropic/x", resetAt: 1234 });
     expect(asked).toEqual(["anthropic/x"]);
+  });
+
+  it("carries the router's wait verdict and ignores a non-boolean one", async () => {
+    const { events } = routerBus(() => ({ ok: false, resetAt: 1, wait: false }));
+    expect(await checkAdmission(events, "anthropic/x")).toEqual({ model: "anthropic/x", resetAt: 1, wait: false });
+    const bad = routerBus(() => ({ ok: false, resetAt: 1, wait: "yes" as never }));
+    expect(await checkAdmission(bad.events, "anthropic/x")).toEqual({ model: "anthropic/x", resetAt: 1 });
   });
 
   it("admits on ok, router errors, malformed replies, and silence", async () => {
@@ -122,6 +129,19 @@ describe("Agent tool admission", () => {
     const { run, jobs, done } = await boot(() => ({ ok: false, resetAt }));
     try {
       await expect(run({ subagent_type: "general-purpose", run_in_background: false })).rejects.toThrow(
+        new Date(resetAt).toISOString(),
+      );
+      expect(jobs()).toEqual([]);
+    } finally {
+      await done();
+    }
+  });
+
+  it("fails a blocked background dispatch when the router's policy says not to wait", async () => {
+    const resetAt = Date.now() + 3_600_000;
+    const { run, jobs, done } = await boot(() => ({ ok: false, resetAt, wait: false }));
+    try {
+      await expect(run({ subagent_type: "general-purpose", run_in_background: true })).rejects.toThrow(
         new Date(resetAt).toISOString(),
       );
       expect(jobs()).toEqual([]);
@@ -219,6 +239,14 @@ describe("SubagentScheduler — quota-parked jobs", () => {
     resetAt = undefined;
     await vi.advanceTimersByTimeAsync(12 * 60_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts instead of re-parking when the router's policy now says fail", async () => {
+    start(() => ({ ok: false, resetAt: Date.now() + 10 * 60_000, wait: false }));
+    const job = park();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(manager.spawn).toHaveBeenCalledTimes(1);
+    expect(store.get(job.id)?.enabled).toBe(false);
   });
 
   it("starts anyway when the router is gone, since admission fails open", async () => {
