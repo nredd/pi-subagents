@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Machine-local model aliases.** `~/.pi/agent/enterprise.local.json` (owner-only, version `1`) can map a logical name to ordered canonical `provider/modelId` candidates under `subagents.modelAliases`, so agent definitions and `Agent({ model })` calls stay portable across machines whose providers differ, e.g. an enterprise proxy. Aliases are also read from the global `subagents.json`, never from a project file.
 
+- **Router exhaustion policy.** An admission reply with `wait: false` (the profile's `exhaustionPolicy: "fail"`, or a reset beyond its `maxWaitMinutes`) fails a background dispatch immediately instead of parking it, and a parked job whose policy has since become `fail` starts rather than re-parking. A reply without `wait` still parks, so older routers behave as before.
+
 ### Changed
 - **`Explore` defaults to the provider-neutral `claude-haiku-4-5`** instead of `anthropic/claude-haiku-4-5`, so a machine-local alias or fuzzy match can pick the provider. With the stock `anthropic` provider it resolves to the same model.
 
