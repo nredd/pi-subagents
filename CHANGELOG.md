@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Background agents survive `/new`, `/resume`, `/fork` and `/reload`.** `session_shutdown` aborted every running agent on any of them, losing the findings. Now only `quit` aborts. Otherwise running background agents (and their nested children) finish in the orphaned manager and spool the result under `$TMPDIR/pi-subagents-<uid>/detached/`; the session they were spawned from re-announces it when reopened, or immediately if it is already open again. Foreground, queued and workflow agents are still aborted, as is everything when the session has no file. The full result stays in the transcript file; `get_subagent_result` cannot reach a detached agent.
+- **`typebox` and `@sinclair/typebox` are peer dependencies.** pi maps both to its own copy, and pi 0.99 warns on every startup when a package lists host-provided modules under `dependencies`.
+
 ### Added
 - **Quota admission through a subscription router.** A fresh `Agent` dispatch asks `router:rpc:admit` over `pi.events` first. A refused background dispatch is parked as a persisted one-shot scheduled job at the reset, re-checked when it fires, including after a restart that slept through the reset; anything else fails with the reset time. No router, or no reply within 100ms, admits as before.
 
