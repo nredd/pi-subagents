@@ -4,7 +4,7 @@
  * Quota tracking lives in a separate extension (nredd/pi-subscription-router),
  * reached over `pi.events` with the same envelope as `cross-extension-rpc.ts`:
  * emit `router:rpc:admit` `{ requestId, model }`, reply on
- * `router:rpc:admit:reply:<requestId>` as `{ success, data?: { ok, resolvedModel?, resetAt? } }` (`resolvedModel` is ignored).
+ * `router:rpc:admit:reply:<requestId>` as `{ success, data?: { ok, resolvedModel?, resetAt?, wait? } }` (`resolvedModel` is ignored).
  *
  * Admission fails open. No router installed, a slow router, a malformed reply
  * or a router error all admit the dispatch: quota is advisory here, and the
@@ -31,6 +31,16 @@ export interface AdmissionEvents {
 export interface QuotaBlock {
   model: string;
   resetAt?: number;
+  /**
+   * False when the router's exhaustion policy says fail now instead of parking.
+   * Absent (an older router) means the dispatch may park until `resetAt`.
+   */
+  wait?: boolean;
+}
+
+/** Whether a refused background dispatch may be parked until the block's reset. */
+export function mayPark(block: QuotaBlock): block is QuotaBlock & { resetAt: number } {
+  return block.resetAt !== undefined && block.wait !== false;
 }
 
 /** `provider/id` for a model, the key the router expects. */
@@ -55,10 +65,15 @@ export function checkAdmission(
       resolve(block);
     };
     const unsubscribe = events.on(`${ADMIT_CHANNEL}:reply:${requestId}`, raw => {
-      const reply = raw as { success?: unknown; data?: { ok?: unknown; resetAt?: unknown } } | undefined;
+      const reply = raw as { success?: unknown; data?: { ok?: unknown; resetAt?: unknown; wait?: unknown } } | undefined;
       if (reply?.success !== true || reply.data?.ok !== false) return finish(undefined);
       const resetAt = reply.data.resetAt;
-      finish({ model, resetAt: typeof resetAt === "number" && Number.isFinite(resetAt) ? resetAt : undefined });
+      const wait = reply.data.wait;
+      finish({
+        model,
+        resetAt: typeof resetAt === "number" && Number.isFinite(resetAt) ? resetAt : undefined,
+        ...(typeof wait === "boolean" ? { wait } : {}),
+      });
     });
     const timer = setTimeout(() => finish(undefined), timeoutMs);
     events.emit(ADMIT_CHANNEL, { requestId, model });
