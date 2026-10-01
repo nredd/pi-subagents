@@ -37,7 +37,7 @@ import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, packageNameForPath, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
-import { checkAdmission, describeBlock, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
+import { checkAdmission, describeBlock, mayPark, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -2234,14 +2234,15 @@ Terse command-style prompts produce shallow, generic work.
 
       // Quota admission for fresh spawns; a resume keeps its session's model.
       // A background dispatch parks as a one-shot scheduled job at the reset,
-      // which the schedule store persists across restarts. Anything else fails
+      // which the schedule store persists across restarts, unless the router's
+      // exhaustion policy says fail now (`wait: false`). Anything else fails
       // now, with the reset, rather than starting on an exhausted provider.
       const dispatchModel = model ?? ctx.model;
       const quotaBlock = dispatchModel ? await checkAdmission(pi.events, modelRef(dispatchModel)) : undefined;
       if (quotaBlock) {
-        const canPark = runInBackground && !inheritContext && quotaBlock.resetAt !== undefined
+        const canPark = runInBackground && !inheritContext && mayPark(quotaBlock)
           && isSchedulingEnabled() && scheduler.isActive();
-        if (!canPark || quotaBlock.resetAt === undefined) {
+        if (!canPark || !mayPark(quotaBlock)) {
           throw new Error(`${describeBlock(quotaBlock)} The agent was not started.`);
         }
         const job = scheduler.addJob({
