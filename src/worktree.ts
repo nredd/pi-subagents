@@ -23,6 +23,8 @@ export interface WorktreeInfo {
   branch: string;
   /** Commit SHA that the worktree was created from. */
   baseSha: string;
+  /** Resolved toplevel of the repo the worktree was created from; the result branch lands here. */
+  repoRoot: string;
   /**
    * Where the agent should work inside the worktree: the equivalent of the
    * cwd the worktree was created from. Equals `path` when that cwd was the
@@ -72,49 +74,72 @@ export interface WorktreeCleanupResult {
  */
 async function git(pi: ExtensionAPI, cwd: string, args: string[], timeout: number): Promise<string> {
   const result = await pi.exec("git", args, { cwd, timeout });
-  if (result.killed || result.code !== 0) {
+  if (result.killed) throw new GitTimeoutError(`\`git ${args.join(" ")}\` timed out after ${timeout}ms in ${cwd}`);
+  if (result.code !== 0) {
     throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
   }
   return result.stdout.trim();
 }
 
+/** A git call killed by its timeout — reported as-is, never as a repo-state cause. */
+class GitTimeoutError extends Error {}
+
 /**
- * Create a temporary git worktree for an agent.
- * Returns the worktree path, or undefined if not in a git repo.
+ * Why `createWorktree` could not isolate an agent. The message names the
+ * directory it tried and the specific cause, so a caller can tell "wrong
+ * directory" from "repo with no commits" from a git failure.
  */
-export async function createWorktree(
-  pi: ExtensionAPI,
-  cwd: string,
-  agentId: string,
-): Promise<WorktreeInfo | undefined> {
-  // Verify we're in a git repo with at least one commit (HEAD must exist)
-  let baseSha: string;
-  let subdir: string;
+export class WorktreeError extends Error {}
+
+/** Run one git step, rethrowing a failure as a `WorktreeError` whose message is `cause(detail)`. */
+async function step(run: Promise<string>, cause: (detail: string) => string): Promise<string> {
   try {
-    await git(pi, cwd, ["rev-parse", "--is-inside-work-tree"], 5000);
-    baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
-    // Where cwd sits inside the repo ("" at the root): the agent must work at
-    // the same subdirectory inside the copy, or a monorepo-package cwd would
-    // silently widen to the whole repo. realpath both sides — git emits
-    // resolved paths while cwd may arrive through a symlink (macOS /tmp).
-    const topLevel = await git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000);
-    subdir = relative(realpathSync(topLevel), realpathSync(cwd));
-  } catch {
-    return undefined;
+    return await run;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new WorktreeError(err instanceof GitTimeoutError ? detail : cause(detail));
   }
+}
+
+/**
+ * Create a temporary git worktree for an agent, from the repo containing `cwd`
+ * (which may be any directory inside it, not just the toplevel).
+ *
+ * @throws WorktreeError — `cwd` is not inside a git work tree, the repo has no
+ * commits yet, `git worktree add` failed, or a git call timed out.
+ */
+export async function createWorktree(pi: ExtensionAPI, cwd: string, agentId: string): Promise<WorktreeInfo> {
+  const inside = await step(
+    git(pi, cwd, ["rev-parse", "--is-inside-work-tree"], 5000),
+    detail => `${cwd} is not inside a git repository (${detail})`,
+  );
+  // "false" with a clean exit: inside a `.git` dir or a bare repo.
+  if (inside !== "true") throw new WorktreeError(`${cwd} is inside a git directory but not a work tree`);
+  // realpath both sides — git emits resolved paths while cwd may arrive
+  // through a symlink (macOS /tmp).
+  const repoRoot = realpathSync(await step(
+    git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000),
+    detail => `${cwd} has no git work tree toplevel (${detail})`,
+  ));
+  const baseSha = await step(
+    git(pi, cwd, ["rev-parse", "--verify", "HEAD"], 5000),
+    () => `${repoRoot} has no commits yet; commit at least once`,
+  );
+  // Where cwd sits inside the repo ("" at the root): the agent must work at
+  // the same subdirectory inside the copy, or a monorepo-package cwd would
+  // silently widen to the whole repo.
+  const subdir = relative(repoRoot, realpathSync(cwd));
 
   const branch = `pi-agent-${agentId}`;
   const suffix = randomUUID().slice(0, 8);
   const worktreePath = join(tmpdir(), `pi-agent-${agentId}-${suffix}`);
 
-  try {
-    // Create detached worktree at HEAD
-    await git(pi, cwd, ["worktree", "add", "--detach", worktreePath, "HEAD"], 30000);
-    return { path: worktreePath, branch, baseSha, workPath: subdir ? join(worktreePath, subdir) : worktreePath };
-  } catch {
-    // If worktree creation fails, return undefined (agent runs in normal cwd)
-    return undefined;
-  }
+  // Create detached worktree at HEAD
+  await step(
+    git(pi, cwd, ["worktree", "add", "--detach", worktreePath, "HEAD"], 30000),
+    detail => `\`git worktree add\` failed in ${repoRoot}: ${detail}`,
+  );
+  return { path: worktreePath, branch, baseSha, repoRoot, workPath: subdir ? join(worktreePath, subdir) : worktreePath };
 }
 
 /**

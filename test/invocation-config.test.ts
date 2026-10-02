@@ -1,5 +1,7 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
+import { resolveAgentInvocationConfig, resolveCwdParam, resolveJoinMode } from "../src/invocation-config.js";
 import { setAgentModels } from "../src/model-resolver.js";
 import type { AgentConfig } from "../src/types.js";
 
@@ -215,5 +217,27 @@ describe("agentModels precedence", () => {
     expect(resolveAgentInvocationConfig(makeConfig({ name: "Explore", model: "definition-model" }), {}, { agentType: "Explore" }).modelInput)
       .toBe("definition-model");
     expect(resolveAgentInvocationConfig(makeConfig({ name: "Explore" }), {}, { agentType: "Explore" }).modelInput).toBeUndefined();
+  });
+});
+
+describe("resolveCwdParam", () => {
+  it("is unset when omitted or blank (models fill optional params with \"\")", () => {
+    expect(resolveCwdParam(undefined, "/session")).toBeUndefined();
+    expect(resolveCwdParam("", "/session")).toBeUndefined();
+    expect(resolveCwdParam("  ", "/session")).toBeUndefined();
+  });
+
+  it("expands ~ and ~/ to the home directory", () => {
+    expect(resolveCwdParam("~", "/session")).toBe(homedir());
+    expect(resolveCwdParam("~/code/repo", "/session")).toBe(join(homedir(), "code", "repo"));
+  });
+
+  it("keeps an absolute path and resolves a relative one against the session cwd", () => {
+    expect(resolveCwdParam("/abs/repo/", "/session")).toBe("/abs/repo");
+    expect(resolveCwdParam("../other/pkg", "/session/here")).toBe("/session/other/pkg");
+  });
+
+  it("does not expand ~user (only the caller's own home)", () => {
+    expect(resolveCwdParam("~bob/x", "/session")).toBe("/session/~bob/x");
   });
 });

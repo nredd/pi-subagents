@@ -26,7 +26,7 @@ import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeInfo } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -760,13 +760,17 @@ export class AgentManager {
     // that omits the field can't stop a caller that never saw the schema.
     let worktreeCwd: string | undefined;
     if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
-      if (!wt) {
+      let wt: WorktreeInfo;
+      try {
+        wt = await createWorktree(pi, baseCwd, id);
+      } catch (err) {
         releaseSlot();
-        throw new Error(
-          'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-          'Initialize git and commit at least once, or omit `isolation`.',
-        );
+        const cause = err instanceof Error ? err.message : String(err);
+        // Only a parent-cwd spawn can be fixed by pointing `cwd` elsewhere.
+        const hint = customCwd === undefined
+          ? " To isolate another repo, pass its path as the `Agent` tool's `cwd`; or omit `isolation`."
+          : " Pass a `cwd` inside a git repo with at least one commit, or omit `isolation`.";
+        throw new Error(`Cannot run with isolation: "worktree": ${cause}.${hint}`);
       }
       record.worktree = wt;
       // workPath preserves subdirectory scoping for caller-supplied cwds: a
@@ -944,12 +948,14 @@ export class AgentManager {
           if (wtResult.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
+            // Named by its toplevel: the cwd may be a subdirectory of it.
+            const repo = record.worktree.repoRoot;
+            const repoNote = customCwd !== undefined ? ` in \`${repo}\`` : "";
             // Appended to the prose only. A structured child's caller parses
             // `structuredJson`, which stays untouched — but `result` is also
             // what a human reads, so the note still belongs on it.
             record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
+              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${repo}\`)` : ""}`;
           }
         }
 
