@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { configuredAgentModel } from "./model-resolver.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
@@ -53,6 +55,36 @@ const isolationParamShape = {
  */
 export function isolationParam(enabled: boolean): Partial<typeof isolationParamShape> {
   return enabled ? isolationParamShape : {};
+}
+
+/**
+ * The model-facing `cwd` parameter of the `Agent` tool.
+ *
+ * Exists because the worktree is made from the repo containing the agent's
+ * working directory, which used to always be the session cwd: a session started
+ * in `~` had no way to isolate an agent in `~/code/some-repo`.
+ */
+export const cwdParam = {
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        'Working directory for the agent: absolute, "~/"-prefixed, or relative to the session cwd. Default: the session cwd. With isolation: "worktree", the worktree is created from the git repo containing this directory, the agent runs at the same subdirectory inside the copy, and the result branch lands in that repo. Pass it whenever the target repo is not the session cwd. Project config (.pi extensions, skills, settings) still loads from the session cwd.',
+    }),
+  ),
+};
+
+/**
+ * Resolve the `Agent` tool's `cwd` against the session cwd: `~` and `~/`
+ * expand to the home directory, a relative path resolves against `sessionCwd`.
+ * Blank means unset: models that fill every optional parameter send `""`.
+ * Existence is checked later by the manager, which re-checks at start time.
+ */
+export function resolveCwdParam(cwd: string | undefined, sessionCwd: string): string | undefined {
+  const trimmed = cwd?.trim();
+  if (!trimmed) return undefined;
+  if (trimmed === "~") return homedir();
+  if (trimmed.startsWith("~/")) return resolve(homedir(), trimmed.slice(2));
+  return resolve(sessionCwd, trimmed);
 }
 
 interface AgentInvocationParams {

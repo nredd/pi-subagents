@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -10,6 +10,7 @@ import {
   isWorktreeIsolationEnabled,
   pruneWorktrees,
   setWorktreeIsolationEnabled,
+  WorktreeError,
 } from "../src/worktree.js";
 
 /**
@@ -96,47 +97,73 @@ describe("worktree", () => {
       try { execFileSync("git", ["worktree", "remove", "--force", wt!.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
-    it("returns undefined for non-git directory", async () => {
+    // Each failure names the directory it tried and its specific cause: the
+    // old single message ("not a git repo, no commits yet, or `git worktree
+    // add` failed") left the caller guessing which directory and which of three.
+    it("throws naming the directory for a non-git directory", async () => {
       const nonGit = mkdtempSync(join(tmpdir(), "pi-wt-nongit-"));
       try {
-        const wt = await createWorktree(pi, nonGit, "test-id-2");
-        expect(wt).toBeUndefined();
+        const err = await createWorktree(pi, nonGit, "test-id-2").catch(e => e);
+        expect(err).toBeInstanceOf(WorktreeError);
+        expect(err.message).toContain(`${nonGit} is not inside a git repository`);
       } finally {
         rmSync(nonGit, { recursive: true, force: true });
       }
     });
 
-    it("returns undefined for git repo with no commits", async () => {
+    it("throws naming the repo for a git repo with no commits", async () => {
       const emptyRepo = mkdtempSync(join(tmpdir(), "pi-wt-empty-"));
       try {
         execFileSync("git", ["init"], { cwd: emptyRepo, stdio: "pipe" });
-        const wt = await createWorktree(pi, emptyRepo, "no-commits");
-        expect(wt).toBeUndefined();
+        mkdirSync(join(emptyRepo, "sub"));
+        // From a subdirectory: the message names the toplevel, not the cwd.
+        await expect(createWorktree(pi, join(emptyRepo, "sub"), "no-commits"))
+          .rejects.toThrow(`${realpathSync(emptyRepo)} has no commits yet`);
       } finally {
         rmSync(emptyRepo, { recursive: true, force: true });
       }
     });
 
-    it("returns undefined when `git worktree add` reports a non-zero exit", async () => {
+    it("throws for a cwd inside the .git directory", async () => {
+      // rev-parse --is-inside-work-tree exits 0 there but prints "false".
+      await expect(createWorktree(pi, join(repoDir, ".git"), "in-git-dir"))
+        .rejects.toThrow("is inside a git directory but not a work tree");
+    });
+
+    it("throws with git's stderr when `git worktree add` reports a non-zero exit", async () => {
       // pi.exec resolves with a failure code instead of throwing, so a port that
       // only caught exceptions would hand back a worktree path that isn't there.
-      const wt = await createWorktree(
+      await expect(createWorktree(
         failingPi(args => args[0] === "worktree" && args[1] === "add", { code: 128, killed: false }),
         repoDir,
         "add-fails",
-      );
-      expect(wt).toBeUndefined();
+      )).rejects.toThrow(`\`git worktree add\` failed in ${realpathSync(repoDir)}: boom`);
     });
 
-    it("returns undefined when a git call is killed by its timeout", async () => {
+    it("throws a timeout, not a repo-state cause, when a git call is killed", async () => {
       // A killed process reports code 0 with killed: true — the one failure
-      // shape that looks like success if only the exit code is checked.
-      const wt = await createWorktree(
-        failingPi(args => args[0] === "rev-parse" && args[1] === "HEAD", { code: 0, killed: true }),
+      // shape that looks like success if only the exit code is checked. And it
+      // says nothing about the repo, so it must not read as "no commits yet".
+      const err = await createWorktree(
+        failingPi(args => args[0] === "rev-parse" && args[2] === "HEAD", { code: 0, killed: true }),
         repoDir,
         "timed-out",
-      );
-      expect(wt).toBeUndefined();
+      ).catch(e => e);
+      expect(err).toBeInstanceOf(WorktreeError);
+      expect(err.message).toContain("timed out");
+      expect(err.message).not.toContain("no commits");
+    });
+
+    it("records the resolved repo toplevel, from any directory inside it", async () => {
+      mkdirSync(join(repoDir, "deep", "er"), { recursive: true });
+      writeFileSync(join(repoDir, "deep", "er", "x.txt"), "x");
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "deep"], { cwd: repoDir, stdio: "pipe" });
+
+      const wt = await createWorktree(pi, join(repoDir, "deep", "er"), "root-of");
+      expect(wt.repoRoot).toBe(realpathSync(repoDir));
+      expect(wt.workPath).toBe(join(wt.path, "deep", "er"));
+      try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
     it("workPath equals path when created from the repo root", async () => {
@@ -314,6 +341,28 @@ describe("worktree", () => {
       try { execFileSync("git", ["branch", "-D", result2.branch!], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
+    it("lands the branch in the repo the worktree came from when cleaned up from a subdirectory", async () => {
+      // The manager passes the caller's cwd, which may sit deep in the repo.
+      mkdirSync(join(repoDir, "pkg"));
+      writeFileSync(join(repoDir, "pkg", "a.ts"), "export {};");
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "pkg"], { cwd: repoDir, stdio: "pipe" });
+      const sub = join(repoDir, "pkg");
+
+      const wt = await createWorktree(pi, sub, "from-sub");
+      writeFileSync(join(wt.workPath, "new.txt"), "agent wrote this");
+      const result = await cleanupWorktree(pi, sub, wt, "from subdir");
+
+      expect(result.hasChanges).toBe(true);
+      expect(existsSync(wt.path)).toBe(false);
+      const files = execFileSync("git", ["ls-tree", "-r", "--name-only", result.branch!], {
+        cwd: repoDir, stdio: "pipe",
+      }).toString();
+      expect(files).toContain("pkg/new.txt");
+      expect(existsSync(join(sub, "new.txt"))).toBe(false);
+      expect(execFileSync("git", ["worktree", "list"], { cwd: repoDir, stdio: "pipe" }).toString().trim().split("\n")).toHaveLength(1);
+    });
+
     it("handles already-deleted worktree gracefully", async () => {
       const wt = (await createWorktree(pi, repoDir, "gone-1"))!;
       // Manually delete the worktree directory
@@ -486,15 +535,16 @@ describe("worktree isolation switch", () => {
   // The switch gates callers; it deliberately does not disarm createWorktree
   // itself, so a caller that has already decided (agent-manager checks first)
   // still gets a real worktree rather than a silent no-op.
-  it("does not disable createWorktree directly", () => {
+  it("does not disable createWorktree directly", async () => {
     const repoDir = initGitRepo();
+    const pi = mockPi();
     try {
       setWorktreeIsolationEnabled(false);
-      const wt = createWorktree(repoDir, "switch-test");
-      expect(wt).toBeDefined();
-      cleanupWorktree(repoDir, wt!, "switch test");
+      const wt = await createWorktree(pi, repoDir, "switch-test");
+      expect(existsSync(wt.path)).toBe(true);
+      await cleanupWorktree(pi, repoDir, wt, "switch test");
     } finally {
-      pruneWorktrees(repoDir);
+      await pruneWorktrees(pi, repoDir);
       rmSync(repoDir, { recursive: true, force: true });
     }
   });

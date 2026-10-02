@@ -7,17 +7,18 @@
  * discarded), so a returned diagnostic reaches the parent model as a subagent
  * that ran and reported this — and the model retries the same doomed call.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/worktree.js", async () => {
   const actual = await vi.importActual<typeof import("../src/worktree.js")>("../src/worktree.js");
-  return { ...actual, createWorktree: vi.fn(() => undefined) };
+  return { ...actual, createWorktree: vi.fn(async () => { throw new actual.WorktreeError("/x is not inside a git repository"); }) };
 });
 
 import subagentsExtension from "../src/index.js";
+import { createWorktree } from "../src/worktree.js";
 
 function boot() {
   const tools = new Map<string, any>();
@@ -91,7 +92,54 @@ describe("Agent startup failures fail the tool call (#179)", () => {
           },
           undefined, undefined, ctx(),
         ),
-      ).rejects.toThrow('Cannot run with isolation: "worktree"');
+      ).rejects.toThrow(
+        'Cannot run with isolation: "worktree": /x is not inside a git repository. ' +
+          "To isolate another repo, pass its path as the `Agent` tool's `cwd`",
+      );
     });
   }
+
+  it("makes the worktree from the repo named by `cwd`, with ~ expanded", async () => {
+    // HOME is the temp dir here, so "~/repo/pkg" must reach createWorktree as
+    // <tmp>/repo/pkg: the session cwd is not where the caller wants isolation.
+    mkdirSync(join(cwd, "repo", "pkg"), { recursive: true });
+    vi.mocked(createWorktree).mockClear();
+    const tools = boot();
+
+    await expect(
+      tools.get("Agent").execute(
+        "tc-2",
+        {
+          prompt: "do it",
+          description: "worktree probe",
+          subagent_type: "general-purpose",
+          isolation: "worktree",
+          cwd: "~/repo/pkg",
+          run_in_background: false,
+        },
+        undefined, undefined, ctx(),
+      ),
+    ).rejects.toThrow("Pass a `cwd` inside a git repo with at least one commit");
+    expect(createWorktree).toHaveBeenCalledWith(expect.anything(), join(cwd, "repo", "pkg"), expect.any(String));
+  });
+
+  it("fails the call for a `cwd` that does not exist, before any worktree", async () => {
+    vi.mocked(createWorktree).mockClear();
+    const tools = boot();
+
+    await expect(
+      tools.get("Agent").execute(
+        "tc-3",
+        {
+          prompt: "do it",
+          description: "worktree probe",
+          subagent_type: "general-purpose",
+          isolation: "worktree",
+          cwd: "nope",
+        },
+        undefined, undefined, ctx(),
+      ),
+    ).rejects.toThrow(`SpawnOptions.cwd does not exist: "${join(cwd, "nope")}"`);
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
 });

@@ -36,7 +36,7 @@ import {
 } from "./detached-results.js";
 import { readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { cwdParam, isolationParam, resolveAgentInvocationConfig, resolveCwdParam, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { applyModelCallEvent, type ModelCallEvent } from "./model-call.js";
@@ -1500,11 +1500,11 @@ export default function (pi: ExtensionAPI) {
   // With no per-result note by design, the model would have every reason to go
   // on reporting a `pi-agent-*` branch that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
-    ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
+    ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result. The worktree is made from the repo containing \`cwd\` (default: the session cwd); when the target repo is not the session cwd, pass its path as \`cwd\`.`
     : "";
 
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
-    ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
+    ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result. Pass \`cwd\` to isolate a repo other than the session cwd.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
@@ -1681,6 +1681,7 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
       ...isolationParam(isWorktreeIsolationEnabled()),
+      ...cwdParam,
       ...scheduleParam,
     }),
 
@@ -1807,6 +1808,9 @@ Terse command-style prompts produce shallow, generic work.
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
+      // Undefined = the session cwd. The manager validates it (absolute,
+      // existing directory) at spawn and again at start.
+      const cwd = resolveCwdParam(params.cwd, ctx.cwd);
       // Whether this spawn writes its .output transcript. Per-agent
       // frontmatter (`output_transcript`) wins; otherwise the project/global
       // default applies. `attachTranscript` below is the SOLE gate — every
@@ -1894,6 +1898,9 @@ Terse command-style prompts produce shallow, generic work.
         }
         if (params.run_in_background === false) {
           return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
+        }
+        if (cwd !== undefined) {
+          return textResult("Cannot combine `schedule` with `cwd` — scheduled jobs run in the session cwd.");
         }
         if (!scheduler.isActive()) {
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
@@ -1997,7 +2004,8 @@ Terse command-style prompts produce shallow, generic work.
       const dispatchModel = model ?? ctx.model;
       const quotaBlock = dispatchModel ? await checkAdmission(pi.events, modelRef(dispatchModel)) : undefined;
       if (quotaBlock) {
-        const canPark = runInBackground && !inheritContext && mayPark(quotaBlock)
+        // A parked job is a scheduled job, which has no `cwd` to carry.
+        const canPark = runInBackground && !inheritContext && cwd === undefined && mayPark(quotaBlock)
           && isSchedulingEnabled() && scheduler.isActive();
         if (!canPark || !mayPark(quotaBlock)) {
           throw new Error(`${describeBlock(quotaBlock)} The agent was not started.`);
@@ -2051,6 +2059,7 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isBackground: true,
           isolation,
+          cwd,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
@@ -2204,6 +2213,7 @@ Terse command-style prompts produce shallow, generic work.
           inheritContext,
           thinkingLevel: thinking,
           isolation,
+          cwd,
           invocation: agentInvocation,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),

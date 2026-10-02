@@ -386,7 +386,7 @@ The agent failed terminally, or you skipped it with `s` in the inspector. These 
 A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so it fails instead — immediately rather than draining, since an agent that ignores its abort signal would wedge the run forever.
 
 **`Cannot run with isolation: "worktree"`.**
-Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
+The message names the directory it tried and the cause: not a git repo, no commits yet, a git timeout, or `git worktree add`'s stderr. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
 
 **`No saved workflow named "x". Looked in: …`**
 The file is not in any of the three directories, or it is there but carries no `export const meta =` declaration, so it is not recognized as a workflow. The message lists the directories it searched and any workflows it did find.

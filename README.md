@@ -461,6 +461,7 @@ Launch a sub-agent.
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
+| `cwd` | string | no | Working directory for the agent: absolute, `~/`-prefixed, or relative to the session cwd. Default: the session cwd. With `isolation: "worktree"`, the worktree comes from the repo containing it; see [Worktree Isolation](#worktree-isolation). Not combinable with `schedule` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
 
 ### `SubagentWorkflow`
@@ -947,7 +948,15 @@ The agent's system prompt names the worktree as an isolated copy and tells it to
 
 The automatic preservation commit uses `--no-verify`, so local pre-commit hooks can't block it — the commit is local-only and never pushed, and pre-push/server-side hooks still apply.
 
-If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
+The worktree is made from the repo containing the agent's working directory, which is the session cwd unless the call passes `cwd`. To isolate a repo the session wasn't started in, name it:
+
+```
+Agent({ subagent_type: "general-purpose", prompt: "...", isolation: "worktree", cwd: "~/code/other-repo/pkg" })
+```
+
+The agent works at the same subdirectory inside the copy (`pkg/` here), and the result names the branch and that repo's toplevel to merge in. The `cwd` gets the same treatment as the [RPC `cwd` option](#cross-extension-rpc): `.pi` config still loads from the session's project.
+
+If the worktree cannot be created, the `Agent` call fails with an error naming the directory it tried and the cause (not a git repo, no commits yet, a git timeout, or `git worktree add`'s stderr) instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
 
 A worktree is a *copy*, so the agent cannot see uncommitted or staged changes in the main checkout. Never use it to review a working-tree or staged diff: the agent finds an empty `git diff` and reports nothing wrong.
 
