@@ -589,7 +589,7 @@ Settings                                    ← max concurrency (background + fo
 
 ## Record retention
 
-A finished agent's record (and the session behind `get_subagent_result` and `steer_subagent`) is kept for **10 minutes once its result was consumed** (fetched with `get_subagent_result`, or delivered inline to a blocking caller) and **60 minutes from completion while nobody has read it**. After that the record is evicted, and the manager keeps an in-memory note for the rest of the session: both tools answer `Agent "<id>" (<description>) completed, evicted after N min; transcript: <path>` instead of `Agent not found`. The path is the `.output` transcript when one was written, else the session file. Notes are cleared on `/new` and `/resume`, like the records.
+A finished agent's record (and the session behind `get_subagent_result` and `steer_subagent`) is kept for **10 minutes once its result was consumed** (fetched with `get_subagent_result`, or delivered inline to a blocking caller) and **60 minutes from completion while nobody has read it**. After that the record is evicted, and the manager keeps an in-memory note for the rest of the session: both tools answer `Agent "<id>" (<description>) completed, evicted after N min; transcript: <path>` instead of `Agent not found`. The path is the `.output` transcript when one was written, else the session file. Notes are cleared on `/new` and `/resume`, like the records. For tests, `PI_SUBAGENTS_CONSUMED_TTL_MIN` and `PI_SUBAGENTS_UNREAD_TTL_MIN` override the two windows in minutes (fractions and `0` allowed; read when the manager starts); the sweep then runs as often as the shorter window needs, but not more than once a second.
 
 ## Graceful Max Turns
 

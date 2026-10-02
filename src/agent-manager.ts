@@ -81,6 +81,27 @@ const CONSUMED_RECORD_TTL_MS = 10 * 60_000;
  */
 const UNCONSUMED_RECORD_TTL_MS = 60 * 60_000;
 
+/**
+ * Read a retention override in minutes (fractions and 0 allowed) from `name`,
+ * else `fallbackMs`. An env var rather than a setting: the windows are not a
+ * user knob, but eviction is otherwise unobservable in an end-to-end test,
+ * which cannot wait an hour. Invalid values warn and keep the default.
+ */
+function retentionMs(name: string, fallbackMs: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallbackMs;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    console.warn(`[pi-subagents] ignoring ${name}="${raw}": expected minutes >= 0`);
+    return fallbackMs;
+  }
+  return minutes * 60_000;
+}
+
+/** Sweep cadence: every minute, or as often as the shortest window needs, never under a second. */
+const MAX_SWEEP_INTERVAL_MS = 60_000;
+const MIN_SWEEP_INTERVAL_MS = 1_000;
+
 /** How many evicted ids keep an answer to "what happened to that agent". */
 const MAX_EVICTED_NOTES = 500;
 
@@ -410,6 +431,10 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
+  /** `CONSUMED_RECORD_TTL_MS` unless `PI_SUBAGENTS_CONSUMED_TTL_MIN` overrides it. */
+  private readonly consumedTtlMs = retentionMs("PI_SUBAGENTS_CONSUMED_TTL_MIN", CONSUMED_RECORD_TTL_MS);
+  /** `UNCONSUMED_RECORD_TTL_MS` unless `PI_SUBAGENTS_UNREAD_TTL_MIN` overrides it. */
+  private readonly unreadTtlMs = retentionMs("PI_SUBAGENTS_UNREAD_TTL_MIN", UNCONSUMED_RECORD_TTL_MS);
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
@@ -474,8 +499,12 @@ export class AgentManager {
     this.onCompact = onCompact;
     this.onUsage = onUsage;
     this.maxConcurrent = maxConcurrent;
-    // Cleanup completed agents after 10 minutes (but keep sessions for resume)
-    this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
+    // Sweep finished records past their retention window (see cleanup()).
+    const sweepMs = Math.min(
+      MAX_SWEEP_INTERVAL_MS,
+      Math.max(MIN_SWEEP_INTERVAL_MS, Math.min(this.consumedTtlMs, this.unreadTtlMs)),
+    );
+    this.cleanupInterval = setInterval(() => this.cleanup(), sweepMs);
     this.cleanupInterval.unref();
   }
 
@@ -1562,8 +1591,8 @@ export class AgentManager {
       if (record.status === "running" || record.status === "queued") continue;
       const completedAt = record.completedAt ?? 0;
       const expired = record.resultConsumed
-        ? now - (record.consumedAt ?? completedAt) >= CONSUMED_RECORD_TTL_MS
-        : now - completedAt >= UNCONSUMED_RECORD_TTL_MS;
+        ? now - (record.consumedAt ?? completedAt) >= this.consumedTtlMs
+        : now - completedAt >= this.unreadTtlMs;
       if (expired) this.removeRecord(id, record);
     }
   }
