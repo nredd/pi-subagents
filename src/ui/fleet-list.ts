@@ -221,7 +221,12 @@ export class FleetList {
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      // A just-spawned agent has no session until its runner finishes binding
+      // extensions, and nothing else calls update() until the child's first model
+      // event, which a slow first response delays by minutes. Keep ticking while
+      // one is starting so its row appears as soon as the session exists.
+      if (this.enabled && this.hasStartingAgent()) this.ensureTimer();
+      else if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;
@@ -254,6 +259,12 @@ export class FleetList {
     } else {
       this.tui?.requestRender();
     }
+  }
+
+  /** Whether a top-level agent is live but not yet listable (no session yet). */
+  private hasStartingAgent(): boolean {
+    return this.manager.listAgents().some(a =>
+      isTopLevelAgent(a) && !a.session && (a.status === "running" || a.status === "queued"));
   }
 
   // ---- Roster ----

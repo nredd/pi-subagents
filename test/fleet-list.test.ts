@@ -337,6 +337,42 @@ describe("FleetList navigation", () => {
     expect(h.render()).toEqual([]);
   });
 
+  it("shows an agent whose session arrives after spawn without another update() call", () => {
+    vi.useFakeTimers();
+    try {
+      const record = makeRecord({ id: "late", session: undefined });
+      const h = harness([record]);
+      h.fleet.update(); // spawn time: running but no session yet, so no rows
+      expect(h.render()).toEqual([]);
+      (record as { session?: unknown }).session = FAKE_SESSION;
+      vi.advanceTimersByTime(250); // the tick must still be armed to pick it up
+      expect(h.render().join("\n")).toContain("Sleep then report 1");
+      h.fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops ticking once no agent is starting or listed", () => {
+    vi.useFakeTimers();
+    try {
+      const listAgents = vi.fn((): AgentRecord[] => []);
+      const manager = { listAgents, abort: () => true } as unknown as AgentManager;
+      const fleet = new FleetList(manager, new Map());
+      fleet.setUICtx({
+        setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
+        notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
+      });
+      fleet.update();
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(1000);
+      expect(listAgents.mock.calls.length).toBe(before);
+      fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("re-arms the refresh timer when the list is re-shown (toggle off→on)", () => {
     vi.useFakeTimers();
     try {
