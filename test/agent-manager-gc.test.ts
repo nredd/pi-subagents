@@ -424,3 +424,71 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(manager.resolveMention("explore")).toBeUndefined();
   });
 });
+
+// The windows are an hour and ten minutes, so an end-to-end test cannot watch
+// eviction without an override. Read at construction, so each case sets the
+// env before `new AgentManager()`.
+describe("AgentManager — retention override (PI_SUBAGENTS_*_TTL_MIN)", () => {
+  let manager: AgentManager | undefined;
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    manager?.dispose();
+    manager = undefined;
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  async function finishedAndRead() {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: { dispose: vi.fn() } as any,
+      aborted: false,
+      steered: false,
+    } as any);
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "work", { description: "the work", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    markConsumed(record);
+    return id;
+  }
+
+  it("evicts a read result within a second at a consumed TTL of 0, leaving the note", async () => {
+    vi.stubEnv("PI_SUBAGENTS_CONSUMED_TTL_MIN", "0");
+    const id = await finishedAndRead();
+
+    // The sweep tightens to the floor of one second rather than staying at a minute.
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(manager!.getRecord(id)).toBeUndefined();
+    expect(describeEvicted(manager!.getEvictedNote(id)!)).toContain("completed, evicted after 0 min");
+  });
+
+  it("takes fractional minutes for the unread window", async () => {
+    vi.stubEnv("PI_SUBAGENTS_UNREAD_TTL_MIN", "0.05"); // 3 s
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false,
+    } as any);
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "work", { description: "unread", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(manager.getRecord(id)).toBeDefined();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(manager.getRecord(id)).toBeUndefined();
+  });
+
+  it("warns and keeps the default for a value that is not minutes >= 0", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubEnv("PI_SUBAGENTS_CONSUMED_TTL_MIN", "-1");
+    const id = await finishedAndRead();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(manager!.getRecord(id)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ignoring PI_SUBAGENTS_CONSUMED_TTL_MIN="-1"'));
+  });
+});
