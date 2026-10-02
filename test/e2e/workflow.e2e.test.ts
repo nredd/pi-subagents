@@ -42,6 +42,14 @@ function workflowProject(): string {
   return dir;
 }
 
+/**
+ * Whether a model call came from the parent session. Not `SubagentWorkflow`:
+ * a child carries a refusing stand-in under that name. `get_subagent_result`
+ * reaches a child only through `allowed_subagents`, which nothing here sets.
+ */
+const isParentContext = (context: Parameters<typeof contextToolNames>[0]) =>
+  contextToolNames(context).includes("get_subagent_result");
+
 /** A `SubagentWorkflow` tool call, the way the parent model would emit one. */
 const workflowCall = (script: string, id = "wf-call-1") =>
   fauxToolCall("SubagentWorkflow", { script }, { id });
@@ -102,7 +110,7 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
+        const isParent = isParentContext(context);
         if (!isParent) {
           childPrompts.push(asText(context));
           childSystemPrompts.push(getCurrentSystemPrompt(context.messages));
@@ -186,7 +194,7 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
+        const isParent = isParentContext(context);
         if (!isParent) {
           const seen = asText(context);
           childPrompts.push(seen);
@@ -234,7 +242,7 @@ describe("Workflow end to end", () => {
       maxModelCalls: 12,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
+        const isParent = isParentContext(context);
         if (!isParent) {
           childPrompts.push(asText(context));
           return fauxText("SUBAGENT-DONE");
