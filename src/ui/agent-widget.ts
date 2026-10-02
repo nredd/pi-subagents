@@ -45,7 +45,7 @@ export type UICtx = {
   setStatus(key: string, text: string | undefined): void;
   setWidget(
     key: string,
-    content: undefined | ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }),
+    content: undefined | ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void; dispose?(): void }),
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
 };
@@ -260,6 +260,8 @@ export class AgentWidget {
   private widgetRegistered = false;
   /** Cached TUI reference from widget factory callback, used for requestRender(). */
   private tui: any | undefined;
+  /** The registered widget component, so a late `dispose()` of a replaced one is ignored. */
+  private component: object | undefined;
   /** Last status bar text, used to avoid redundant setStatus calls. */
   private lastStatusText: string | undefined;
 
@@ -623,14 +625,27 @@ export class AgentWidget {
     if (!this.widgetRegistered) {
       this.uiCtx.setWidget("agents", (tui, theme) => {
         this.tui = tui;
-        return {
+        const component = {
           render: () => this.renderWidget(tui, theme),
           invalidate: () => {
             // Theme changed — force re-registration so factory captures fresh theme.
             this.widgetRegistered = false;
             this.tui = undefined;
           },
+          // Core disposes every extension widget on /reload and when plan mode
+          // is entered or left. Without this the flag stayed true, update() only
+          // ever asked a dead component to re-render, and the widget vanished.
+          // Only the live component may reset it: a replaced one is disposed
+          // after its successor registered.
+          dispose: () => {
+            if (this.component !== component) return;
+            this.component = undefined;
+            this.widgetRegistered = false;
+            this.tui = undefined;
+          },
         };
+        this.component = component;
+        return component;
       }, { placement: "aboveEditor" });
       this.widgetRegistered = true;
     } else {
@@ -649,6 +664,7 @@ export class AgentWidget {
       this.uiCtx.setStatus("subagents", undefined);
     }
     this.widgetRegistered = false;
+    this.component = undefined;
     this.tui = undefined;
     this.lastStatusText = undefined;
   }
