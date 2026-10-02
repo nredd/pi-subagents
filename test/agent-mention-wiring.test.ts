@@ -1016,6 +1016,8 @@ describe("resuming an evicted agent by name", () => {
     const record = manager.getRecord(id);
     record.sessionFile = sessionPath();
     writeFileSync(record.sessionFile, "");
+    // Read, which is what the 10-minute window applies to; an unread record is kept for 60.
+    record.resultConsumed = true;
     record.completedAt = Date.now() - 11 * 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     return manager;
