@@ -397,18 +397,23 @@ describe("toolDescriptionMode", () => {
       expect(desc).not.toContain("- quiet: quiet agent. (Tools: *)");
     });
 
+    it("a narrowed agent with extensions off lists only its built-ins", () => {
+      const tools = withAgent("closed", "tools: read, grep\nextensions: false");
+      expect(tools.get("Agent").description).toContain("- closed: closed agent. (Tools: read, grep)");
+    });
+
     it("an omitted `tools:` still renders as * — absent means all built-ins", () => {
       // Guards the fix from over-correcting: undefined (inherit everything,
       // as the shipped defaults do) is not the same as [] (explicitly zero).
       const tools = withAgent("broad", "");
       const desc: string = tools.get("Agent").description;
-      expect(desc).toContain("- broad: broad agent. (Tools: *)");
+      expect(desc).toContain("- broad: broad agent. (Tools: * + extension tools)");
     });
 
     it("a narrowed `tools:` still lists the names it actually has", () => {
       const tools = withAgent("narrow", "tools: read, grep");
       const desc: string = tools.get("Agent").description;
-      expect(desc).toContain("- narrow: narrow agent. (Tools: read, grep)");
+      expect(desc).toContain("- narrow: narrow agent. (Tools: read, grep + extension tools)");
     });
   });
 });
