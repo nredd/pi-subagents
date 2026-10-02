@@ -20,6 +20,7 @@ import type { Context, ToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { contextToolNames } from "./helpers/context-view.js";
 import {
   agentCall,
   type FauxResponder,
@@ -47,7 +48,7 @@ function userPrompt(ctx: Context): string {
 }
 
 function tools(ctx: Context): string[] {
-  return (ctx.tools ?? []).map((tool) => tool.name);
+  return contextToolNames(ctx);
 }
 
 function toolResults(ctx: Context, name: string): string[] {

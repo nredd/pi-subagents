@@ -66,6 +66,7 @@ import {
   buildSessionContext,
   createAgentSession,
   type ExtensionContext,
+  type ExtensionToolContext,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -125,7 +126,9 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        // The main ctx is an `ExtensionContext`, not a tool context: the `Agent` tool never
+        // reads `tools` or calls `executeTool`, so the narrower type is not load-bearing.
+        ctx as ExtensionToolContext,
       );
     },
   };
@@ -175,11 +178,15 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // real thing, so the copy reasons under the instructions the user's model
     // is actually working under.
     const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
+    if (systemPrompt) replaceSystemPrompt(session.agent.state, systemPrompt);
 
     // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
+    // session was built around stays the one it goes on using. Pi 1.0 carries
+    // the prompt and tool declarations as system messages; the parent's would
+    // re-declare tools the clone does not have, so only the turns are copied.
+    session.agent.state.messages.push(
+      ...conversation.messages.filter((entry) => (entry as { role?: string }).role !== "system"),
+    );
 
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.
@@ -193,4 +200,20 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   return spawned
     ? { spawned: true }
     : { spawned: false, error: "the conversation clone did not start it" };
+}
+
+/**
+ * Swap the clone's system prompt for the live one.
+ *
+ * Pi 1.0 derives `state.systemPrompt` from the leading system message, which also declares the
+ * clone's tool, so the message is replaced with the same declarations and the new text. Older
+ * pi kept a writable `systemPrompt` field on the state.
+ */
+function replaceSystemPrompt(state: { systemPrompt: string; messages: unknown[] }, systemPrompt: string): void {
+  const head = state.messages[0] as { role?: string } | undefined;
+  if (head?.role === "system") {
+    state.messages[0] = { ...head, content: systemPrompt, sections: undefined };
+    return;
+  }
+  (state as { systemPrompt: string }).systemPrompt = systemPrompt;
 }

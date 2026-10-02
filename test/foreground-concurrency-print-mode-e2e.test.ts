@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { contextToolNames } from "./helpers/context-view.js";
 import {
   agentCall,
   agentToolResults,
@@ -72,7 +73,7 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
       cwd: projectDir(settings),
       live: false, // scripted on purpose: a real model may not emit both calls
       respond: async (context: Context) => {
-        const isParent = (context.tools ?? []).some(t => t.name === "Agent");
+        const isParent = contextToolNames(context).includes("Agent");
         if (isParent) {
           const alreadySpawned = context.messages.some(
             m => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
