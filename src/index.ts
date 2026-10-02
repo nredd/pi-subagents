@@ -19,7 +19,7 @@ import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, describeEvicted, isTopLevelAgent, markConsumed } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { rowDescription, sourceIndicator, sourceLegend } from "./agent-source-badge.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
@@ -895,7 +895,7 @@ export default function (pi: ExtensionAPI) {
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
-            record.resultConsumed = true;
+            markConsumed(record);
             outbox.cancel(record.id);
             return true;
           },
@@ -998,6 +998,7 @@ export default function (pi: ExtensionAPI) {
         // steer_subagent tool. Un-consume the result so the agent's reply to
         // this message is still relayed even if the LLM read its last answer.
         record.resultConsumed = false;
+        record.consumedAt = undefined;
         manager.steer(record.id, mention.message);
         pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
         ctx.ui.notify(`Sent to ${target}`, "info");
@@ -2982,6 +2983,12 @@ Terse command-style prompts produce shallow, generic work.
     });
   }
 
+  /** "Not found", or what became of the agent when its record was evicted. */
+  function agentNotFound(ref: string): string {
+    const note = manager.getEvictedNote(ref);
+    return note ? describeEvicted(note) : `Agent not found: "${ref}". It may have been cleaned up.`;
+  }
+
   // ---- get_subagent_result tool ----
 
   registerToolReportingUsage(defineTool({
@@ -3007,9 +3014,7 @@ Terse command-style prompts produce shallow, generic work.
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
-      if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
-      }
+      if (!record || !isTopLevelAgent(record)) return textResult(agentNotFound(params.agent_id));
 
       // Wait for completion if requested. Cancellation stops only this tool
       // call; the background agent keeps running and remains unconsumed so its
@@ -3055,7 +3060,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
-        record.resultConsumed = true;
+        markConsumed(record);
         outbox.cancel(record.id);
       }
 
@@ -3090,9 +3095,7 @@ Terse command-style prompts produce shallow, generic work.
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
-      if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
-      }
+      if (!record || !isTopLevelAgent(record)) return textResult(agentNotFound(params.agent_id));
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }

@@ -9,7 +9,7 @@
 // timers are hostile to the promise-settling style of the main suite.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager } from "../src/agent-manager.js";
+import { AgentManager, describeEvicted, markConsumed } from "../src/agent-manager.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -54,6 +54,8 @@ describe("AgentManager — record GC", () => {
     manager ??= new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", prompt, { description: prompt, isBackground: true });
     await manager.getRecord(id)!.promise;
+    // Read, so the 10-minute consumed window applies; the unread window has its own tests.
+    manager.getRecord(id)!.resultConsumed = true;
     return { id, record: manager.getRecord(id)! };
   }
 
@@ -154,6 +156,106 @@ describe("AgentManager — record GC", () => {
   });
 });
 
+const SIXTY_MINUTES = 60 * 60_000;
+
+describe("AgentManager — retention windows", () => {
+  let manager: AgentManager;
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    manager?.dispose();
+    vi.useRealTimers();
+  });
+
+  async function finished(opts: { sessionFile?: string; outputFile?: string } = {}) {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: { dispose: vi.fn() } as any,
+      aborted: false,
+      steered: false,
+    } as any);
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "work", { description: "the work", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    record.sessionFile = opts.sessionFile;
+    record.outputFile = opts.outputFile;
+    return { id, record };
+  }
+
+  it("keeps an unread result past the consumed window", async () => {
+    const { id, record } = await finished();
+    record.completedAt = Date.now() - (TEN_MINUTES + 5 * TICK);
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(manager.getRecord(id)).toBeDefined();
+  });
+
+  it("evicts an unread result once 60 minutes have passed", async () => {
+    const { id, record } = await finished();
+    record.completedAt = Date.now() - (SIXTY_MINUTES + 30_000);
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(manager.getRecord(id)).toBeUndefined();
+  });
+
+  it("counts the consumed window from the moment the result was read, not from completion", async () => {
+    const { id, record } = await finished();
+    record.completedAt = Date.now() - 30 * 60_000;
+    markConsumed(record);
+
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(manager.getRecord(id)).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+    expect(manager.getRecord(id)).toBeUndefined();
+  });
+
+  it("leaves a note saying what happened, with the transcript path", async () => {
+    const { id, record } = await finished({ outputFile: "/tmp/t/agent.output", sessionFile: "/s/agent.jsonl" });
+    markConsumed(record);
+    record.consumedAt = Date.now() - (TEN_MINUTES + 30_000);
+    record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    const note = manager.getEvictedNote(id);
+    expect(note).toMatchObject({ id, status: "completed", evictedAfterMin: 12, transcript: "/tmp/t/agent.output" });
+    expect(describeEvicted(note!)).toBe(
+      `Agent "${id}" (the work) completed, evicted after 12 min; transcript: /tmp/t/agent.output`,
+    );
+  });
+
+  it("falls back to the session file, and says nothing about a transcript when there is none", async () => {
+    const { id, record } = await finished({ sessionFile: "/s/agent.jsonl" });
+    markConsumed(record);
+    record.consumedAt = record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(manager.getEvictedNote(id)?.transcript).toBe("/s/agent.jsonl");
+
+    manager.dispose();
+    const second = await finished();
+    markConsumed(second.record);
+    second.record.consumedAt = second.record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(describeEvicted(manager.getEvictedNote(second.id)!)).not.toContain("transcript");
+  });
+
+  it("forgets evicted notes at a session boundary", async () => {
+    const { id, record } = await finished();
+    markConsumed(record);
+    record.consumedAt = record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(manager.getEvictedNote(id)).toBeDefined();
+
+    manager.clearCompleted(true);
+
+    expect(manager.getEvictedNote(id)).toBeUndefined();
+  });
+});
+
 // Eviction is exactly the moment a handle would otherwise stop working. These
 // cover what outlives it: enough to find the agent's session on disk and
 // reopen the conversation, and the name held so nothing else claims it.
@@ -178,6 +280,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
     const id = manager.spawn(mockPi, mockCtx, type, prompt, { description: prompt, isBackground: true });
     const record = manager.getRecord(id)!;
     await record.promise;
+    record.resultConsumed = true;
     record.sessionFile = sessionFile;
     record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
     return { id, record };
