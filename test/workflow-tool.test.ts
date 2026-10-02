@@ -932,6 +932,8 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const line = tools.get("SubagentWorkflow").renderCall({ script: inlineScript }, plainTheme, { isPartial: false }).text ?? "";
     expect(String(line)).toContain("SubagentWorkflow");
     expect(String(line)).toContain("from-inline");
+    // Core draws the disclosure marker on a settled tool row; a fake one doubles it.
+    expect(String(line)).not.toContain("▸");
   });
 
   it("actually runs the script in the background and notifies through the agent channel", async () => {

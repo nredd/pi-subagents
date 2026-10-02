@@ -144,7 +144,9 @@ describe("Agent tool result — effective model", () => {
     );
 
     expect(result.details.modelName).toBe("opus 4.6");
-    expect(render(tool, result)).toContain("opus 4.6");
+    // The folded row is `Plan  desc · status · elapsed · tokens`; the model is
+    // in the expanded view's tags line.
+    expect(render(tool, result)).not.toContain("opus 4.6");
     expect(render(tool, result, true)).toContain("opus 4.6");
   });
 
@@ -171,7 +173,7 @@ describe("Agent tool result — effective model", () => {
 
     const streamed = onUpdate.mock.calls[0][0];
     expect(streamed.details.modelName).toBe("opus 4.6");
-    expect(tool.renderResult(streamed, { expanded: false, isPartial: true }, theme, { isError: false })
+    expect(tool.renderResult(streamed, { expanded: true, isPartial: true }, theme, { isError: false })
       .render(200).join("\n")).toContain("opus 4.6");
   });
 
@@ -194,7 +196,7 @@ describe("Agent tool result — effective model", () => {
     );
 
     expect(result.details.tags).toContain("twin");
-    expect(render(tool, result)).toContain("twin");
+    expect(render(tool, result, true)).toContain("twin");
   });
 
   it("reports the session's level, and what was asked for, when pi clamps it", async () => {

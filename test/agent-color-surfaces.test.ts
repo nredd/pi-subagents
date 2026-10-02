@@ -144,7 +144,7 @@ describe("custom agent color runtime surfaces", () => {
       // no badge, and no row background of our own for HTML export to pick up.
       registerAgents(new Map([[TYPE, { ...config, color: undefined }]]));
       const uncolored = render({ isPartial: false, isError: false });
-      expect(uncolored.trimEnd()).toBe(`▸ <toolTitle>*${DISPLAY_NAME}*</toolTitle>  <muted>Review this change</muted>`);
+      expect(uncolored.trimEnd()).toBe(`<toolTitle>*${DISPLAY_NAME}*</toolTitle>  <muted>Review this change</muted>`);
     } finally {
       await handlers.get("session_shutdown")?.({}, { hasUI: false, ui: {} });
     }
