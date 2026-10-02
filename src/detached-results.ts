@@ -13,6 +13,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentRecord } from "./types.js";
+import type { AgentActivity } from "./ui/agent-widget.js";
 
 /** One finished agent, in the shape `session_start` needs to re-announce it. */
 export interface DetachedResult {
@@ -84,4 +86,49 @@ export function watchDetached(sessionFile: string, onSpooled: () => void): () =>
   return () => {
     if (map.get(sessionFile) === onSpooled) map.delete(sessionFile);
   };
+}
+
+/**
+ * A background agent still running in an orphaned manager. The record and
+ * activity are the orphan's live objects, so a reloaded session can show and
+ * open them; `abort` and `steer` are bound to the orphan's manager.
+ */
+export interface RunningDetached {
+  record: AgentRecord;
+  activity?: AgentActivity;
+  abort(): boolean;
+  steer(message: string): boolean;
+}
+
+const RUNNING_KEY = Symbol.for("pi-subagents:detached-running");
+
+/** Running orphans by parent session file then agent id, shared across every extension instance. */
+function running(): Map<string, Map<string, RunningDetached>> {
+  const g = globalThis as Record<symbol, unknown>;
+  let map = g[RUNNING_KEY] as Map<string, Map<string, RunningDetached>> | undefined;
+  if (!map) {
+    map = new Map();
+    g[RUNNING_KEY] = map;
+  }
+  return map;
+}
+
+/** Publish an orphaned, still-running agent so the session's next extension instance can list it. */
+export function registerRunningDetached(sessionFile: string, agent: RunningDetached): void {
+  const byId = running().get(sessionFile) ?? new Map<string, RunningDetached>();
+  byId.set(agent.record.id, agent);
+  running().set(sessionFile, byId);
+}
+
+/** Drop an orphan once it settles (its result is spooled from there on). */
+export function unregisterRunningDetached(sessionFile: string, id: string): void {
+  const byId = running().get(sessionFile);
+  byId?.delete(id);
+  if (byId?.size === 0) running().delete(sessionFile);
+}
+
+/** Orphans still running for `sessionFile`, in registration order. */
+export function listRunningDetached(sessionFile: string | undefined): RunningDetached[] {
+  if (sessionFile === undefined) return [];
+  return [...(running().get(sessionFile)?.values() ?? [])];
 }
