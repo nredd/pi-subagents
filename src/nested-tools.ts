@@ -49,6 +49,21 @@ export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.m
 
 const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
 
+/**
+ * Why a subagent may not start background work. A detached child's completion
+ * is delivered as a follow-up to the session that spawned it, and a subagent
+ * session ends the moment it returns its answer, so the notice would go to a
+ * session that no longer exists and the work would be aborted with its owner.
+ */
+export const NESTED_BACKGROUND_ERROR =
+  "Background agents are not available inside a subagent: when you finish, this session ends and nothing is left to receive the result. "
+  + "Omit run_in_background; the call blocks and returns the child's result inline.";
+
+/** Same reasoning for workflow tools, which run in the background and notify on completion. */
+export const NESTED_WORKFLOW_ERROR =
+  "Workflows are not available inside a subagent: a workflow runs in the background and reports to the session that started it, "
+  + "and this session ends when you return your answer. Do the work directly, or call Agent in the foreground.";
+
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
@@ -172,7 +187,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
+          description: "Not supported inside a subagent: nested spawns always block and return the child's result inline. Passing true returns an error.",
         }),
       ),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
@@ -181,6 +196,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+      if (params.run_in_background === true) return textResult(NESTED_BACKGROUND_ERROR, true);
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
@@ -269,7 +285,6 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           maxTurns: invocation.maxTurns,
           isolated: invocation.isolated,
           inheritContext: invocation.inheritContext,
-          runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
         // Nested children are hidden from every reporting surface, so their spend
@@ -334,20 +349,6 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // report it as a tool error, like the top-level Agent tool does, instead of
       // letting it escape into the child's turn.
       try {
-        if (invocation.runInBackground) {
-          const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
-            ...options,
-            isBackground: true,
-          });
-          // Synchronous, before the event loop yields — onSessionCreated fires
-          // asynchronously inside runAgent, so the file is attached in time.
-          attachTranscript(id);
-          // Worktree isolation starts the agent asynchronously; surface its
-          // failure as a tool error, like the synchronous throw used to.
-          await context.manager.awaitStartup(id);
-          return textResult(`Nested agent started in background. Agent ID: ${id}`);
-        }
-
         const { record } = await context.manager.spawnAndWait(
           context.pi,
           ctx,
