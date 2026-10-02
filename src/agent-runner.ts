@@ -23,7 +23,7 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
-import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { createNestedSubagentTools, getMaxSubagentDepth, NESTED_WORKFLOW_ERROR, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -43,6 +43,13 @@ export const SUBAGENT_TOOL_NAMES = {
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
 } as const;
+
+/**
+ * Workflow tools, ours and other extensions', that must fail inside a subagent
+ * with an explanation. The same names as `FOREIGN_WORKFLOW_TOOL_NAMES`, repeated
+ * because that module imports this one.
+ */
+const BLOCKED_IN_SUBAGENT: ReadonlySet<string> = new Set([SUBAGENT_TOOL_NAMES.WORKFLOW, "Workflow", "workflow"]);
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
@@ -298,6 +305,12 @@ export function installExtensionToolScope(
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
+    // Ahead of the scope check so a workflow tool registered by another
+    // extension gets the reason, not "not available": it is loaded here like
+    // any extension tool, and would otherwise run and report to a dead session.
+    if (BLOCKED_IN_SUBAGENT.has(context.toolCall.name)) {
+      return { block: true, reason: NESTED_WORKFLOW_ERROR };
+    }
     if (!inScope().has(context.toolCall.name)) {
       return {
         block: true,

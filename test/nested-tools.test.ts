@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
-import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
+import { createNestedSubagentTools, getMaxSubagentDepth, NESTED_BACKGROUND_ERROR, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
 
 let cwd: string;
@@ -251,19 +251,36 @@ describe("child-safe nested Agent tools", () => {
     }
   });
 
-  it("supports background launches and ownership-scopes result, resume, and steer", async () => {
-    const [agent, getResult, steer] = tools(["scout"]);
+  it("refuses a background launch with an explanation and never spawns", async () => {
+    const [agent] = tools(["scout"]);
     const launched = await execute(agent, {
       subagent_type: "scout",
       description: "find files",
       prompt: "Find them",
       run_in_background: true,
     });
-    expect(launched.content[0].text).toContain("child-1");
-    expect(spawn).toHaveBeenCalledWith(
-      expect.anything(), expect.anything(), "scout", "Find them",
-      expect.objectContaining({ isBackground: true, depth: 2, parentAgentId: "parent-1" }),
-    );
+    expect(launched.isError).toBe(true);
+    expect(launched.content[0].text).toBe(NESTED_BACKGROUND_ERROR);
+    expect(launched.content[0].text).toContain("Omit run_in_background");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+
+  it("runs an explicit run_in_background: false, and a background-by-config agent, in the foreground", async () => {
+    writeAgent("bg", "run_in_background: true\n");
+    registerAgents(loadCustomAgents(cwd));
+    const [agent] = tools(["scout", "bg"]);
+    for (const [type, extra] of [["scout", { run_in_background: false }], ["bg", {}]] as const) {
+      spawnAndWait.mockClear();
+      await execute(agent, { subagent_type: type, description: "fg", prompt: "Go", ...extra });
+      expect(spawnAndWait).toHaveBeenCalledTimes(1);
+    }
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("ownership-scopes result, resume, and steer", async () => {
+    const [agent, getResult, steer] = tools(["scout"]);
+    records.set("child-1", { id: "child-1", status: "running", result: "mine", parentAgentId: "parent-1" });
 
     const own = await execute(getResult, { agent_id: "child-1" });
     expect(own.isError).toBe(false);
@@ -284,27 +301,6 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Continue",
     })).isError).toBe(true);
     expect(manager.resume).not.toHaveBeenCalled();
-  });
-
-  it("reports a background child that fails to start as a tool error", async () => {
-    // Under isolation: "worktree" the child is not running when spawn() returns
-    // — the repo copy is awaited. The failure must reach the parent as an error
-    // result, not as "Nested agent started in background".
-    vi.mocked(manager.awaitStartup).mockRejectedValueOnce(
-      new Error('Cannot run with isolation: "worktree"'),
-    );
-    const [agent] = tools(["scout"]);
-
-    const result = await execute(agent, {
-      subagent_type: "scout",
-      description: "find files",
-      prompt: "Find them",
-      run_in_background: true,
-      isolation: "worktree",
-    });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('isolation: "worktree"');
   });
 
   it("waits for a queued owned child to start and settle", async () => {
@@ -451,9 +447,9 @@ describe("child-safe nested Agent tools", () => {
   it("attributes a nested child's token spend to the owning parent", async () => {
     const parent = { id: "parent-1", status: "running", lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 } };
     records.set("parent-1", parent);
-    spawn.mockImplementation((_pi, _ctx, _type, _prompt, options) => {
+    spawnAndWait.mockImplementation(async (_pi, _ctx, _type, _prompt, options) => {
       options.onAssistantUsage?.({ input: 100, output: 20, cacheWrite: 5 });
-      return "child-1";
+      return { id: "child-1", record: { id: "child-1", status: "completed", result: "ok", parentAgentId: "parent-1" } };
     });
 
     const [agent] = tools();
@@ -461,7 +457,6 @@ describe("child-safe nested Agent tools", () => {
       subagent_type: "scout",
       description: "spender",
       prompt: "Do work",
-      run_in_background: true,
     });
 
     expect(parent.lifetimeUsage).toEqual({ input: 100, output: 20, cacheWrite: 5 });
@@ -477,9 +472,9 @@ describe("child-safe nested Agent tools", () => {
     };
     records.set("top", top);
     records.set("parent-1", middle);
-    spawn.mockImplementation((_pi, _ctx, _type, _prompt, options) => {
+    spawnAndWait.mockImplementation(async (_pi, _ctx, _type, _prompt, options) => {
       options.onAssistantUsage?.({ input: 7, output: 3, cacheWrite: 1 });
-      return "child-1";
+      return { id: "child-1", record: { id: "child-1", status: "completed", result: "ok", parentAgentId: "parent-1" } };
     });
 
     const [agent] = tools();
@@ -487,7 +482,6 @@ describe("child-safe nested Agent tools", () => {
       subagent_type: "scout",
       description: "deep spender",
       prompt: "Do work",
-      run_in_background: true,
     });
 
     expect(middle.lifetimeUsage).toEqual({ input: 7, output: 3, cacheWrite: 1 });
