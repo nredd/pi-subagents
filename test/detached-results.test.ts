@@ -18,7 +18,14 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
-import { drainDetached, spoolDetached, watchDetached } from "../src/detached-results.js";
+import {
+  drainDetached,
+  listRunningDetached,
+  registerRunningDetached,
+  spoolDetached,
+  unregisterRunningDetached,
+  watchDetached,
+} from "../src/detached-results.js";
 import subagentsExtension from "../src/index.js";
 
 function makePi() {
@@ -92,6 +99,28 @@ describe("detached result spool", () => {
     writeFileSync(join(detachedDir(file), "0-bad.json"), "{nope");
     spoolDetached(file, { id: "ok", content: "", details: {}, record: {} });
     expect(drainDetached(file).map((r) => r.id)).toEqual(["ok"]);
+  });
+});
+
+describe("running detached registry", () => {
+  const file = `/sessions/running-${process.pid}-${Date.now()}.jsonl`;
+  const mk = (id: string) => ({ record: { id } as any, abort: () => true, steer: () => true });
+
+  it("lists per session in registration order and forgets settled agents", () => {
+    registerRunningDetached(file, mk("a"));
+    registerRunningDetached(file, mk("b"));
+    registerRunningDetached(`${file}.other`, mk("z"));
+    expect(listRunningDetached(file).map((d) => d.record.id)).toEqual(["a", "b"]);
+    unregisterRunningDetached(file, "a");
+    expect(listRunningDetached(file).map((d) => d.record.id)).toEqual(["b"]);
+    unregisterRunningDetached(file, "b");
+    expect(listRunningDetached(file)).toEqual([]);
+    unregisterRunningDetached(`${file}.other`, "z");
+  });
+
+  it("returns nothing for an unknown or missing session", () => {
+    expect(listRunningDetached(undefined)).toEqual([]);
+    expect(listRunningDetached("/sessions/none.jsonl")).toEqual([]);
   });
 });
 
@@ -196,6 +225,21 @@ describe("session switch with a running background agent", () => {
     expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(back.pi.appendEntry).toHaveBeenCalledWith("subagents:record", expect.objectContaining({ id: agent.id, status: "completed" }));
     await back.lifecycle.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx(sessionFile));
+  });
+
+  it("publishes the running agent for the next instance until it settles", async () => {
+    const first = makePi();
+    subagentsExtension(first.pi);
+    await first.lifecycle.get("session_start")({ type: "session_start" }, ctx(sessionFile));
+    const agent = await spawnRunning(first.tools);
+    expect(listRunningDetached(sessionFile)).toEqual([]);
+
+    await first.lifecycle.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx(sessionFile));
+    expect(listRunningDetached(sessionFile).map((d) => d.record.id)).toEqual([agent.id]);
+
+    agent.finish();
+    await flush();
+    expect(listRunningDetached(sessionFile)).toEqual([]);
   });
 
   it("delivers immediately when the agent finishes while its session is open again", async () => {

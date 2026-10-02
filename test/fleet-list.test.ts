@@ -198,6 +198,48 @@ describe("formatFleetTokens", () => {
   });
 });
 
+describe("FleetList detached agents", () => {
+  function detachedHarness(own: AgentRecord[], orphans: () => any[]) {
+    let factory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
+    const ui = {
+      setWidget: (_k: string, content: any) => { factory = content; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as FleetUICtx["custom"],
+    } as FleetUICtx;
+    const fleet = new FleetList(fakeManager(own), new Map(), undefined, undefined, undefined, undefined, orphans);
+    fleet.setUICtx(ui);
+    fleet.update();
+    const render = () => (factory ? factory({ requestRender: () => {} }, theme).render(120).join("\n") : "");
+    return { fleet, render };
+  }
+
+  it("lists an orphaned running agent that the manager does not know", () => {
+    const orphan = makeRecord({ id: "orph", description: "survivor" });
+    const h = detachedHarness([], () => [{ record: orphan, abort: () => true, steer: () => true }]);
+    expect(h.render()).toContain("survivor");
+    h.fleet.dispose();
+  });
+
+  it("does not duplicate a record present in both the manager and the registry", () => {
+    const rec = makeRecord({ id: "same", description: "once-only" });
+    const h = detachedHarness([rec], () => [{ record: rec, abort: () => true, steer: () => true }]);
+    expect(h.render().split("once-only")).toHaveLength(2);
+    h.fleet.dispose();
+  });
+
+  it("drops the row when the registry empties", () => {
+    const orphan = makeRecord({ id: "orph", description: "survivor" });
+    let list = [{ record: orphan, abort: () => true, steer: () => true }];
+    const h = detachedHarness([], () => list);
+    list = [];
+    h.fleet.update();
+    expect(h.render()).toBe("");
+    h.fleet.dispose();
+  });
+});
+
 describe("FleetList navigation", () => {
   it("does not register a widget when there are no agents", () => {
     const h = harness([]);
