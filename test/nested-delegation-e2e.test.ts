@@ -19,7 +19,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
@@ -178,7 +178,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
     expect(run.responseText).toContain(WORKER_MARKER);
   });
 
-  it("backgrounds a nested child, polls it by id, and streams its transcript", async () => {
+  it("runs a nested child in the foreground and streams its transcript", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "nested-e2e-bg-"));
     tmpDirs.push(cwd);
     writeAgents(cwd);
@@ -191,23 +191,13 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       if (text.includes("Do the leaf work")) return WORKER_MARKER;
 
       if (text.includes("Delegate this downward")) {
-        const results = toolResultTexts(context);
-        const spawned = results.find((r) => r.name === "Agent")?.text ?? "";
-        const polled = results.find((r) => r.name === "get_subagent_result")?.text;
-        // Third turn: the poll came back — echo it so a lost result fails loudly.
-        if (polled !== undefined) return `orchestrator polled: ${polled}`;
-        // Second turn: the spawn returned an id; fetch by exactly that id, which
-        // also exercises the manager's ownership check from inside a child.
-        if (spawned) {
-          const id = /Agent ID:\s*(\S+)/.exec(spawned)?.[1];
-          expect(id).toBeTruthy();
-          return fauxToolCall("get_subagent_result", { agent_id: id, wait: true });
-        }
+        // Second turn: the foreground spawn returned the leaf's answer inline.
+        const spawned = toolResultTexts(context).find((r) => r.name === "Agent")?.text;
+        if (spawned !== undefined) return `orchestrator got: ${spawned}`;
         return agentCall({
           subagent_type: "worker",
           description: "leaf work",
           prompt: "Do the leaf work.",
-          run_in_background: true,
         });
       }
 
@@ -230,13 +220,12 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
       });
 
-      // The background child ran and its output came back through the id the
-      // spawn handed out — so it was never queued behind its waiting parent.
+      // The child ran to completion and its output came back inline.
       const orchestratorResult = run.parentSession.messages
         .filter((m) => m.role === "toolResult")
         .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ""))
         .join("\n");
-      expect(orchestratorResult).toContain("orchestrator polled");
+      expect(orchestratorResult).toContain("orchestrator got");
       expect(orchestratorResult).toContain(WORKER_MARKER);
 
       // Only the REAL manager wires onSessionCreated → streamToOutputFile for a

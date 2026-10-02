@@ -113,6 +113,7 @@ vi.mock("../src/skill-loader.js", () => ({
 }));
 
 vi.mock("../src/nested-tools.js", () => ({
+  NESTED_WORKFLOW_ERROR: "Workflows are not available inside a subagent: mocked.",
   getMaxSubagentDepth: vi.fn(() => 2),
   createNestedSubagentTools: vi.fn(() => [
     { name: "Agent" },
@@ -1644,6 +1645,25 @@ describe("agent-runner async extension tool registration", () => {
     await expect(
       session.agent.beforeToolCall?.({ toolCall: { name: "foo_tool" } }),
     ).resolves.toBeUndefined();
+  });
+
+  it("beforeToolCall explains why workflow tools are unavailable inside a subagent", async () => {
+    // Another extension's `workflow` tool loads in the child like any extension
+    // tool, runs in the background, and would report to a session that ends as
+    // soon as this one returns. The reason must say that, not "not available".
+    setup();
+    withExtensions({ "/ext/wf.ts": ["workflow", "Workflow", "ok_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    for (const name of ["workflow", "Workflow", "SubagentWorkflow"]) {
+      const verdict = await session.agent.beforeToolCall?.({ toolCall: { name } });
+      expect(verdict).toMatchObject({ block: true });
+      expect(verdict.reason).toContain("Workflows are not available inside a subagent");
+    }
+    await expect(session.agent.beforeToolCall?.({ toolCall: { name: "ok_tool" } })).resolves.toBeUndefined();
   });
 
   it("beforeToolCall preserves a hook pi installed before us", async () => {
