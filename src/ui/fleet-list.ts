@@ -14,9 +14,10 @@
 import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { describeModelCall } from "../model-call.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, formatCost, type Theme } from "./agent-widget.js";
 import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -153,6 +154,12 @@ export class FleetList {
      * widget this list shares with. Omitted → no `b` affordance.
      */
     private backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction,
+    /**
+     * Read live at render time. Whether each row names the model and thinking
+     * level it runs at. Defaults to off — the extension supplies the user's
+     * `showModel` setting, which until now only the widget honoured.
+     */
+    private showModel: () => boolean = () => false,
   ) {}
 
   // ---- Lifecycle ----
@@ -568,7 +575,23 @@ export class FleetList {
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const parts: string[] = [];
+    if (this.showModel()) {
+      // Leading, and paired: a thinking level means nothing without its model.
+      const { modelName, tags } = buildInvocationTags(record.invocation);
+      if (modelName) parts.push(modelName);
+      const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
+      if (thinkingTag) parts.push(thinkingTag);
+    }
+    // What the in-flight model call is doing, only while the agent is running:
+    // a finished row has no call to describe.
+    const call = record.status === "running"
+      ? describeModelCall(this.agentActivity.get(record.id)?.modelCall, Date.now())
+      : undefined;
+    if (call) parts.push(call);
+    parts.push(formatFleetElapsed(elapsedMs), formatFleetTokens(tokens));
+    if (cost) parts.push(cost);
+    const stats = parts.join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

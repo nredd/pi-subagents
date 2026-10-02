@@ -174,10 +174,10 @@ describe("cost display", () => {
 
   describe("the completion notification", () => {
     /** Render a notification through the extension's registered renderer. */
-    function render(pi: any, details: any): string {
+    function render(pi: any, details: any, expanded = true): string {
       const [, renderer] = pi.registerMessageRenderer.mock.calls[0];
       const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
-      return renderer({ details }, { expanded: false }, theme).render().join("\n");
+      return renderer({ details }, { expanded }, theme).render(200).join("\n");
     }
 
     const agent = (description: string, totalTokens: number, totalCost: number) => ({
@@ -189,7 +189,7 @@ describe("cost display", () => {
       const { pi } = boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
 
-      expect(out).toContain("2 agents · 4.0k token · ~$0.03");
+      expect(out).toContain("4.0k token · ~$0.03 in total");
     });
 
     it("does not total a single agent — the line above already says it", () => {

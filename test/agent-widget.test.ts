@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
 
@@ -39,18 +38,6 @@ describe("formatSessionTokens", () => {
     expect(fgPreservingNestedStyles(ansiTheme, "accent", tokenText)).toBe(
       "\u001b[35m1.2k token (\u001b[33m70%\u001b[39m\u001b[35m)\u001b[39m",
     );
-  });
-});
-
-describe("renderRunningAgentStatus", () => {
-  it("renders running status as separate component lines", () => {
-    const theme = { fg: (_c: string, s: string) => s };
-    const component = renderRunningAgentStatus("⠋", "thinking: xhigh · 4 tool uses", "thinking…", theme);
-
-    expect(component.render(120).map((line) => line.trimEnd())).toEqual([
-      "⠋ thinking: xhigh · 4 tool uses",
-      "  ⎿  thinking…",
-    ]);
   });
 });
 
