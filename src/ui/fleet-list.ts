@@ -101,6 +101,8 @@ export class FleetList {
   private tui: any | undefined;
   private inputUnsub: (() => void) | undefined;
   private widgetRegistered = false;
+  /** The registered widget component, so a late `dispose()` of a replaced one is ignored. */
+  private component: object | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
 
   private enabled = true;
@@ -161,6 +163,7 @@ export class FleetList {
     this.inputUnsub?.();
     this.ui = ui;
     this.widgetRegistered = false;
+    this.component = undefined;
     this.tui = undefined;
     this.inputUnsub = ui.onTerminalInput(data => this.handleKey(data));
   }
@@ -189,6 +192,7 @@ export class FleetList {
     this.viewingWorkflowId = undefined;
     if (this.ui && this.widgetRegistered) this.ui.setWidget(FLEET_KEY, undefined);
     this.widgetRegistered = false;
+    this.component = undefined;
     this.tui = undefined;
     this.active = false;
     // Null last so a `viewerClose()` microtask above can't re-register the widget.
@@ -222,10 +226,22 @@ export class FleetList {
     if (!this.widgetRegistered) {
       this.ui.setWidget(FLEET_KEY, (tui, theme) => {
         this.tui = tui;
-        return {
+        const component = {
           render: (w: number) => this.renderBar(w, theme),
           invalidate: () => { this.widgetRegistered = false; this.tui = undefined; },
+          // Core disposes extension widgets on /reload and plan-mode enter/exit.
+          // Reset the flag so the next update() registers a fresh one instead of
+          // asking a dead component to re-render. Only the live component counts:
+          // a replaced one is disposed after its successor registered.
+          dispose: () => {
+            if (this.component !== component) return;
+            this.component = undefined;
+            this.widgetRegistered = false;
+            this.tui = undefined;
+          },
         };
+        this.component = component;
+        return component;
       }, { placement: "belowEditor" });
       this.widgetRegistered = true;
     } else {

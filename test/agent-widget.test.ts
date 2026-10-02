@@ -526,3 +526,55 @@ describe("AgentWidget overflow accounting", () => {
     expect(render()).toContain("resumed description");
   });
 });
+
+// Core calls `dispose()` on every extension widget in `clearExtensionWidgets()`
+// (on /reload and when plan mode is entered or left). The registration flag
+// used to stay true, so update() only asked the dead component to re-render
+// and the widget never came back.
+describe("AgentWidget re-registration after core disposes it", () => {
+  const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  function setup() {
+    const agent = {
+      id: "a1", type: "general-purpose", description: "still running", status: "running", toolUses: 0,
+      startedAt: Date.now(), lifetimeUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compactionCount: 0,
+    };
+    const widget = new AgentWidget({ listAgents: () => [agent] } as any, new Map(), () => "all");
+    const registered: any[] = [];
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_k: any, c: any) => {
+        registered.push(c ? c({ terminal: { columns: 120 }, requestRender: () => {} }, theme) : undefined);
+      },
+    } as any);
+    return { widget, registered };
+  }
+
+  it("registers again on the next update once the component is disposed", () => {
+    const { widget, registered } = setup();
+    widget.update();
+    expect(registered).toHaveLength(1);
+
+    widget.update(); // steady state: re-render only
+    expect(registered).toHaveLength(1);
+
+    registered[0].dispose();
+    widget.update();
+
+    expect(registered).toHaveLength(2);
+    expect(registered[1].render().join("\n")).toContain("still running");
+  });
+
+  it("ignores the disposal of a component that was already replaced", () => {
+    const { widget, registered } = setup();
+    widget.update();
+    registered[0].invalidate(); // theme change: forces a fresh registration
+    widget.update();
+    expect(registered).toHaveLength(2);
+
+    registered[0].dispose(); // core disposes the old one after the new one registered
+    widget.update();
+
+    expect(registered).toHaveLength(2);
+  });
+});

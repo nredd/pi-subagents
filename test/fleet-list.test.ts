@@ -567,6 +567,51 @@ describe("FleetList overlay lifecycle", () => {
   });
 });
 
+describe("FleetList re-registration after core disposes it", () => {
+  function setup() {
+    const registered: { render(w: number): string[]; invalidate(): void; dispose?(): void }[] = [];
+    const ui: FleetUICtx = {
+      setWidget: (_key, content) => {
+        if (content) registered.push(content({ requestRender: () => {}, terminal: { columns: 120, rows: 40 } }, theme));
+      },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as FleetUICtx["custom"],
+    };
+    const fleet = new FleetList(fakeManager([makeRecord()]), new Map());
+    fleet.setUICtx(ui);
+    fleet.update();
+    return { fleet, registered };
+  }
+
+  it("registers a fresh widget on the next update after dispose()", () => {
+    const { fleet, registered } = setup();
+    expect(registered).toHaveLength(1);
+    fleet.update();
+    expect(registered).toHaveLength(1);
+
+    registered[0].dispose?.();
+    fleet.update();
+
+    expect(registered).toHaveLength(2);
+    fleet.dispose();
+  });
+
+  it("ignores the disposal of a component that was already replaced", () => {
+    const { fleet, registered } = setup();
+    registered[0].invalidate();
+    fleet.update();
+    expect(registered).toHaveLength(2);
+
+    registered[0].dispose?.();
+    fleet.update();
+
+    expect(registered).toHaveLength(2);
+    fleet.dispose();
+  });
+});
+
 describe("FleetList cost display", () => {
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
