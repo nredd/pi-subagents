@@ -1003,8 +1003,9 @@ describe("agent-runner master tool allowlist", () => {
     // Order is not semantically meaningful (pi-mono dedupes via Set);
     // assert membership and exact size instead.
     const tools = lastToolsPassed();
-    expect(tools).toHaveLength(BUILTINS_7.length + 2);
-    expect(new Set(tools)).toEqual(new Set([...BUILTINS_7, "mcp", "mcp_call"]));
+    expect(tools).toHaveLength(BUILTINS_7.length + 3);
+    // `SubagentWorkflow` is the refusing stand-in, see its own test below.
+    expect(new Set(tools)).toEqual(new Set([...BUILTINS_7, "mcp", "mcp_call", "SubagentWorkflow"]));
   });
 
   it("enumerates tools across multiple loaded extensions", async () => {
@@ -1127,7 +1128,8 @@ describe("agent-runner master tool allowlist", () => {
     const opts = createAgentSession.mock.calls[0][0];
     // (a) not denied at the registry gate, and passed as customTools.
     expect(opts.excludeTools ?? []).not.toContain("Agent");
-    expect(opts.customTools).toHaveLength(3);
+    // Plus the refusing `SubagentWorkflow` stand-in.
+    expect(opts.customTools).toHaveLength(4);
     // (b) survive the active-set renarrow alongside a real extension tool.
     const active = lastToolsPassed();
     expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent"]));
@@ -1522,8 +1524,9 @@ describe("agent-runner master tool allowlist", () => {
     // scope is a denylist of this extension's own tools plus `disallowedTools`.
     const opts = createAgentSession.mock.calls[0][0];
     expect(opts.tools).toBeUndefined();
+    // `SubagentWorkflow` is not denied: the child gets a refusing stand-in.
     expect(new Set(opts.excludeTools)).toEqual(
-      new Set([...Object.values(SUBAGENT_TOOL_NAMES), "bash"]),
+      new Set([...Object.values(SUBAGENT_TOOL_NAMES).filter((t) => t !== "SubagentWorkflow"), "bash"]),
     );
 
     // The active set is repaired AFTER bindExtensions (tools may register during
@@ -1552,10 +1555,10 @@ describe("agent-runner async extension tool registration", () => {
     ext.tools.set(toolName, {});
   }
 
-  function setup(o: { builtinToolNames?: string[]; extSelectors?: string[] } = {}) {
+  function setup(o: { builtinToolNames?: string[]; extSelectors?: string[]; disallowedTools?: string[] } = {}) {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
-      makeAgentConfig({ extensions: true, extSelectors: o.extSelectors }),
+      makeAgentConfig({ extensions: true, extSelectors: o.extSelectors, disallowedTools: o.disallowedTools }),
     );
     vi.mocked(getToolNamesForType).mockReturnValueOnce(o.builtinToolNames ?? ["read"]);
   }
@@ -1664,6 +1667,49 @@ describe("agent-runner async extension tool registration", () => {
       expect(verdict.reason).toContain("Workflows are not available inside a subagent");
     }
     await expect(session.agent.beforeToolCall?.({ toolCall: { name: "ok_tool" } })).resolves.toBeUndefined();
+  });
+
+  it("gives the child a refusing SubagentWorkflow, so a call gets the reason instead of 'not found'", async () => {
+    // Core answers "Tool X not found" for a tool missing from the turn's set
+    // BEFORE beforeToolCall runs, so with the real tool excluded the reason
+    // above was unreachable for our own workflow tool.
+    setup();
+    withExtensions({ "/ext/ok.ts": ["ok_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const opts = createAgentSession.mock.calls[0][0];
+    const stub = opts.customTools.find((t: any) => t.name === "SubagentWorkflow");
+    expect(stub).toBeDefined();
+    expect(opts.excludeTools).not.toContain("SubagentWorkflow");
+    expect(session.getActiveToolNames()).toContain("SubagentWorkflow");
+    const verdict = await session.agent.beforeToolCall?.({ toolCall: { name: "SubagentWorkflow" } });
+    expect(verdict.reason).toContain("Workflows are not available inside a subagent");
+    // Without the hook the stub still refuses, by throwing (a returned isError is discarded).
+    await expect(stub.execute("tc", {}, undefined, undefined, undefined)).rejects.toThrow(
+      "Workflows are not available inside a subagent",
+    );
+  });
+
+  it("omits the SubagentWorkflow stand-in when disallowed or when extensions are off", async () => {
+    setup({ disallowedTools: ["SubagentWorkflow"] });
+    withExtensions({ "/ext/ok.ts": ["ok_tool"] });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    await runAgent(ctx, "Explore", "go", { pi });
+    let opts = createAgentSession.mock.calls.at(-1)[0];
+    expect(opts.customTools.map((t: any) => t.name)).not.toContain("SubagentWorkflow");
+    expect(opts.excludeTools).toContain("SubagentWorkflow");
+
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    await runAgent(ctx, "Explore", "go", { pi });
+    opts = createAgentSession.mock.calls.at(-1)[0];
+    expect(opts.customTools.map((t: any) => t.name)).not.toContain("SubagentWorkflow");
+    expect(opts.tools).not.toContain("SubagentWorkflow");
   });
 
   it("beforeToolCall preserves a hook pi installed before us", async () => {
