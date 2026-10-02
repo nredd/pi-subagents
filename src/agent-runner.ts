@@ -358,6 +358,16 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /**
+ * Sent as a tool-less turn when a turn cap or its grace wrap-up fired, so the
+ * result is a report rather than whatever the agent last narrated before it
+ * was cut off ("Now let me check the tests...").
+ */
+const FINAL_REPORT_PROMPT =
+  "You are out of turns and have no tools left. Do NOT call any tool or say what you would do next. "
+  + "Write your complete final report now: everything you found, concrete file paths and line numbers, "
+  + "what you changed or concluded, and anything unfinished or unverified.";
+
+/**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
  */
@@ -558,6 +568,41 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
     if (text) return text;
   }
   return "";
+}
+
+/**
+ * Whether THIS invocation's last assistant message is a finished answer: text,
+ * no tool call pending, and a stop that was not an abort, a tool-use handoff or
+ * a token-limit cut. Anything else is a teaser or a cut-off report.
+ */
+function endedWithReport(session: AgentSession, startIndex = 0): boolean {
+  for (let i = session.messages.length - 1; i >= startIndex; i--) {
+    const msg = session.messages[i];
+    if (msg.role !== "assistant") continue;
+    const hasToolCall = msg.content.some((c) => c.type === "toolCall");
+    const cutOff = msg.stopReason === "aborted" || msg.stopReason === "toolUse" || msg.stopReason === "length";
+    return !hasToolCall && !cutOff && extractText(msg.content).trim() !== "";
+  }
+  return false;
+}
+
+/**
+ * Prompt the session once more with its tools switched off and ask for the full
+ * report. Returns whether that produced assistant text. Never throws: the run
+ * keeps whatever it had if the extra turn fails.
+ */
+async function forceFinalReport(session: AgentSession, startIndex: number): Promise<boolean> {
+  const previousTools = session.getActiveToolNames();
+  try {
+    await session.waitForIdle?.();
+    session.setActiveToolsByName([]);
+    await session.prompt(FINAL_REPORT_PROMPT);
+  } catch {
+    return false;
+  } finally {
+    session.setActiveToolsByName(previousTools);
+  }
+  return endedWithReport(session, startIndex);
 }
 
 /**
@@ -1049,13 +1094,16 @@ export async function runAgent(
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
+  // True while the forced final-report turn runs: it is the grace window's
+  // epilogue, so it must neither re-steer nor re-abort itself.
+  let finalizing = false;
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
-      if (maxTurns != null) {
+      if (maxTurns != null && !finalizing) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
@@ -1111,6 +1159,18 @@ export async function runAgent(
   let structuredRetried = false;
   try {
     await session.prompt(effectivePrompt);
+
+    // A cap fired. The wrap-up steer is only a request: a model deep in a tool
+    // loop keeps calling tools through the grace turns and is then aborted
+    // mid-turn, leaving its last narration as the "result". Demand the report
+    // in a turn that cannot call tools.
+    if (softLimitReached && options.signal?.aborted !== true && !endedWithReport(session, startLen)) {
+      finalizing = true;
+      const reported = await forceFinalReport(session, startLen);
+      // A delivered report is a wrap-up, not a failure: the agent did hand back
+      // its findings, just later than it would have chosen.
+      if (reported) aborted = false;
+    }
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.

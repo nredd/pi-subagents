@@ -2618,6 +2618,112 @@ describe("agent-runner turn limits", () => {
     expect(session.steer).not.toHaveBeenCalled();
   });
 
+  describe("final report after a cap", () => {
+    const TEASER = "Now let me check the remaining modules...";
+    const REPORT = "FINAL REPORT: modules a, b, c reviewed; see src/a.ts:10.";
+
+    /**
+     * An agent deep in a tool loop: every turn narrates and calls a tool, and it
+     * never heeds the wrap-up steer. The first prompt ends on the teaser (as an
+     * abort mid-turn leaves it); a second, tool-less prompt can only answer.
+     */
+    async function runRunaway(opts: { maxTurns: number; turns: number; signal?: AbortSignal }) {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+      const { session, listeners } = createSession("unused");
+      const toolsDuringPrompt: string[][] = [];
+      session.prompt.mockImplementation(async () => {
+        toolsDuringPrompt.push([...session.getActiveToolNames()]);
+        if (toolsDuringPrompt.length === 1) {
+          for (let i = 0; i < opts.turns; i++) {
+            session.messages.push({
+              role: "assistant",
+              stopReason: "toolUse",
+              content: [{ type: "text", text: TEASER }, { type: "toolCall", name: "read" }],
+            });
+            for (const l of [...listeners]) l({ type: "turn_end" });
+          }
+          return;
+        }
+        // The report turn counts turns too; it must not trip the cap again.
+        for (const l of [...listeners]) l({ type: "turn_end" });
+        session.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: REPORT }] });
+      });
+      createAgentSession.mockResolvedValue({ session });
+      const result = await runAgent(ctx, "Explore", "go", { pi, maxTurns: opts.maxTurns, signal: opts.signal });
+      return { session, result, toolsDuringPrompt };
+    }
+
+    it("forces a tool-less report turn when the grace window ends in a hard abort", async () => {
+      setGraceTurns(2);
+      const { session, result, toolsDuringPrompt } = await runRunaway({ maxTurns: 5, turns: 7 });
+      expect(session.abort).toHaveBeenCalled();
+      expect(session.prompt).toHaveBeenCalledTimes(2);
+      expect(session.prompt.mock.calls[1][0]).toContain("final report");
+      expect(toolsDuringPrompt[1]).toEqual([]);
+      expect(result.responseText).toBe(REPORT);
+      expect(result.responseText).not.toBe(TEASER);
+      // Delivered, so a wrap-up rather than a failure.
+      expect(result.aborted).toBe(false);
+      expect(result.steered).toBe(true);
+    });
+
+    it("restores the tool set after the report turn", async () => {
+      setGraceTurns(2);
+      const { session } = await runRunaway({ maxTurns: 5, turns: 7 });
+      expect(session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
+    });
+
+    it("forces the report when the steer was ignored but the grace window was not exhausted", async () => {
+      setGraceTurns(10);
+      const { session, result } = await runRunaway({ maxTurns: 5, turns: 7 });
+      expect(session.abort).not.toHaveBeenCalled();
+      expect(session.prompt).toHaveBeenCalledTimes(2);
+      expect(result.responseText).toBe(REPORT);
+    });
+
+    it("does not re-abort or re-steer during the report turn", async () => {
+      setGraceTurns(1);
+      const { session } = await runRunaway({ maxTurns: 2, turns: 3 });
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.abort).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves a run alone that wrapped up on its own after the steer", async () => {
+      setGraceTurns(5);
+      const { session, result } = await runWithTurns(5, { maxTurns: 5 });
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(result.responseText).toBe("OK");
+      expect(result.steered).toBe(true);
+    });
+
+    it("does not force a report on a user stop", async () => {
+      setGraceTurns(1);
+      const controller = new AbortController();
+      controller.abort();
+      const { session } = await runRunaway({ maxTurns: 2, turns: 4, signal: controller.signal });
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the hard abort when the report turn itself fails", async () => {
+      setGraceTurns(1);
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+      const { session, listeners } = createSession("unused");
+      let calls = 0;
+      session.prompt.mockImplementation(async () => {
+        if (++calls === 2) throw new Error("provider down");
+        for (let i = 0; i < 4; i++) {
+          session.messages.push({ role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: TEASER }, { type: "toolCall", name: "read" }] });
+          for (const l of [...listeners]) l({ type: "turn_end" });
+        }
+      });
+      createAgentSession.mockResolvedValue({ session });
+      const result = await runAgent(ctx, "Explore", "go", { pi, maxTurns: 2 });
+      expect(result.aborted).toBe(true);
+      expect(result.responseText).toBe(TEASER);
+      expect(session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
+    });
+  });
+
   it("reports each turn to the caller's counter", async () => {
     const onTurnEnd = vi.fn();
     await runWithTurns(3, { maxTurns: 10, onTurnEnd });
