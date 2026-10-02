@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
+import { setAgentModels } from "../src/model-resolver.js";
 import type { AgentConfig } from "../src/types.js";
 
 function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -191,5 +192,28 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
     );
 
     expect(resolved.overridden).toEqual({ thinking: "max" });
+  });
+});
+
+describe("agentModels precedence", () => {
+  afterEach(() => setAgentModels(undefined));
+
+  it("orders param > agentModels[type] > agentModels['*'] > definition model", () => {
+    const config = makeConfig({ name: "Plan", model: "definition-model" });
+    setAgentModels({ Plan: "type-model", "*": "wildcard-model" });
+
+    const fromParam = resolveAgentInvocationConfig(config, { model: "param-model" }, { agentType: "Plan" });
+    expect(fromParam).toMatchObject({ modelInput: "param-model", modelFromParams: true });
+
+    const fromType = resolveAgentInvocationConfig(config, {}, { agentType: "Plan" });
+    expect(fromType).toMatchObject({ modelInput: "type-model", modelFromParams: false });
+
+    const fromWildcard = resolveAgentInvocationConfig(makeConfig({ name: "Explore", model: "definition-model" }), {}, { agentType: "Explore" });
+    expect(fromWildcard.modelInput).toBe("wildcard-model");
+
+    setAgentModels({ Plan: "type-model" });
+    expect(resolveAgentInvocationConfig(makeConfig({ name: "Explore", model: "definition-model" }), {}, { agentType: "Explore" }).modelInput)
+      .toBe("definition-model");
+    expect(resolveAgentInvocationConfig(makeConfig({ name: "Explore" }), {}, { agentType: "Explore" }).modelInput).toBeUndefined();
   });
 });

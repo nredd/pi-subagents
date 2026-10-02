@@ -244,6 +244,15 @@ export interface SubagentsSettings {
   /** Trusted-global logical name -> ordered canonical provider/model candidates. */
   modelAliases?: Record<string, string[]>;
   /**
+   * Trusted-global map of agent `type` (or `"*"` for every type) -> model, in
+   * any form `Agent({ model })` accepts. Precedence, highest first: the Agent
+   * tool's `model` parameter, `agentModels[type]`, `agentModels["*"]`, the agent
+   * definition's `model:`, then the parent's model. Like `modelAliases` it
+   * decides which provider a subagent runs on, so a project `.pi/subagents.json`
+   * value is ignored with a warning.
+   */
+  agentModels?: Record<string, string>;
+  /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
    *
@@ -332,6 +341,7 @@ export interface SettingsAppliers {
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setModelAliases: (v: Record<string, string[]> | undefined) => void;
+  setAgentModels: (v: Record<string, string> | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -469,7 +479,29 @@ function sanitize(raw: unknown): SubagentsSettings {
     const aliases = sanitizeModelAliases(r.modelAliases);
     if (aliases) out.modelAliases = aliases;
   }
+  if (r.agentModels !== undefined) {
+    const models = sanitizeAgentModels(r.agentModels);
+    if (models) out.agentModels = models;
+  }
   return out;
+}
+
+/** Validate the `agentModels` map: non-empty string keys and non-empty string values. */
+function sanitizeAgentModels(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn("[pi-subagents] Ignoring agentModels: expected an object of agent type -> model.");
+    return undefined;
+  }
+  const models: Record<string, string> = {};
+  for (const [type, model] of Object.entries(raw)) {
+    const key = type.trim();
+    if (!key || typeof model !== "string" || !model.trim()) {
+      console.warn(`[pi-subagents] Ignoring invalid agentModels entry "${type}".`);
+      continue;
+    }
+    models[key] = model.trim();
+  }
+  return models;
 }
 
 /** Validate one-way logical aliases without interpreting provider details. */
@@ -525,9 +557,12 @@ function readSettingsFile(path: string): SubagentsSettings {
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
   // Aliases pick the provider a subagent runs on, so they are machine
   // configuration: a cloned repo's project file must not redirect them.
-  const { modelAliases: projectModelAliases, ...project } = readSettingsFile(projectPath(cwd));
+  const { modelAliases: projectModelAliases, agentModels: projectAgentModels, ...project } = readSettingsFile(projectPath(cwd));
   if (projectModelAliases !== undefined) {
     console.warn("[pi-subagents] Ignoring modelAliases in project .pi/subagents.json: aliases are read from trusted global configuration only.");
+  }
+  if (projectAgentModels !== undefined) {
+    console.warn("[pi-subagents] Ignoring agentModels in project .pi/subagents.json: per-agent models are read from trusted global configuration only.");
   }
   const enterprise = readEnterpriseLocalManifest()?.subagents;
   const enterpriseSettings = enterprise === undefined ? {} : sanitize(enterprise);
@@ -562,6 +597,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   // Module state: reset when a session omits it, or the previous activation's aliases leak.
   appliers.setModelAliases(s.modelAliases);
+  appliers.setAgentModels(s.agentModels);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

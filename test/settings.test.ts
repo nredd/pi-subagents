@@ -300,6 +300,30 @@ describe("settings persistence", () => {
       warn.mockRestore();
     });
 
+    it("agentModels loads from global and the manifest, trimmed and validated", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeGlobal({ agentModels: { Plan: " opus ", "*": "sonnet", bad: 3, "": "x" } });
+      expect(loadSettings(projectDir).agentModels).toEqual({ Plan: "opus", "*": "sonnet" });
+      writeManifest({ version: 1, subagents: { agentModels: { Explore: "haiku" } } });
+      expect(loadSettings(projectDir).agentModels).toEqual({ Explore: "haiku" });
+      warn.mockRestore();
+    });
+
+    it("agentModels ignores the project file so a cloned repo cannot pick providers", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      writeGlobal({ agentModels: { "*": "sonnet" } });
+      writeProject({ agentModels: { "*": "evil/model" }, maxConcurrent: 2 });
+      expect(loadSettings(projectDir)).toEqual({ agentModels: { "*": "sonnet" }, maxConcurrent: 2 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring agentModels in project"));
+      warn.mockRestore();
+    });
+
+    it("applySettings resets agentModels when a session omits them", () => {
+      const setAgentModels = vi.fn();
+      applySettings({}, { setAgentModels, setModelAliases: vi.fn() } as unknown as SettingsAppliers);
+      expect(setAgentModels).toHaveBeenCalledWith(undefined);
+    });
+
     it("ignores a group- or world-readable manifest without printing its contents", () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       writeManifest({ version: 1, subagents: { modelAliases: { fast: ["corp/secret-model"] } } }, 0o644);
@@ -334,7 +358,7 @@ describe("settings persistence", () => {
 
     it("applySettings resets aliases when a session omits them", () => {
       const setModelAliases = vi.fn();
-      applySettings({}, { setModelAliases } as unknown as SettingsAppliers);
+      applySettings({}, { setModelAliases, setAgentModels: vi.fn() } as unknown as SettingsAppliers);
       expect(setModelAliases).toHaveBeenCalledWith(undefined);
     });
   });
@@ -619,6 +643,7 @@ describe("settings persistence", () => {
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
         setModelAliases: vi.fn(),
+        setAgentModels: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
@@ -871,6 +896,7 @@ describe("settings persistence", () => {
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
         setModelAliases: vi.fn(),
+        setAgentModels: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),

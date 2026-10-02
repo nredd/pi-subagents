@@ -26,11 +26,12 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { type DetachedResult, drainDetached, spoolDetached, watchDetached } from "./detached-results.js";
+import { readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel, setModelAliases } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -257,10 +258,11 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
 /**
  * Format an agent's tool scope for the Agent tool description.
  *
- * This suffix describes BUILT-IN scope only — extension tools are resolved when
- * the agent runs (extensions can register asynchronously), so they cannot be
- * enumerated while the description is being built. That is why an agent with
- * `tools: "*, ext:mcp/search"` renders "*" and always has.
+ * This suffix names the BUILT-IN scope and flags, without listing them, that
+ * extension tools load too — they are resolved when the agent runs (extensions
+ * can register asynchronously), so they cannot be enumerated while the
+ * description is being built. An agent with `tools: "*, ext:mcp/search"`
+ * therefore renders "* + extension tools".
  *
  * Two distinctions matter, both of them capability claims the orchestrator acts on:
  *
@@ -278,17 +280,19 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
  */
 export function formatToolsSuffix(cfg: AgentConfig | undefined): string {
   const tools = cfg?.builtinToolNames;
-  if (!tools) return "*";
-  if (tools.length === 0) {
-    // `isolated` overrides extensions to false in the runner, so both mean the
-    // agent has no extension tools either — and then it truly has nothing.
-    const noExtensionTools = cfg?.isolated === true || cfg?.extensions === false;
+  // `isolated` overrides extensions to false in the runner, so both mean the
+  // agent has no extension tools.
+  const noExtensionTools = cfg?.isolated === true || cfg?.extensions === false;
+  if (tools && tools.length === 0) {
     return noExtensionTools ? "none" : "no built-ins, extension tools only";
   }
-  const isFullSet =
-    tools.length === BUILTIN_TOOL_NAMES.length
-    && BUILTIN_TOOL_NAMES.every((t) => tools.includes(t));
-  return isFullSet ? "*" : tools.join(", ");
+  const isFullSet = !tools
+    || (tools.length === BUILTIN_TOOL_NAMES.length && BUILTIN_TOOL_NAMES.every((t) => tools.includes(t)));
+  const builtins = isFullSet ? "*" : tools.join(", ");
+  // Extension tools resolve at run time, so they cannot be enumerated here, but
+  // omitting the fact reads as "built-ins only": an agent that can search the
+  // web through an extension then looks web-less, and the work gets routed away.
+  return noExtensionTools ? builtins : `${builtins} + extension tools`;
 }
 
 /** CLI flag that runs a workflow script at session start. */
@@ -390,6 +394,9 @@ export default function (pi: ExtensionAPI) {
       `Run a workflow script at startup: --${WORKFLOW_FILE_FLAG}=<path>. ` +
       "Use the `=` form — the space form consumes the next argument, which would swallow a following prompt.",
   });
+
+  // Fuzzy model names ("opus") prefer what the user enabled in pi's settings.
+  setModelScopeProvider(registry => resolveEnabledModels(readEnabledModels(process.cwd()), registry, process.cwd()));
 
   // Read directly rather than waiting for applyAndEmitLoaded below: this decides
   // the initial load, which happens hundreds of lines before settings are applied.
@@ -1494,6 +1501,7 @@ export default function (pi: ExtensionAPI) {
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setModelAliases,
+      setAgentModels,
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -1875,6 +1883,7 @@ Terse command-style prompts produce shallow, generic work.
       const customConfig = getAgentConfig(subagentType);
 
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
+        agentType: subagentType,
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: getBackgroundByDefault(),
       });
@@ -3565,6 +3574,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       fallbackSubagent: getFallbackSubagent(),
       // Global-only (see loadSettings): never written into the project file.
       modelAliases: undefined,
+      agentModels: undefined,
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
