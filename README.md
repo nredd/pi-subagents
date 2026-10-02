@@ -564,12 +564,13 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 1. At `max_turns` — steering message: *"Wrap up immediately — provide your final answer now."*
 2. Up to 5 grace turns to finish cleanly
 3. Hard abort only after the grace period
+4. Whenever a limit fired and the agent did not end on a finished answer (text, no pending tool call), one more tool-less turn asks for the full final report. The steer is only a request: an agent deep in a tool loop ignores it, and without that turn the result was whatever it narrated before the abort ("Now let me check the tests...")
 
 | Status | Meaning | Icon |
 |--------|---------|------|
 | `completed` | Finished naturally | `✓` green |
-| `steered` | Hit limit, wrapped up in time | `✓` yellow |
-| `aborted` | Grace period exceeded | `✗` red |
+| `steered` | Hit limit, wrapped up (on its own, or via the forced final report) | `✓` yellow |
+| `aborted` | Grace period exceeded and the final report turn produced nothing | `✗` red |
 | `stopped` | User-initiated abort | `■` dim |
 
 ## Concurrency
