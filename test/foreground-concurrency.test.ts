@@ -378,7 +378,7 @@ describe("maxConcurrentForeground", () => {
     manager = new AgentManager();
     manager.setMaxConcurrentForeground(1);
 
-    vi.mocked(createWorktree).mockReturnValue(undefined as any);
+    vi.mocked(createWorktree).mockRejectedValue(new Error("/tmp is not inside a git repository"));
 
     const first = fg(manager, "holder");
     const doomed = fg(manager, "doomed", { isolation: "worktree" });

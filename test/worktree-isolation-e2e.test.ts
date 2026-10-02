@@ -17,7 +17,7 @@
  * env var to leave it alone — the pre-publish smoke sets PI_E2E_LIVE globally.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
@@ -79,7 +79,10 @@ function agentResultText(session: Context): string {
  * tools resolve against, and writing the file from the test would answer it by
  * assumption.
  */
-function respondSpawning(isolation: "worktree" | undefined): (context: Context) => FauxReply {
+function respondSpawning(
+  isolation: "worktree" | undefined,
+  extra: Record<string, unknown> = {},
+): (context: Context) => FauxReply {
   return (context: Context): FauxReply => {
     if (firstUserText(context).includes(CHILD_PROMPT)) {
       if (!toolResultNames(context).includes("bash")) {
@@ -99,6 +102,7 @@ function respondSpawning(isolation: "worktree" | undefined): (context: Context) 
       description: "worktree work",
       prompt: CHILD_PROMPT,
       ...(isolation ? { isolation } : {}),
+      ...extra,
     });
   };
 }
@@ -149,6 +153,59 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
 
     // And the copy is gone: `git worktree list` is down to the main checkout.
     expect(git(repo, "worktree", "list").split("\n")).toHaveLength(1);
+  });
+
+  it("isolates a repo other than the session cwd when the caller names it as `cwd`", async () => {
+    // The session sits in a plain directory; the repo is elsewhere. Before
+    // `cwd` existed the worktree could only come from the session cwd, so this
+    // failed with a bare "not a git repo".
+    const repo = initGitRepo();
+    repos.push(repo);
+    mkdirSync(join(repo, "pkg"));
+    writeFileSync(join(repo, "pkg", "index.ts"), "export {};\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "add pkg");
+    const sessionDir = mkdtempSync(join(tmpdir(), "wt-iso-e2e-session-"));
+    repos.push(sessionDir);
+
+    run = await runPrintMode({
+      prompt: "Delegate the work.",
+      cwd: sessionDir,
+      respond: respondSpawning("worktree", { cwd: join(repo, "pkg") }),
+      live: false,
+    });
+
+    const result = agentResultText(run.parentSession);
+    expect(result).toContain(CHILD_MARKER);
+    // Neither the session dir nor the target checkout saw the write.
+    expect(existsSync(join(sessionDir, MARKER_FILE))).toBe(false);
+    expect(existsSync(join(repo, "pkg", MARKER_FILE))).toBe(false);
+    expect(git(repo, "status", "--porcelain")).toBe("");
+
+    // The result names the target repo, and the branch lives there, with the
+    // file at the same subdirectory the caller asked for.
+    const branch = /Changes saved to branch `(pi-agent-[^`]+)`/.exec(result)?.[1];
+    expect(branch).toBeTruthy();
+    expect(result).toContain(`in \`${realpathSync(repo)}\``);
+    expect(git(repo, "ls-tree", "-r", "--name-only", branch!)).toContain(`pkg/${MARKER_FILE}`);
+    expect(git(repo, "worktree", "list").split("\n")).toHaveLength(1);
+  });
+
+  it("names the directory and cause when the session cwd is not a repo", async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "wt-iso-e2e-norepo-"));
+    repos.push(sessionDir);
+
+    run = await runPrintMode({
+      prompt: "Delegate the work.",
+      cwd: sessionDir,
+      respond: respondSpawning("worktree"),
+      live: false,
+    });
+
+    const result = agentResultText(run.parentSession);
+    expect(result).not.toContain(CHILD_MARKER);
+    expect(result).toContain(`${sessionDir} is not inside a git repository`);
+    expect(result).toContain("pass its path as the `Agent` tool's `cwd`");
   });
 
   it("downgrades to the main checkout when the project set worktreeIsolation: false", async () => {
