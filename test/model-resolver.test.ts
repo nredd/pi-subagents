@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { describeModel, getModelAliases, type ModelRegistry, resolveModel, setModelAliases } from "../src/model-resolver.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { configuredAgentModel, describeModel, getModelAliases, type ModelRegistry, parseModelVersion, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -283,5 +283,89 @@ describe("describeModel", () => {
   it("falls back to the id when the model has no display name", () => {
     expect(describeModel({ provider: "openai-codex", id: "gpt-5.6-sol" }))
       .toEqual({ modelName: "gpt-5.6-sol", modelId: "openai-codex/gpt-5.6-sol" });
+  });
+});
+
+describe("fuzzy resolution ranks by version, then score", () => {
+  const FAMILY = [
+    { id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" },
+    { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+    { id: "claude-opus-4-20250514", name: "Claude Opus 4", provider: "anthropic" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
+    { id: "gpt-5.1-codex", name: "GPT-5.1 Codex", provider: "openai" },
+    { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "openai" },
+    { id: "gpt-6-mini", name: "GPT-6 Mini", provider: "openai" },
+  ];
+
+  afterEach(() => {
+    setModelScopeProvider(undefined);
+  });
+
+  it("parses claude and gpt versions, ignoring date stamps", () => {
+    expect(parseModelVersion("claude-opus-4-6")).toEqual([4, 6]);
+    expect(parseModelVersion("claude-opus-5")).toEqual([5, 0]);
+    expect(parseModelVersion("claude-opus-4-20250514")).toEqual([4, 0]);
+    expect(parseModelVersion("claude-haiku-4-5-20251001")).toEqual([4, 5]);
+    expect(parseModelVersion("claude-3-5-sonnet-20241022")).toEqual([3, 5]);
+    expect(parseModelVersion("anthropic/claude-opus-4.6")).toEqual([4, 6]);
+    expect(parseModelVersion("gpt-6.1-sol")).toEqual([6, 1]);
+    expect(parseModelVersion("gpt-6-mini")).toEqual([6, 0]);
+    expect(parseModelVersion("gemini-2.5-pro")).toBeUndefined();
+  });
+
+  it("a bare family name picks the newest version, not the shortest id", () => {
+    expect(resolveModel("opus", makeRegistry(FAMILY))).toEqual(FAMILY[0]);
+    expect(resolveModel("gpt", makeRegistry(FAMILY))).toEqual(FAMILY[5]);
+  });
+
+  it("an exact id still wins over a newer sibling", () => {
+    expect(resolveModel("claude-opus-4-6", makeRegistry(FAMILY))).toEqual(FAMILY[1]);
+    expect(resolveModel("anthropic/claude-opus-4-6", makeRegistry(FAMILY))).toEqual(FAMILY[1]);
+  });
+
+  it("an alias still wins over fuzzy ranking", () => {
+    setModelAliases({ opus: ["anthropic/claude-opus-4-6"] });
+    expect(resolveModel("opus", makeRegistry(FAMILY))).toEqual(FAMILY[1]);
+    setModelAliases(undefined);
+  });
+
+  it("prefers the enabled model scope, then newest within it", () => {
+    setModelScopeProvider(() => new Set(["anthropic/claude-opus-4-6", "anthropic/claude-opus-4-20250514"]));
+    expect(resolveModel("opus", makeRegistry(FAMILY))).toEqual(FAMILY[1]);
+  });
+
+  it("falls back to every candidate when none is in scope", () => {
+    setModelScopeProvider(() => new Set(["openai/gpt-6.1-sol"]));
+    expect(resolveModel("opus", makeRegistry(FAMILY))).toEqual(FAMILY[0]);
+  });
+
+  it("ranks unversioned models after versioned ones, then by score", () => {
+    const mixed = [
+      { id: "pro", name: "Pro", provider: "x" },
+      { id: "gemini-pro-latest", name: "Gemini Pro", provider: "google" },
+      { id: "claude-pro-1", name: "Claude Pro 1", provider: "anthropic" },
+    ];
+    expect(resolveModel("pro", makeRegistry(mixed))).toEqual(mixed[0]); // exact id
+    expect(resolveModel("pr", makeRegistry(mixed))).toEqual(mixed[2]); // only versioned one
+  });
+});
+
+describe("configuredAgentModel", () => {
+  afterEach(() => {
+    setAgentModels(undefined);
+  });
+
+  it("prefers the type, then the wildcard, then the definition's own model", () => {
+    setAgentModels({ Plan: "opus", "*": "sonnet" });
+    expect(configuredAgentModel("Plan", "haiku")).toBe("opus");
+    expect(configuredAgentModel("Explore", "haiku")).toBe("sonnet");
+    setAgentModels({ Plan: "opus" });
+    expect(configuredAgentModel("Explore", "haiku")).toBe("haiku");
+    expect(configuredAgentModel("Explore", undefined)).toBeUndefined();
+  });
+
+  it("matches the type case-insensitively", () => {
+    setAgentModels({ Plan: "opus" });
+    expect(configuredAgentModel("plan", undefined)).toBe("opus");
   });
 });

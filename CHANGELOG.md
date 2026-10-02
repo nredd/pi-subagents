@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Router exhaustion policy.** An admission reply with `wait: false` (the profile's `exhaustionPolicy: "fail"`, or a reset beyond its `maxWaitMinutes`) fails a background dispatch immediately instead of parking it, and a parked job whose policy has since become `fail` starts rather than re-parking. A reply without `wait` still parks, so older routers behave as before.
 
+- **`agentModels` setting.** Global/enterprise-only map of agent `type` (or `"*"`) to model. Precedence: `Agent({ model })` > `agentModels[type]` > `agentModels["*"]` > the definition's `model:` > the parent's model. Applied on the top-level, nested and workflow `agent()` paths; a project `.pi/subagents.json` value is ignored with a warning.
+
 ### Changed
+- **Fuzzy model names resolve to the newest version.** `"opus"` resolved to `claude-opus-5` because the shortest id won. Exact ids and aliases still win first; otherwise candidates are narrowed to pi's `enabledModels` (when any is in it), then ranked by parsed version descending (`claude-<family>-<n>[-<n>]`, `gpt-<n>[.<n>]-<variant>`), then by score.
+- **The `Agent` tool description no longer implies built-ins are all an agent has.** Suffixes now read `* + extension tools` (or `read, grep + extension tools`) for agents that load extensions; `none` and the no-extension forms are unchanged.
 - **`Explore` defaults to the provider-neutral `claude-haiku-4-5`** instead of `anthropic/claude-haiku-4-5`, so a machine-local alias or fuzzy match can pick the provider. With the stock `anthropic` provider it resolves to the same model.
 
 ### Fixed

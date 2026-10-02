@@ -336,6 +336,8 @@ All fields are optional — sensible defaults for everything.
 
 Frontmatter is authoritative for `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`. An agent file's `model` is its portable default; an explicit `Agent({ model })` selection overrides it. Other `Agent` tool parameters only fill fields the agent config leaves unspecified.
 
+**Fuzzy names pick the newest model.** A bare family name such as `"opus"` matches several ids; exact ids and [aliases](#machine-local-model-aliases) still win first, otherwise the candidates are narrowed to pi's `enabledModels` (when any candidate is enabled), then ranked by parsed version, newest first, then by match score. Versions are read from `claude-<family>-<n>[-<n>]` (`claude-opus-4-6`, `claude-opus-5`; a trailing `-YYYYMMDD` is a date, not a minor) and `gpt-<n>[.<n>]-<variant>` (`gpt-6.1-sol`); ids with no recognised scheme rank after every versioned one. Previously the shortest id won, so `"opus"` resolved to `claude-opus-5` even with `claude-opus-4-6` enabled and `claude-opus-5` not.
+
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
 ### Nested subagents
@@ -398,16 +400,18 @@ A few rules the examples don't make obvious:
 - `exclude_extensions:` is **not a sandbox**: excluded extensions' factory code still executes once during loading. Exclusion suppresses their tools and their bound lifecycle hooks (`pi.on` handlers like `session_start` only fire for extensions bound to the session), but not other load-time side effects — a factory that subscribes directly to the shared `pi.events` bus stays live. Don't rely on it to contain an untrusted extension.
 - Array and string forms are equivalent: `[a, b]` == `"a, b"`.
 
-**How an agent's scope is advertised.** The Agent tool description lists every available agent with a `(Tools: …)` suffix, and that suffix is what the orchestrator reads when deciding where to route work. It describes **built-in scope only** — extension tools are resolved when the agent runs (extensions may register lazily, see above), so they can't be enumerated when the description is built:
+**How an agent's scope is advertised.** The Agent tool description lists every available agent with a `(Tools: …)` suffix, and that suffix is what the orchestrator reads when deciding where to route work. It names the **built-in scope** and flags that extension tools load too, without listing them (extensions may register lazily, see above, so they can't be enumerated when the description is built):
 
-| `tools:` | suffix |
-|---|---|
-| omitted, `*`, or `all` | `*` |
-| a list of built-ins | that list, e.g. `read, grep` |
-| `none` with `isolated: true` or `extensions: false` | `none` |
-| `none`, or only `ext:` entries, with extensions loading | `no built-ins, extension tools only` |
+| `tools:` | extensions loading | suffix |
+|---|---|---|
+| omitted, `*`, or `all` | yes | `* + extension tools` |
+| omitted, `*`, or `all` | `extensions: false` or `isolated: true` | `*` |
+| a list of built-ins | yes | e.g. `read, grep + extension tools` |
+| a list of built-ins | no | that list, e.g. `read, grep` |
+| `none` with `isolated: true` or `extensions: false` | no | `none` |
+| `none`, or only `ext:` entries | yes | `no built-ins, extension tools only` |
 
-The last two rows are separate because zero built-ins is not zero tools: `tools: none` alongside `extensions:` still surfaces every extension tool, so calling it `none` would understate what the agent can do. Note `*` doesn't enumerate extension tools either — an agent with `tools: "*, ext:mcp/search"` advertises `*`.
+The last two rows are separate because zero built-ins is not zero tools: `tools: none` alongside `extensions:` still surfaces every extension tool, so calling it `none` would understate what the agent can do. Without the `+ extension tools` flag an agent that can search the web through an extension (e.g. `Plan`) read as web-less.
 
 ## Tools
 
@@ -613,6 +617,16 @@ When background agents complete, they notify the main agent. The **join mode** c
 ```
 
 Alias candidates are resolved in order against authenticated models; Pi sessions and schedules retain only the selected canonical ID. Missing, malformed, group-readable, or unsupported manifests are ignored with a safe path-and-reason warning. Aliases may not contain `/`; candidates must be canonical IDs, so aliases cannot recurse. A request whose alias has no available candidate fails with its alias and candidate IDs, never credential data.
+
+## Per-agent models
+
+`agentModels` in the global `~/.pi/agent/subagents.json` (or the `subagents` section of `enterprise.local.json`) maps an agent `type`, or `"*"` for every type, to a model: any form `Agent({ model })` takes (`provider/modelId`, alias, fuzzy name). Types match case-insensitively.
+
+```json
+{ "agentModels": { "Plan": "opus", "Explore": "haiku", "*": "sonnet" } }
+```
+
+Precedence, highest first: the `Agent` tool's `model` parameter, `agentModels[type]`, `agentModels["*"]`, the agent definition's `model:`, the parent's model. It applies on every spawn path (top-level, nested, workflow `agent()`). A value that does not resolve falls back down the chain silently, like a definition default. Like `modelAliases` it chooses providers, so a project `.pi/subagents.json` value is ignored with a warning.
 
 ## Model Scope
 
@@ -987,7 +1001,7 @@ src/
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)
-  model-resolver.ts   # Model resolution: exact provider/modelId with fuzzy fallback
+  model-resolver.ts   # Model resolution: exact provider/modelId, aliases, `agentModels`, fuzzy fallback ranked by version
   enabled-models.ts   # Read pi's enabledModels settings (project over global)
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing

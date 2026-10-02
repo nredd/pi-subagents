@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { configuredAgentModel } from "./model-resolver.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
@@ -72,6 +73,8 @@ interface AgentInvocationParams {
 }
 
 interface ResolveOptions {
+  /** The resolved agent type, for the `agentModels` lookup. Omitted → only the `"*"` entry applies. */
+  agentType?: string;
   /**
    * Whether worktree isolation is permitted at all. False when the project set
    * `worktreeIsolation: false`, which drops a requested worktree rather than
@@ -130,8 +133,9 @@ export function resolveAgentInvocationConfig(
   return {
     // A frontmatter model is a portable default, not a policy boundary. An
     // explicit model on the Agent call must win so an orchestrator can select a
-    // specific model (e.g. a `router/*` virtual model) for this dispatch.
-    modelInput: params.model ?? agentConfig?.model,
+    // specific model (e.g. a `router/*` virtual model) for this dispatch. Below
+    // it, the global `agentModels` setting outranks the definition's own default.
+    modelInput: params.model ?? configuredAgentModel(opts?.agentType ?? agentConfig?.name ?? "", agentConfig?.model),
     modelFromParams: params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
