@@ -6,7 +6,7 @@
  */
 
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -20,6 +20,57 @@ const CHROME_LINES_BASE = 6;
 const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
+
+/** Fraction of the terminal width the viewer box takes. */
+const BOX_WIDTH_PCT = 90;
+
+/** Lines moved by one wheel event when the host reports no `wheelDelta`. */
+const FALLBACK_WHEEL_LINES = 3;
+/** Alt held multiplies a wheel scroll by this much (the host's own factor). */
+const ALT_WHEEL_MULTIPLIER = 5;
+
+/** Ticks the header and activity line forward while an agent runs, so `thinking · 2m41s` keeps counting. */
+const LIVE_TICK_MS = 1000;
+
+/** Whether pi is drawing in fullscreen mode (1.0+), the only mode that delivers mouse events. */
+function isFullscreen(tui: TUI): boolean {
+  return (tui as { mode?: string }).mode === "fullscreen";
+}
+
+/** The slice of pi 1.0's `TuiMouseEvent` the viewer reads; older pi never calls `handleMouse`. */
+export interface ViewerMouseEvent {
+  type: string;
+  button: string;
+  /** Local to the viewer component. */
+  x: number;
+  y: number;
+  /** Logical lines; negative scrolls up. Already scaled by `fullscreenWheelScrollLines` and Alt. */
+  wheelDelta?: number;
+  alt?: boolean;
+}
+
+export interface ViewerMouseResult {
+  handled?: boolean;
+  render?: boolean;
+}
+
+/**
+ * Overlay sizing for the viewer. In fullscreen the overlay covers the whole
+ * terminal and the viewer draws its box inside it, because core delivers a
+ * click only to the overlay under the pointer: a click on the empty margin has
+ * to land on the viewer to be able to close it. Elsewhere it stays the 90%
+ * centred box it always was. Core re-reads the options each layout, so the
+ * choice follows the `tui` handed to the factory.
+ */
+export function createViewerOverlay(): { options: () => OverlayOptions; track: (tui: TUI) => void } {
+  let fullscreen = false;
+  return {
+    options: () => fullscreen
+      ? { anchor: "center", width: "100%", maxHeight: "100%" }
+      : { anchor: "center", width: `${BOX_WIDTH_PCT}%`, maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
+    track: (tui) => { fullscreen = isFullscreen(tui); },
+  };
+}
 
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.
@@ -143,6 +194,10 @@ export class ConversationViewer implements Component {
   private unsubscribe: (() => void) | undefined;
   private lastInnerW = 0;
   private closed = false;
+  /** Repaints once a second while the agent runs; see `LIVE_TICK_MS`. */
+  private liveTimer: ReturnType<typeof setInterval> | undefined;
+  /** Where the box sits inside the component when drawn on a backdrop (fullscreen). */
+  private boxRect: { left: number; top: number; width: number; height: number } | undefined;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
   private keys: ViewerKeys;
@@ -197,6 +252,54 @@ export class ConversationViewer implements Component {
       if (this.closed) return;
       this.tui.requestRender();
     });
+    if (record.status === "running" || record.status === "queued") {
+      this.liveTimer = setInterval(() => {
+        if (this.closed) return;
+        this.tui.requestRender();
+        if (this.record.status !== "running" && this.record.status !== "queued") this.stopLiveTimer();
+      }, LIVE_TICK_MS);
+      this.liveTimer.unref?.();
+    }
+  }
+
+  private stopLiveTimer(): void {
+    if (this.liveTimer !== undefined) clearInterval(this.liveTimer);
+    this.liveTimer = undefined;
+  }
+
+  /**
+   * Mouse input (pi 1.0 fullscreen). The wheel scrolls by the host's own
+   * `wheelDelta`, which already honours `fullscreenWheelScrollLines` and the
+   * 5x Alt multiplier. A click outside the box, on the backdrop, closes the
+   * viewer. Anything else is left to the host (selection, links).
+   */
+  handleMouse(event: ViewerMouseEvent): ViewerMouseResult | undefined {
+    if (event.type === "wheel") {
+      const direction = (event.wheelDelta ?? 0) < 0 ? -1 : 1;
+      const delta = event.wheelDelta ?? direction * FALLBACK_WHEEL_LINES * (event.alt ? ALT_WHEEL_MULTIPLIER : 1);
+      const maxScroll = Math.max(0, this.buildContentLines(this.lastInnerW).length - this.viewportHeight());
+      // `autoScroll` follows the bottom: pinned there, new output keeps scrolling.
+      const from = this.autoScroll ? maxScroll : this.scrollOffset;
+      this.scrollOffset = Math.max(0, Math.min(maxScroll, from + delta));
+      this.autoScroll = this.scrollOffset >= maxScroll;
+      return { handled: true, render: true };
+    }
+    if (event.type === "click" && event.button === "left" && this.isOutsideBox(event.x, event.y)) {
+      this.close();
+      return { handled: true, render: true };
+    }
+    return undefined;
+  }
+
+  private isOutsideBox(x: number, y: number): boolean {
+    const box = this.boxRect;
+    if (!box) return false; // not on a backdrop: every event is inside the box
+    return x < box.left || x >= box.left + box.width || y < box.top || y >= box.top + box.height;
+  }
+
+  private close(): void {
+    this.closed = true;
+    this.done(undefined);
   }
 
   handleInput(data: string): void {
@@ -209,8 +312,7 @@ export class ConversationViewer implements Component {
     }
 
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
-      this.closed = true;
-      this.done(undefined);
+      this.close();
       return;
     }
 
@@ -277,6 +379,30 @@ export class ConversationViewer implements Component {
   }
 
   render(width: number): string[] {
+    // Fullscreen with a full-width overlay: centre the box on a blank backdrop
+    // the size of the terminal, so a click on the margin reaches `handleMouse`.
+    const columns = this.tui.terminal.columns;
+    if (!isFullscreen(this.tui) || width < columns) {
+      this.boxRect = undefined;
+      return this.renderBox(width);
+    }
+    const boxWidth = Math.max(6, Math.floor((width * BOX_WIDTH_PCT) / 100));
+    const box = this.renderBox(boxWidth);
+    const left = Math.floor((width - boxWidth) / 2);
+    const rows = this.tui.terminal.rows;
+    const top = Math.max(0, Math.floor((rows - box.length) / 2));
+    const blank = " ".repeat(width);
+    const margin = " ".repeat(left);
+    const lines = [
+      ...Array.from({ length: top }, () => blank),
+      ...box.map(line => margin + line + " ".repeat(Math.max(0, width - left - visibleWidth(line)))),
+    ];
+    while (lines.length < rows) lines.push(blank);
+    this.boxRect = { left, top, width: boxWidth, height: box.length };
+    return lines;
+  }
+
+  private renderBox(width: number): string[] {
     if (width < 6) return []; // too narrow for any meaningful rendering
     const th = this.theme;
     const innerW = width - 4; // border + padding
@@ -366,7 +492,7 @@ export class ConversationViewer implements Component {
       // at 80 columns with steer + stop present, and this group has no
       // degradation step below "drop the line-count readout".
       actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
-      const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
+      const footerRight = th.fg("dim", "wheel/↑↓ scroll · PgUp/PgDn/Shift+↑↓ · Esc close");
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
       // it's the first thing dropped so it never crowds out the hints.
@@ -475,6 +601,7 @@ export class ConversationViewer implements Component {
 
   dispose(): void {
     this.closed = true;
+    this.stopLiveTimer();
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = undefined;
@@ -577,9 +704,26 @@ export class ConversationViewer implements Component {
       needsSeparator = true;
     }
 
+    // The message being streamed is not in `messages` until it ends. Showing its
+    // text as it arrives is what makes the viewer live rather than a log that
+    // jumps a whole reply at a time. Literal, not Markdown: it is rebuilt on
+    // every delta, and a half-written fence would reflow the whole message.
+    const streaming = this.session.state?.streamingMessage;
+    if (streaming?.role === "assistant" && !messages.includes(streaming)) {
+      const text = streaming.content
+        .flatMap(c => (c.type === "text" && c.text ? [c.text] : []))
+        .join("\n")
+        .trim();
+      if (text) {
+        if (needsSeparator) lines.push(th.fg("dim", "───"));
+        lines.push(th.bold("[Assistant]"));
+        lines.push(...this.rawLines(text, width, false));
+      }
+    }
+
     // Streaming indicator for running agents
     if (this.record.status === "running" && this.activity) {
-      const act = describeActivity(this.activity.activeTools, this.activity.responseText);
+      const act = describeActivity(this.activity.activeTools, this.activity.responseText, this.activity.modelCall);
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
     }

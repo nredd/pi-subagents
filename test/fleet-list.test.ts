@@ -658,6 +658,74 @@ describe("FleetList cost display", () => {
   });
 });
 
+describe("FleetList model and activity", () => {
+  const withModel = (over: Partial<AgentRecord> = {}) => makeRecord({
+    invocation: { modelName: "opus 4.6", modelId: "anthropic/claude-opus-4-6", thinking: "high" },
+    ...over,
+  });
+
+  function row(record: AgentRecord, showModel: boolean, activity?: Map<string, AgentActivity>): string {
+    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), undefined, undefined, undefined, () => showModel);
+    let factory: any;
+    fleet.setUICtx({
+      setWidget: (_k: string, c: any) => { factory = c; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as any,
+    } as any);
+    fleet.update();
+    return factory({ requestRender: () => {}, terminal: { columns: 160, rows: 40 } }, theme).render(160).join("\n");
+  }
+
+  it("names the model and thinking level under showModel", () => {
+    const out = row(withModel(), true);
+    expect(out).toContain("opus 4.6");
+    expect(out).toContain("thinking: high");
+  });
+
+  it("renders the row exactly as before when showModel is off", () => {
+    const out = row(withModel(), false);
+    expect(out).not.toContain("opus 4.6");
+    expect(out).not.toContain("thinking: high");
+  });
+
+  it("copes with a record that has no invocation yet", () => {
+    expect(() => row(makeRecord(), true)).not.toThrow();
+  });
+
+  it("shows what the in-flight model call is doing on a running row", () => {
+    const now = Date.now();
+    const thinking = new Map<string, AgentActivity>([["a1", {
+      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      modelCall: { startedAt: now - 161_000, lastEventAt: now - 1_000, kind: "thinking", writtenChars: 0 },
+    }]]);
+    expect(row(withModel(), false, thinking)).toMatch(/thinking · 2m4\ds/);
+
+    const writing = new Map<string, AgentActivity>([["a1", {
+      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      modelCall: { startedAt: now - 5_000, lastEventAt: now - 100, kind: "writing", writtenChars: 12_800 },
+    }]]);
+    expect(row(withModel(), false, writing)).toContain("writing · 3.2k tok");
+
+    const stalled = new Map<string, AgentActivity>([["a1", {
+      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      modelCall: { startedAt: now - 200_000, lastEventAt: now - 161_000, kind: "thinking", writtenChars: 0 },
+    }]]);
+    expect(row(withModel(), false, stalled)).toMatch(/stalled\? · 2m4\ds/);
+  });
+
+  it("shows no call for a finished row", () => {
+    const now = Date.now();
+    const activity = new Map<string, AgentActivity>([["a1", {
+      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      modelCall: { startedAt: now - 5_000, lastEventAt: now - 100, kind: "writing", writtenChars: 12_800 },
+    }]]);
+    const out = row(withModel({ status: "completed", completedAt: now - 100 }), false, activity);
+    expect(out).not.toContain("writing");
+  });
+});
+
 /* ------------------------------------------------------------------------- *
  * Workflow runs
  * ------------------------------------------------------------------------- */

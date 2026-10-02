@@ -9,6 +9,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
+import { describeModelCall, type ModelCallState } from "../model-call.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
@@ -60,6 +61,8 @@ export interface AgentActivity {
   turnCount: number;
   /** Effective max turns for this agent (undefined = unlimited). */
   maxTurns?: number;
+  /** The model call in flight, if any; see `describeModelCall`. */
+  modelCall?: ModelCallState;
 }
 
 /** Metadata attached to Agent tool results for custom rendering. */
@@ -87,6 +90,8 @@ export interface AgentDetails {
   cost?: number;
   agentId?: string;
   error?: string;
+  /** The `.output` transcript, when one was written. */
+  outputFile?: string;
 }
 
 // ---- Formatting helpers ----
@@ -217,8 +222,17 @@ function truncateLine(text: string, len = 60): string {
   return line.slice(0, len) + "…";
 }
 
-/** Build a human-readable activity string from currently-running tools or response text. */
-export function describeActivity(activeTools: Map<string, string>, responseText?: string): string {
+/**
+ * Build a human-readable activity string: running tools first, then the model
+ * call in flight (`thinking · 2m41s`, `writing · 3.2k tok`, `stalled? · 2m41s`),
+ * then the latest response text.
+ */
+export function describeActivity(
+  activeTools: Map<string, string>,
+  responseText?: string,
+  modelCall?: ModelCallState,
+  now: number = Date.now(),
+): string {
   if (activeTools.size > 0) {
     const groups = new Map<string, number>();
     for (const toolName of activeTools.values()) {
@@ -236,6 +250,9 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
     }
     return parts.join(", ") + "…";
   }
+
+  const call = describeModelCall(modelCall, now);
+  if (call) return call;
 
   // No tools active — show truncated response text if available
   if (responseText && responseText.trim().length > 0) {
@@ -475,7 +492,7 @@ export class AgentWidget {
       parts.push(elapsed);
       const statsText = parts.join(" · ");
 
-      const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
+      const activity = bg ? describeActivity(bg.activeTools, bg.responseText, bg.modelCall) : "thinking…";
 
       runningLines.push([
         truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
