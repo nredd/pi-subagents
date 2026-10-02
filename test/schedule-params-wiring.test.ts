@@ -204,6 +204,18 @@ describe("Agent tool → schedule restrictions", () => {
     }
   });
 
+  it("refuses `schedule` with `cwd` rather than running the job in the session cwd", async () => {
+    // A job has no `cwd` field, so accepting this would quietly retarget the
+    // agent (and any worktree) at the session's repo when it fires.
+    const { reply, jobCount, restore } = await scheduleCall({ cwd: "/" });
+    try {
+      expect(reply).toBe("Cannot combine `schedule` with `cwd` \u2014 scheduled jobs run in the session cwd.");
+      expect(jobCount).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
   it("accepts `run_in_background: true` and an omitted `run_in_background`", async () => {
     // The mirror: only an explicit `false` is refused, so a caller that sets the
     // flag by habit is not blocked.

@@ -73,21 +73,22 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 
 | Error | Source |
 |---|---|
-| `No active session` | spawn handler, `src/cross-extension-rpc.ts` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
-| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | spawn handler, `src/cross-extension-rpc.ts` |
-| `Model not found: "<input>".` + available models | `resolveModel`, `src/model-resolver.ts` |
-| `Model not in scope: "<input>".` + allowed models | `checkModelScope`, `src/model-scope.ts` — only with `scopeModels` on, and checked against the *resolved* model |
-| `Unknown or disabled agent type: "<raw>". Available: <list>.` | `resolveSpawnTypeIn`, `src/agent-types.ts` — only under `fallbackSubagent: none` |
-| `No agent type given. Available: <list>.` | `resolveSpawnTypeIn` — same condition |
-| `<reason> The configured fallbackSubagent "<x>" is itself unknown or disabled. Available: <list>.` | `resolveSpawnTypeIn` |
-| `SpawnOptions.cwd must be an absolute path: "<value>"` | `assertValidSpawnCwd`, `src/agent-manager.ts` |
-| `SpawnOptions.cwd does not exist: "<cwd>"` | `assertValidSpawnCwd` |
-| `SpawnOptions.cwd is not a directory: "<cwd>"` | `assertValidSpawnCwd` |
-| ``Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. Initialize git and commit at least once, or omit `isolation`.`` | `AgentManager.startAgent`, surfaced through `awaitStartup`. Every git failure ends here: `createWorktree` (`src/worktree.ts`) catches git's own error and returns nothing |
-| `Agent not found` | stop handler, `src/cross-extension-rpc.ts` |
-| `Agent is owned by another agent or workflow` | stop handler |
-| `Agent is not running` | stop handler. The record exists, so it has already settled |
-| `Agent not found or still running` | consume handler |
+| `No active session` | `src/cross-extension-rpc.ts:107` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
+| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
+| `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
+| `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
+| `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
+| `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |
+| `<reason> The configured fallbackSubagent "<x>" is itself unknown or disabled. Available: <list>.` | `src/agent-types.ts:205-207` |
+| `SpawnOptions.cwd must be an absolute path: "<value>"` | `src/agent-manager.ts:85` |
+| `SpawnOptions.cwd does not exist: "<cwd>"` | `src/agent-manager.ts:91` |
+| `SpawnOptions.cwd is not a directory: "<cwd>"` | `src/agent-manager.ts:94` |
+| `Cannot run with isolation: "worktree": <cause>. <hint>` | `src/agent-manager.ts:773`, surfaced through `awaitStartup`. `<cause>` names the directory tried and why: not inside a git repository, no commits yet, a git timeout, or `git worktree add`'s stderr |
+| git plumbing failures | `src/worktree.ts:76` |
+| `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
+| `Agent is owned by another agent or workflow` | stop — `:178` |
+| `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
+| `Agent not found or still running` | consume — `:193` |
 
 Three things the table cannot show:
 
