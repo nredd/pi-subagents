@@ -65,6 +65,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { contextToolNames } from "./context-view.js";
 import { fauxModelBackend } from "./faux-model-backend.js";
 import { getModel, registerFauxProvider } from "./pi-ai.js";
 
@@ -210,7 +211,7 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
+    const isParent = contextToolNames(context).includes("Agent");
     if (!isParent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",

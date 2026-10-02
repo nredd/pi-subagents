@@ -119,16 +119,24 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     // changed, a delegating session would look like it was filling its context
     // with work that happened somewhere else entirely — and users would compact
     // for no reason.
+    //
+    // Pi >=1.0 also estimates the tokens of messages that follow the last
+    // assistant turn, so the tool result's own text moves the percentage a
+    // hair. The invariant is that the reported *usage* doesn't: compare against
+    // an identical result with no usage attached, in a second session.
+    const control = await realSession();
     const session = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
+      control.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
+      const expected = control.getSessionStats().contextUsage?.percent ?? null;
 
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
       session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(expected);
     } finally {
+      control.dispose?.();
       session.dispose?.();
     }
   });

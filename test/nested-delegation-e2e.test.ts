@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { encodeCwd } from "../src/output-file.js";
+import { contextToolNames } from "./helpers/context-view.js";
 import {
   agentCall,
   type FauxReply,
@@ -101,7 +102,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
 
     const respond = (context: Context): FauxReply => {
       const text = firstUserText(context);
-      const names = (context.tools ?? []).map((t) => t.name);
+      const names = contextToolNames(context);
 
       // Leaf: no nested tools (it never opted in) — just answer.
       if (text.includes("Do the leaf work")) {
