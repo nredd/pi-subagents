@@ -67,6 +67,50 @@ const DEFAULT_MAX_CONCURRENT = 10;
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 
 /**
+ * How long a finished record stays in memory once its result was consumed
+ * (fetched, or delivered inline to a blocking caller). Nothing is waiting on it
+ * any more; the window only covers a follow-up `get_subagent_result` or steer.
+ */
+const CONSUMED_RECORD_TTL_MS = 10 * 60_000;
+
+/**
+ * How long a finished record nobody has read stays in memory, measured from
+ * completion. Far longer than the consumed window: an orchestrator that was busy
+ * when the notice arrived still gets to fetch the full result an hour later.
+ */
+const UNCONSUMED_RECORD_TTL_MS = 60 * 60_000;
+
+/** How many evicted ids keep an answer to "what happened to that agent". */
+const MAX_EVICTED_NOTES = 500;
+
+/** Mark a record's result as read, which shortens its retention and suppresses its notice. */
+export function markConsumed(record: Pick<AgentRecord, "resultConsumed" | "consumedAt">): void {
+  record.resultConsumed = true;
+  record.consumedAt = Date.now();
+}
+
+/**
+ * What survives a record's eviction, so a later `get_subagent_result` or steer
+ * can say what became of the agent instead of "not found".
+ */
+export interface EvictedNote {
+  id: string;
+  type: SubagentType;
+  description: string;
+  status: AgentRecord["status"];
+  /** Whole minutes between completion and eviction. */
+  evictedAfterMin: number;
+  /** The `.output` transcript when one was written, else the session file. */
+  transcript?: string;
+}
+
+/** The text a tool returns for an id whose record was evicted. */
+export function describeEvicted(note: EvictedNote): string {
+  const where = note.transcript ? `; transcript: ${note.transcript}` : "";
+  return `Agent "${note.id}" (${note.description}) ${note.status}, evicted after ${note.evictedAfterMin} min${where}`;
+}
+
+/**
  * How many evicted agents stay addressable by name. Only a bound on memory —
  * a session that spawns hundreds of agents shouldn't retain every one — and
  * far above the handful anyone keeps in their head.
@@ -392,6 +436,9 @@ export class AgentManager {
    */
   private tombstones = new Map<string, AgentTombstone>();
 
+  /** Evicted records by id, oldest first (insertion order). */
+  private evictedNotes = new Map<string, EvictedNote>();
+
   /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
    * both pools: `drainQueue` picks the earliest entry whose own pool has room,
@@ -628,7 +675,7 @@ export class AgentManager {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
-          if (queuedPool === "foreground") record.resultConsumed = true;
+          if (queuedPool === "foreground") markConsumed(record);
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
           record.completedAt = Date.now();
@@ -966,7 +1013,7 @@ export class AgentManager {
    *   the release disagree with the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
-    if (!record.isBackground) record.resultConsumed = true;
+    if (!record.isBackground) markConsumed(record);
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
 
@@ -1133,6 +1180,7 @@ export class AgentManager {
 
       record.isBackground = true;
       record.resultConsumed = false;
+      record.consumedAt = undefined;
       record.result = undefined;
       record.error = undefined;
       record.completedAt = undefined;
@@ -1428,6 +1476,7 @@ export class AgentManager {
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
+    this.noteEviction(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
@@ -1467,12 +1516,45 @@ export class AgentManager {
     }
   }
 
+  /** Remember that `record` existed, so its id still answers with something better than "not found". */
+  private noteEviction(record: AgentRecord): void {
+    const completedAt = record.completedAt ?? Date.now();
+    this.evictedNotes.delete(record.id);
+    this.evictedNotes.set(record.id, {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      status: record.status,
+      evictedAfterMin: Math.max(0, Math.round((Date.now() - completedAt) / 60_000)),
+      transcript: record.outputFile ?? record.sessionFile,
+    });
+    while (this.evictedNotes.size > MAX_EVICTED_NOTES) {
+      const oldest = this.evictedNotes.keys().next().value;
+      if (oldest === undefined) break;
+      this.evictedNotes.delete(oldest);
+    }
+  }
+
+  /** What became of an evicted agent, by id; undefined for an id this session never evicted. */
+  getEvictedNote(id: string): EvictedNote | undefined {
+    return this.evictedNotes.get(id);
+  }
+
+  /**
+   * Evict finished records past their window: 10 minutes from the moment the
+   * result was consumed, 60 from completion while nobody has read it. A consumed
+   * record with no stamp (set directly, not through `markConsumed`) is aged from
+   * completion.
+   */
   private cleanup() {
-    const cutoff = Date.now() - 10 * 60_000;
+    const now = Date.now();
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
-      if ((record.completedAt ?? 0) >= cutoff) continue;
-      this.removeRecord(id, record);
+      const completedAt = record.completedAt ?? 0;
+      const expired = record.resultConsumed
+        ? now - (record.consumedAt ?? completedAt) >= CONSUMED_RECORD_TTL_MS
+        : now - completedAt >= UNCONSUMED_RECORD_TTL_MS;
+      if (expired) this.removeRecord(id, record);
     }
   }
 
@@ -1480,7 +1562,7 @@ export class AgentManager {
    * Remove all completed/stopped/errored records immediately.
    * Called on session start/switch so tasks from a prior session don't persist.
    * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
-   * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
+   * (resultConsumed=false) — they will be evicted by the cleanup timer instead (60 minutes).
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
@@ -1495,6 +1577,8 @@ export class AgentManager {
     // `@explore` would silently reach an agent the user never started. Claude
     // Code resets its registry on `/clear` for the same reason.
     this.tombstones.clear();
+    // Ids are only meaningful within the session that issued them.
+    this.evictedNotes.clear();
   }
 
   /** Whether any agents are still running or queued. */
