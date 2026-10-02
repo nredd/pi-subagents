@@ -25,7 +25,15 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { type DetachedResult, drainDetached, spoolDetached, watchDetached } from "./detached-results.js";
+import {
+  type DetachedResult,
+  drainDetached,
+  listRunningDetached,
+  registerRunningDetached,
+  spoolDetached,
+  unregisterRunningDetached,
+  watchDetached,
+} from "./detached-results.js";
 import { readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
@@ -554,6 +562,7 @@ export default function (pi: ExtensionAPI) {
     // Orphaned by a session switch: this closure's `pi` is stale, so hand the
     // result to the session it belongs to instead of announcing it here.
     if (detachedSessionFile !== undefined) {
+      unregisterRunningDetached(detachedSessionFile, record.id);
       spoolDetachedResult(detachedSessionFile, record);
       return;
     }
@@ -785,6 +794,8 @@ export default function (pi: ExtensionAPI) {
       unwatchDetached = watchDetached(sessionFile, () => deliverDetached(sessionFile));
       deliverDetached(sessionFile);
     }
+    // Orphans from the previous instance are already registered; show them now.
+    fleet.update();
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1117,6 +1128,17 @@ export default function (pi: ExtensionAPI) {
     if (detaching) {
       // Disposal waits for the survivors; it also releases their sessions.
       detachedSessionFile = sessionFile;
+      // The reloaded instance has an empty manager; publish the survivors so
+      // its fleet list shows them while they run.
+      for (const record of manager.listAgents()) {
+        if (record.status !== "running" || !isTopLevelAgent(record)) continue;
+        registerRunningDetached(sessionFile, {
+          record,
+          activity: agentActivity.get(record.id),
+          abort: () => manager.abort(record.id),
+          steer: (message) => manager.steer(record.id, message),
+        });
+      }
       void manager.waitForAll().then(() => manager.dispose(), () => {});
       return;
     }
@@ -1142,7 +1164,9 @@ export default function (pi: ExtensionAPI) {
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
-    isShowModelEnabled);
+    isShowModelEnabled,
+    // Agents the previous instance of this session left running (/reload, /new, ...).
+    () => listRunningDetached(currentCtx?.sessionManager?.getSessionFile?.()));
   /** What the Agent tool row reads at render time, so its summary stays live. */
   const agentRowLive: AgentRowLive = {
     getRecord: (id) => manager.getRecord(id),

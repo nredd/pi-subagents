@@ -14,6 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import type { RunningDetached } from "../detached-results.js";
 import { describeModelCall } from "../model-call.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
@@ -153,6 +154,12 @@ export class FleetList {
      * `showModel` setting, which until now only the widget honoured.
      */
     private showModel: () => boolean = () => false,
+    /**
+     * Agents still running in an orphaned manager (the instance before a
+     * `/reload`, `/new`, ...). Listed with this session's own and opened,
+     * stopped and steered through the orphan's manager. Omitted -> none.
+     */
+    private detachedSource: () => readonly RunningDetached[] = () => [],
   ) {}
 
   // ---- Lifecycle ----
@@ -279,13 +286,26 @@ export class FleetList {
    */
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
-    return this.manager.listAgents()
+    // Orphans are live objects, so a settled one is simply skipped; the
+    // registry drops it itself. Own records win if an id appears in both.
+    const own = this.manager.listAgents();
+    const ownIds = new Set(own.map(a => a.id));
+    const orphans = this.detachedSource().map(d => d.record).filter(r => !ownIds.has(r.id));
+    return [...own, ...orphans]
       .filter(a => isTopLevelAgent(a) && a.session && (
         a.status === "running" || a.status === "queued"
         || a.id === this.viewingAgentId
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
       ))
       .sort((a, b) => a.startedAt - b.startedAt);
+  }
+
+  private detachedFor(id: string): RunningDetached | undefined {
+    return this.detachedSource().find(d => d.record.id === id);
+  }
+
+  private activityFor(id: string): AgentActivity | undefined {
+    return this.agentActivity.get(id) ?? this.detachedFor(id)?.activity;
   }
 
   /**
@@ -438,7 +458,8 @@ export class FleetList {
       return;
     }
     const session = record.session;
-    const activity = this.agentActivity.get(record.id);
+    const activity = this.activityFor(record.id);
+    const orphan = this.detachedFor(record.id);
     this.viewingAgentId = record.id;
     const overlay = createViewerOverlay();
 
@@ -454,10 +475,10 @@ export class FleetList {
           theme,
           done,
           () => {
-            if (this.manager.abort(record.id)) this.ui?.notify(`Stopped "${record.description}".`, "info");
+            if ((orphan ? orphan.abort() : this.manager.abort(record.id))) this.ui?.notify(`Stopped "${record.description}".`, "info");
           },
           keybindings,
-          (message: string) => this.manager.steer(record.id, message),
+          (message: string) => (orphan ? orphan.steer(message) : this.manager.steer(record.id, message)),
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,
@@ -583,7 +604,7 @@ export class FleetList {
     // What the in-flight model call is doing, only while the agent is running:
     // a finished row has no call to describe.
     const call = record.status === "running"
-      ? describeModelCall(this.agentActivity.get(record.id)?.modelCall, Date.now())
+      ? describeModelCall(this.activityFor(record.id)?.modelCall, Date.now())
       : undefined;
     if (call) parts.push(call);
     parts.push(formatFleetElapsed(elapsedMs), formatFleetTokens(tokens));
