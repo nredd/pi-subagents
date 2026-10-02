@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`steer_subagent` accepts a queued agent.** It refused anything not `running`, so an agent waiting on `maxConcurrent` could not be redirected before its first turn. The steer is now queued on the record, reported as queued, and delivered when the agent starts.
+- **`isolation: "worktree"` can target a repo other than the session cwd.** The worktree was always made from the session's cwd, so a session started outside the target repo (e.g. in `~`) could not isolate an agent there. The `Agent` tool takes a `cwd` (absolute, `~/`, or relative to the session cwd); the worktree comes from the repo containing it, the agent works at the same subdirectory inside the copy, and the branch note names that repo's toplevel. The failure message now names the directory tried and the cause: not a git repo, no commits, a timeout, or `git worktree add`'s stderr. `cwd` cannot be combined with `schedule`, and a quota-blocked spawn with `cwd` fails rather than parking.
+
+### Fixed
 - **`isolation: "worktree"` can target a repo other than the session cwd.** The worktree was always made from the session's cwd, so a session started outside the target repo (e.g. in `~`) could not isolate an agent there. The `Agent` tool takes a `cwd` (absolute, `~/`, or relative to the session cwd); the worktree comes from the repo containing it, the agent works at the same subdirectory inside the copy, and the branch note names that repo's toplevel. The failure message now names the directory tried and the cause: not a git repo, no commits, a timeout, or `git worktree add`'s stderr. `cwd` cannot be combined with `schedule`, and a quota-blocked spawn with `cwd` fails rather than parking.
 
 ### Fixed
