@@ -598,7 +598,7 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 1. At `max_turns` — steering message: *"Wrap up immediately — provide your final answer now."*
 2. Up to 5 grace turns to finish cleanly
 3. Hard abort only after the grace period
-4. Whenever a limit fired and the agent did not end on a finished answer (text, no pending tool call), one more tool-less turn asks for the full final report. The steer is only a request: an agent deep in a tool loop ignores it, and without that turn the result was whatever it narrated before the abort ("Now let me check the tests...")
+4. Whenever a limit fired and the agent did not end on a finished answer (text, no pending tool call), one more tool-less turn asks for the full final report. The steer is only a request: an agent deep in a tool loop ignores it, and without that turn the result was whatever it narrated before the abort ("Now let me check the tests..."). That turn is tool-free even when another extension re-activates its tools from `before_agent_start` (e.g. pi-deferred-context-engine): the loadout is pinned empty for the turn, any call that still gets through is refused, and the turn is stopped if it calls a tool or runs past one turn
 
 | Status | Meaning | Icon |
 |--------|---------|------|

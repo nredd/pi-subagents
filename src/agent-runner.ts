@@ -646,20 +646,38 @@ function endedWithReport(session: AgentSession, startIndex = 0): boolean {
   return false;
 }
 
+/** The reason a tool call gets during the forced report turn. */
+const FINAL_REPORT_TOOL_BLOCKED = "No tools are available for the final report. Write the report as text now.";
+
 /**
  * Prompt the session once more with its tools switched off and ask for the full
  * report. Returns whether that produced assistant text. Never throws: the run
  * keeps whatever it had if the extra turn fails.
+ *
+ * Clearing the active set alone is not enough: `prompt()` fires
+ * `before_agent_start`, and an extension may re-activate its tools there
+ * (pi-deferred-context-engine re-pins its always-active spine), after which the
+ * turn's tools are snapshotted. So for this turn the loadout is pinned empty by
+ * shadowing `setActiveToolsByName` (the path `pi.setActiveTools` takes), and any
+ * call that still gets through (a tool activated by a registry refresh) is
+ * blocked with `terminate`, which ends the loop after that batch. The caller's
+ * turn hook is the hard stop behind both.
  */
 async function forceFinalReport(session: AgentSession, startIndex: number): Promise<boolean> {
   const previousTools = session.getActiveToolNames();
+  const setActiveTools = session.setActiveToolsByName;
+  const priorBeforeToolCall = session.agent.beforeToolCall;
   try {
     await session.waitForIdle?.();
-    session.setActiveToolsByName([]);
+    setActiveTools.call(session, []);
+    session.setActiveToolsByName = () => setActiveTools.call(session, []);
+    session.agent.beforeToolCall = async () => ({ block: true, terminate: true, reason: FINAL_REPORT_TOOL_BLOCKED });
     await session.prompt(FINAL_REPORT_PROMPT);
   } catch {
     return false;
   } finally {
+    session.setActiveToolsByName = setActiveTools;
+    session.agent.beforeToolCall = priorBeforeToolCall;
     session.setActiveToolsByName(previousTools);
   }
   return endedWithReport(session, startIndex);
@@ -1161,15 +1179,25 @@ export async function runAgent(
   let softLimitReached = false;
   let aborted = false;
   // True while the forced final-report turn runs: it is the grace window's
-  // epilogue, so it must neither re-steer nor re-abort itself.
+  // epilogue, so it must neither re-steer nor re-abort itself by the normal cap.
   let finalizing = false;
+  let finalizingTurns = 0;
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
-      if (maxTurns != null && !finalizing) {
+      if (finalizing) {
+        // Hard stop for the report turn: it gets exactly one turn, and a turn
+        // that still called a tool is over. Without this the cap is off here,
+        // and a model offered tools anyway would loop unbounded.
+        finalizingTurns++;
+        if (finalizingTurns > 1 || (event.toolResults?.length ?? 0) > 0) {
+          aborted = true;
+          session.abort();
+        }
+      } else if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");

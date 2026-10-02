@@ -2770,6 +2770,73 @@ describe("agent-runner turn limits", () => {
       expect(session.prompt).toHaveBeenCalledTimes(1);
     });
 
+    /** A run that hits the cap, then plays `reportTurn` as the forced report prompt. */
+    async function runWithReportTurn(reportTurn: (session: any, listeners: any[]) => void) {
+      setGraceTurns(1);
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+      const { session, listeners } = createSession("unused");
+      let calls = 0;
+      session.prompt.mockImplementation(async () => {
+        if (++calls === 2) return reportTurn(session, listeners);
+        // Three turns: steer at 2, one grace-window abort at 3.
+        for (let i = 0; i < 3; i++) {
+          session.messages.push({ role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: TEASER }, { type: "toolCall", name: "read" }] });
+          for (const l of [...listeners]) l({ type: "turn_end" });
+        }
+      });
+      createAgentSession.mockResolvedValue({ session });
+      const result = await runAgent(ctx, "Explore", "go", { pi, maxTurns: 2 });
+      return { session, result, calls: () => calls };
+    }
+
+    it("keeps the report turn tool-free when another extension re-activates tools inside prompt()", async () => {
+      // pi-deferred-context-engine re-pins its spine from before_agent_start,
+      // which fires inside prompt() after our clear and before the snapshot.
+      let offered: string[] = [];
+      let verdict: any;
+      const { session, result } = await runWithReportTurn(async (session, listeners) => {
+        session.setActiveToolsByName(["search_tools", "read", "bash"]);
+        offered = [...session.getActiveToolNames()];
+        verdict = await session.agent.beforeToolCall?.({ toolCall: { name: "search_tools" } });
+        for (const l of [...listeners]) l({ type: "turn_end", toolResults: [] });
+        session.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: REPORT }] });
+      });
+      expect(offered).toEqual([]);
+      // A call that slips through anyway is refused and ends the loop.
+      expect(verdict).toMatchObject({ block: true, terminate: true });
+      expect(result.responseText).toBe(REPORT);
+      expect(result.aborted).toBe(false);
+      // Both shadows are undone: the loadout and the scope hook come back.
+      expect(session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
+      session.setActiveToolsByName(["read"]);
+      expect(session.getActiveToolNames()).toEqual(["read"]);
+      expect(session.agent.beforeToolCall).toBeUndefined();
+    });
+
+    it("hard-stops a report turn that still calls a tool", async () => {
+      // The cap is off during the report turn, so without its own stop a model
+      // offered tools anyway (the 66-call loop) would never end.
+      const { session, result } = await runWithReportTurn((session, listeners) => {
+        session.messages.push({ role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: TEASER }, { type: "toolCall", name: "bash" }] });
+        for (const l of [...listeners]) l({ type: "turn_end", toolResults: [{ role: "toolResult" }] });
+      });
+      // Once for the grace window, once for the report turn.
+      expect(session.abort).toHaveBeenCalledTimes(2);
+      expect(result.aborted).toBe(true);
+    });
+
+    it("hard-stops a report turn that runs past one turn", async () => {
+      let abortsAfterFirst = -1;
+      const { session } = await runWithReportTurn((session, listeners) => {
+        for (const l of [...listeners]) l({ type: "turn_end", toolResults: [] });
+        abortsAfterFirst = session.abort.mock.calls.length;
+        for (const l of [...listeners]) l({ type: "turn_end", toolResults: [] });
+      });
+      // A clean first report turn is left alone; the second is stopped.
+      expect(abortsAfterFirst).toBe(1);
+      expect(session.abort).toHaveBeenCalledTimes(2);
+    });
+
     it("keeps the hard abort when the report turn itself fails", async () => {
       setGraceTurns(1);
       vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
