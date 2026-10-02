@@ -12,11 +12,13 @@ import {
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
+  defineTool,
   type ExtensionAPI,
   getAgentDir,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -51,6 +53,27 @@ export const SUBAGENT_TOOL_NAMES = {
  * because that module imports this one.
  */
 const BLOCKED_IN_SUBAGENT: ReadonlySet<string> = new Set([SUBAGENT_TOOL_NAMES.WORKFLOW, "Workflow", "workflow"]);
+
+/**
+ * Stand-in for our own `SubagentWorkflow` in a child session, where the real
+ * tool is excluded. Without it a call never reaches `beforeToolCall` (core
+ * answers "Tool SubagentWorkflow not found" first), so the model gets no reason
+ * and retries; a foreign `workflow` tool is loaded in the child and does get
+ * one. The scope hook blocks the call with `NESTED_WORKFLOW_ERROR`; the throw
+ * covers a session without that hook.
+ */
+function createWorkflowRefusalTool() {
+  return defineTool({
+    name: SUBAGENT_TOOL_NAMES.WORKFLOW,
+    label: "SubagentWorkflow",
+    description: "Not available inside a subagent; calling it explains why.",
+    // Open object: whatever arguments the model sends, the refusal is the answer.
+    parameters: Type.Object({}),
+    execute: async () => {
+      throw new Error(NESTED_WORKFLOW_ERROR);
+    },
+  });
+}
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
@@ -964,9 +987,15 @@ export async function runAgent(
   // agent's own frontmatter can take back, while StructuredOutput exists only
   // because this call asked for a schema — removing it would make the request
   // unsatisfiable by construction rather than merely restricted.
+  // Only where extensions load, which is also where a foreign `workflow` tool
+  // would be visible and refused; an isolated child gets no workflow tool at all.
+  const refusalTools = !noExtensions && !disallowedSet?.has(SUBAGENT_TOOL_NAMES.WORKFLOW)
+    ? [createWorkflowRefusalTool()]
+    : [];
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
+    ...refusalTools.map(tool => tool.name),
   ]);
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
@@ -1018,7 +1047,7 @@ export async function runAgent(
     // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
     // those are injected as customTools and must survive the registry gate.
     const denyTools = new Set<string>(
-      EXCLUDED_TOOL_NAMES.filter((t) => !nestedToolNames.has(t)),
+      EXCLUDED_TOOL_NAMES.filter((t) => !nestedToolNames.has(t) && !readmitToolNames.has(t)),
     );
     // Keep only the built-ins the agent asked for — deny the rest.
     for (const name of BUILTIN_TOOL_NAMES) {
@@ -1077,7 +1106,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools],
+    customTools: [...nestedTools, ...structuredTools, ...refusalTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
