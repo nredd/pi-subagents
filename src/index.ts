@@ -2826,11 +2826,11 @@ Terse command-style prompts produce shallow, generic work.
     label: "Steer Agent",
     description:
       "Send a steering message to a running agent. The message will interrupt the agent after its current tool execution " +
-      "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents.",
+      "and be injected into its conversation, allowing you to redirect its work mid-run. A queued agent gets the message when it starts.",
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to steer (must be currently running). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+        description: "The agent ID to steer (must be running or queued). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       message: Type.String({
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
@@ -2839,15 +2839,19 @@ Terse command-style prompts produce shallow, generic work.
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) return textResult(agentNotFound(params.agent_id));
-      if (record.status !== "running") {
-        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a finished agent.`);
       }
       if (!record.session) {
-        // Session not ready yet — queue the steer for delivery once initialized
+        // Queued for a concurrency slot, or running with its session still
+        // being built: either way the manager flushes `pendingSteers` into the
+        // session the moment it exists, ahead of the first turn.
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
         pi.events.emit("subagents:steered", { id: record.id, message: params.message });
-        return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
+        return textResult(record.status === "queued"
+          ? `Steering message queued for agent ${record.id} (status: queued). It will be delivered when the agent starts.`
+          : `Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
       }
 
       try {
