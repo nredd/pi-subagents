@@ -33,6 +33,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
+import { applyModelCallEvent, type ModelCallEvent } from "./model-call.js";
 import { describeModel, type ModelRegistry, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -45,26 +46,25 @@ import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitCh
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
+import { AgentCallView, AgentResultView, type AgentRowLive, keepRowTicking } from "./ui/agent-row.js";
 import {
   type AgentActivity,
   type AgentDetails,
   AgentWidget,
   buildInvocationTags,
   describeActivity,
-  fgPreservingNestedStyles,
   formatCost,
   formatDuration,
   formatMs,
   formatTokens,
-  formatTurns,
   getDisplayName,
   getPromptModeLabel,
   SPINNER,
-  type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
 import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { renderNotification } from "./ui/notification-view.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
@@ -145,6 +145,10 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       state.turnCount = turnCount;
       onStreamUpdate?.();
     },
+    onModelCall: (event: ModelCallEvent) => {
+      state.modelCall = applyModelCallEvent(state.modelCall, event, Date.now());
+      onStreamUpdate?.();
+    },
     onSessionCreated: (session: any) => {
       state.session = session;
     },
@@ -213,7 +217,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; outputFile?: string; lifetimeUsage: LifetimeUsage },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -231,6 +235,7 @@ function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    outputFile: record.outputFile,
     ...overrides,
   };
 }
@@ -312,6 +317,9 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
  */
 export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
 
+/** Statuses the Agent row has a rendering for. */
+const AGENT_ROW_STATUSES = new Set(["running", "background", "completed", "steered", "aborted", "stopped", "error"]);
+
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
@@ -319,67 +327,14 @@ export default function (pi: ExtensionAPI) {
   if (inChildSessionContext()) return;
 
   // ---- Register custom notification renderer ----
+  // Core collapses a custom message to this renderer's first line and draws the
+  // ▸/▾ gutter itself; see ui/notification-view.ts.
   pi.registerMessageRenderer<NotificationDetails>(
     "subagent-notification",
     (message, { expanded }, theme) => {
       const d = message.details;
       if (!d) return undefined;
-
-      function renderOne(d: NotificationDetails): string {
-        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
-        const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-        const statusText = isError ? d.status
-          : d.status === "steered" ? "completed (steered)"
-          : "completed";
-
-        // Line 1: icon + agent description + status
-        let line = `${icon} ${theme.bold(d.description)} ${theme.fg("dim", statusText)}`;
-
-        // Line 2: stats
-        const parts: string[] = [];
-        if (d.turnCount > 0) parts.push(formatTurns(d.turnCount, d.maxTurns));
-        if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
-        if (d.totalTokens > 0) parts.push(formatTokens(d.totalTokens));
-        if (showCost) {
-          const costText = formatCost(d.totalCost ?? 0);
-          if (costText) parts.push(costText);
-        }
-        if (d.durationMs > 0) parts.push(formatMs(d.durationMs));
-        if (parts.length) {
-          line += "\n  " + parts.map(p => theme.fg("dim", p)).join(" " + theme.fg("dim", "·") + " ");
-        }
-
-        // Line 3: result preview (collapsed) or full (expanded)
-        if (expanded) {
-          const lines = d.resultPreview.split("\n").slice(0, 30);
-          for (const l of lines) line += "\n" + theme.fg("dim", `  ${l}`);
-        } else {
-          const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
-          line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
-        }
-
-        // Line 4: output file link (if present)
-        if (d.outputFile) {
-          line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
-        }
-
-        return line;
-      }
-
-      const all = [d, ...(d.others ?? [])];
-      const rendered = all.map(renderOne);
-      // A group of agents lands as one notification, and the number a user wants
-      // from it is what the batch cost — not four figures to add up by hand.
-      // Derived from the per-agent details rather than carried alongside them:
-      // one source, so the total can never disagree with the rows above it.
-      if (showCost && all.length > 1) {
-        const total = formatCost(all.reduce((sum, a) => sum + (a.totalCost ?? 0), 0));
-        if (total) {
-          const tokens = all.reduce((sum, a) => sum + a.totalTokens, 0);
-          rendered.unshift(theme.fg("dim", `${all.length} agents · ${formatTokens(tokens)} · ${total}`));
-        }
-      }
-      return new Text(rendered.join("\n"), 0, 0);
+      return renderNotification(d, expanded, theme, showCost);
     }
   );
 
@@ -450,7 +405,7 @@ export default function (pi: ExtensionAPI) {
   /** Name the model and thinking level on the widget's running rows. */
   let showModel = false;
   function isShowModelEnabled(): boolean { return showModel; }
-  function setShowModel(b: boolean): void { showModel = b; widget.update(); }
+  function setShowModel(b: boolean): void { showModel = b; widget.update(); fleet.update(); }
   /**
    * How much of the conversation viewer renders as Markdown. Read through a
    * getter by the viewer rather than captured like `showCost`, because the
@@ -1325,7 +1280,13 @@ export default function (pi: ExtensionAPI) {
   // one opened from `/agents`: same settings on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
-    getFullscreenScrollbar, backgroundActionFor);
+    getFullscreenScrollbar, backgroundActionFor, isShowModelEnabled);
+  /** What the Agent tool row reads at render time, so its summary stays live. */
+  const agentRowLive: AgentRowLive = {
+    getRecord: (id) => manager.getRecord(id),
+    getActivity: (id) => agentActivity.get(id),
+    showCost: isShowCostEnabled,
+  };
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1862,10 +1823,16 @@ Terse command-style prompts produce shallow, generic work.
         restoreBackground: rowBackground,
         bold: true,
       });
-      return new Text(rowBackground + "▸ " + name + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
+      // No ▸ here: core draws the disclosure marker on a settled tool row and
+      // folds the collapsed row to `<this line> · <first result line>`.
+      return new AgentCallView(
+        rowBackground + name + (desc ? "  " + theme.fg("muted", desc) : ""),
+        context.expanded ? args.prompt : undefined,
+        theme,
+      );
     },
 
-    renderResult(result, { expanded, isPartial }, theme, renderContext) {
+    renderResult(result, { expanded }, theme, renderContext) {
       const details = result.details as AgentDetails | undefined;
       const text = result.content[0]?.type === "text" ? result.content[0].text : "";
       // Pi reports pre-execution failures (extension block, abort, argument
@@ -1874,94 +1841,12 @@ Terse command-style prompts produce shallow, generic work.
       if (renderContext.isError || !details?.status) {
         return new Text(text, 0, 0);
       }
+      // Anything else ("queued", or a status added later) has no rendering of
+      // its own — raw text beats guessing at one.
+      if (!AGENT_ROW_STATUSES.has(details.status)) return new Text(text, 0, 0);
 
-      // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
-      const stats = (d: AgentDetails) => {
-        const parts: string[] = [];
-        if (d.modelName) parts.push(d.modelName);
-        if (d.tags) parts.push(...d.tags);
-        if (d.turnCount != null && d.turnCount > 0) {
-          parts.push(formatTurns(d.turnCount, d.maxTurns));
-        }
-        if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
-        if (d.tokens) parts.push(d.tokens);
-        if (showCost) {
-          const costText = formatCost(d.cost ?? 0);
-          if (costText) parts.push(costText);
-        }
-        return parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
-      };
-
-      // ---- While running (streaming) ----
-      if (isPartial || details.status === "running") {
-        const frame = SPINNER[details.spinnerFrame ?? 0];
-        const s = stats(details);
-        const status = renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
-        // Claude Code's hint, after the same 2s: a call that finishes quickly
-        // never flashes it.
-        if (details.backgroundHint && details.durationMs >= BACKGROUND_HINT_DELAY_MS) {
-          status.addChild(new Text(theme.fg("dim", "     (ctrl+b to run in background)"), 0, 0));
-        }
-        return status;
-      }
-
-      // ---- Background agent launched ----
-      if (details.status === "background") {
-        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
-      }
-
-      // ---- Completed / Steered ----
-      if (details.status === "completed" || details.status === "steered") {
-        const duration = formatMs(details.durationMs);
-        const isSteered = details.status === "steered";
-        const icon = isSteered ? theme.fg("warning", "✓") : theme.fg("success", "✓");
-        const s = stats(details);
-        let line = icon + (s ? " " + s : "");
-        line += " " + theme.fg("dim", "·") + " " + theme.fg("dim", duration);
-
-        if (expanded) {
-          const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
-          if (resultText) {
-            const lines = resultText.split("\n").slice(0, 50);
-            for (const l of lines) {
-              line += "\n" + theme.fg("dim", `  ${l}`);
-            }
-            if (resultText.split("\n").length > 50) {
-              line += "\n" + theme.fg("muted", "  ... (use get_subagent_result with verbose for full output)");
-            }
-          }
-        } else {
-          const doneText = isSteered ? "Wrapped up (turn limit)" : "Done";
-          line += "\n" + theme.fg("dim", `  ⎿  ${doneText}`);
-        }
-        return new Text(line, 0, 0);
-      }
-
-      // ---- Stopped (user-initiated abort) ----
-      if (details.status === "stopped") {
-        const s = stats(details);
-        let line = theme.fg("dim", "■") + (s ? " " + s : "");
-        line += "\n" + theme.fg("dim", "  ⎿  Stopped");
-        return new Text(line, 0, 0);
-      }
-
-      // Anything left ("queued", or a status added later) has no rendering of
-      // its own — the turn-limit wording below must not be the catch-all.
-      if (details.status !== "error" && details.status !== "aborted") {
-        return new Text(text, 0, 0);
-      }
-
-      // ---- Error / Aborted (hard max_turns) ----
-      const s = stats(details);
-      let line = theme.fg("error", "✗") + (s ? " " + s : "");
-
-      if (details.status === "error") {
-        line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
-      } else {
-        line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
-      }
-
-      return new Text(line, 0, 0);
+      keepRowTicking(renderContext, details, agentRowLive);
+      return new AgentResultView(details, text, expanded, agentRowLive, theme);
     },
 
     // ---- Execute ----
@@ -2381,7 +2266,7 @@ Terse command-style prompts produce shallow, generic work.
           // started and may not for minutes.
           status: "running",
           activity: queuedAhead === undefined
-            ? describeActivity(fgState.activeTools, fgState.responseText)
+            ? describeActivity(fgState.activeTools, fgState.responseText, fgState.modelCall)
             : `queued — waiting for a foreground slot${queuedAhead > 0 ? ` (${queuedAhead} ahead)` : ""}`,
           spinnerFrame: spinnerFrame % SPINNER.length,
           // One hint per batch, as in Claude Code: on the earliest call still
@@ -2714,9 +2599,10 @@ Terse command-style prompts produce shallow, generic work.
       ),
     }),
 
+    // No ▸: core draws the disclosure marker on a settled tool row.
     renderCall(args, theme) {
       return new Text(
-        `${theme.fg("toolTitle", "▸ ")}${theme.bold(theme.fg("toolTitle", "SubagentWorkflow"))}  ${theme.fg("muted", workflowCallName(args))}`,
+        `${theme.bold(theme.fg("toolTitle", "SubagentWorkflow"))}  ${theme.fg("muted", workflowCallName(args))}`,
         0,
         0,
       );

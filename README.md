@@ -150,6 +150,17 @@ The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
 - **`⇊N`** — number of times the session has compacted, when > 0. Stays dim; the percent's color carries urgency.
 
+### The `Agent` tool row
+
+pi 1.0 folds every collapsed tool row to `<first line of the call> · <first line of the result>` and draws the `▸`/`▾` marker itself, so the `Agent` row's call and result each put what matters on their first line and draw no marker:
+
+```
+Plan  design the cache · ⠹ thinking · 2m41s · 12s · 3.2k token      collapsed, running
+Plan  design the cache · ✓ done · 41s · 33.8k token                 collapsed, finished
+```
+
+The status, elapsed time and tokens are read from the agent record on every render (and the host is asked to repaint once a second while it runs), so the row keeps moving after a background launch instead of freezing on `Running in background`. Expanded, the row shows the prompt, the model and thinking tags (`↳ opus 4.6 · thinking: high`), the transcript link, then the result.
+
 ### FleetView
 
 While subagents are running, a Claude Code-style navigable list renders **below** the editor:
@@ -165,6 +176,8 @@ While subagents are running, a Claude Code-style navigable list renders **below*
 ```
 
 Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet list, the above-editor widget, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. The agents are ordered earliest-launched first, and only agents you can actually open are shown (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. On a running foreground `Agent` call, press `b` to hand that run to the background; the hint only shows where the handoff is available. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+
+With [`showModel`](#persistent-settings) on, each row names its model and thinking level. Running rows also show live model activity.
 
 ### Fullscreen conversation observer
 
@@ -182,6 +195,22 @@ In pi's `/settings → TUI mode → fullscreen`, the observer supports:
 Observer mouse events are consumed, including at scroll limits, so they do not scroll, select, or click the main view underneath. Closing restores focus without editing the main prompt. The main conversation can still advance as its agent runs.
 
 This is an initial implementation. Mouse text selection, copy-on-select, link activation, and switching agents without leaving the observer are not implemented. pi's global shortcuts remain host-owned: its fullscreen search searches the main transcript, not the observer. The scrollbar, jump indicator, and mouse controls apply only to fullscreen mode; regular mode retains the original viewer.
+
+### Live activity
+
+While a model call is in flight, the widget, the fleet row and the conversation viewer say what it is doing instead of `thinking…` for as long as it takes:
+
+| Shown | Meaning |
+|---|---|
+| `thinking · 2m41s` | the call has been thinking (no text yet) for 2m41s |
+| `writing · 3.2k tok` | it is writing text or tool-call arguments; the figure is an estimate (characters / 4) until the provider reports usage |
+| `stalled? · 2m41s` | no stream event of any kind for 2 minutes (the time is the silence, not the call) |
+
+Tools running take precedence (`reading…`, `running command…`). Activity is tracked for spawns made through the `Agent` tool, RPC and mentions; a resumed run shows `thinking…` until it finishes.
+
+### Conversation viewer input
+
+In pi 1.0 fullscreen the viewer takes the mouse. The **wheel** scrolls by pi's own `fullscreenWheelScrollLines` setting (Alt = 5x): pi resolves both into the event's `wheelDelta`, so the viewer follows the setting without reading any file. A **click outside the box closes it**: in fullscreen the overlay is the whole terminal and the box is drawn centred on a blank backdrop, because pi only delivers a click to the overlay under the pointer. Outside fullscreen it is the same 90% centred box as before and the mouse is not involved. The viewer also streams the reply being written, before it lands in the transcript, and repaints once a second while the agent runs so the activity timers count. The footer reads `wheel/↑↓ scroll · PgUp/PgDn/Shift+↑↓ · Esc close`.
 
 ### Agent mentions
 
@@ -268,16 +297,14 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
+By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications collapse to one line, with pi 1.0 drawing the `▸`/`▾` marker and toggling on click (the renderers draw none of their own):
 
 ```
-✓ Find auth files completed
-  ↻3 · 3 tool uses · 12.4k token · 4.1s
-  ⎿  Found 5 files related to authentication...
-  transcript: /tmp/pi-subagents-501/home-user-project/sess-1/tasks/agent-abc123.output
+✓ Find auth files · 3 tools · 12.4k token · ~$0.0042 · 4.1s          collapsed
+3 agents finished · ✓ a, ✓ b, ✗ c                                   collapsed, grouped
 ```
 
-Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+Expanded, a notice adds `↻3 · 3 tools · 12.4k token · 4.1s`, the result preview, and the transcript as an OSC 8 hyperlink labelled `transcript ↗` (the path follows it as plain text). A group expands to one block per agent, plus a total when `showCost` is on. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
 
 ## Default Agent Types
 
@@ -777,7 +804,7 @@ The `~` marks it as pi's estimate rather than a billed figure. **A cost is shown
 
 Independent of `reportUsage`: this one is what you read, that one is what your session counts. Toggle via `/agents → Settings → Show cost`; applied live.
 
-**Show model** (`showModel`, default `false`): whether the widget's running rows name the model driving each agent and the thinking level it is running at:
+**Show model** (`showModel`, default `false`): whether the widget's running rows and the [FleetView](#fleetview) rows name the model driving each agent and the thinking level it is running at. Toggling it refreshes both:
 
 ```text
 ├─ ⠹ Explore  inspect code · sonnet 4.6 · thinking: high · ↻3 · 8.2k token · 4.1s
@@ -1078,6 +1105,7 @@ src/
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
+  model-call.ts       # In-flight model call tracking: thinking / writing / stalled?
   completion-outbox.ts # Deliver completion notifications at the parent's next boundary, coalesced
   group-join.ts       # `group` join mode: one notification per turn's batch, with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
@@ -1116,6 +1144,8 @@ src/
     tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
     agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming
+    agent-row.ts          # The Agent tool row: live one-line summary, expanded prompt/tags/transcript
+    notification-view.ts  # Completion notice renderer: one-line collapsed, stats/preview/link expanded
     fleet-list.ts         # FleetView: navigable agent list below the editor
     conversation-viewer.ts # Live conversation overlay for viewing agent sessions
     viewer-keys.ts        # Viewer scroll keys resolved through user keybindings
