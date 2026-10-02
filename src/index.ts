@@ -34,6 +34,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
+import { NotificationOutbox } from "./notification-outbox.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { checkAdmission, describeBlock, mayPark, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -454,83 +455,66 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  // ---- Notification outbox ----
+  // Completion notices queue here and go out as ONE message: straight away while
+  // the parent is idle, otherwise on `agent_end`. Core delivers one followUp per
+  // turn while the parent is busy, so sending as agents finished made notices
+  // arrive late and one by one, and after the parent had often fetched the
+  // result itself. Anything read in the meantime is dropped at delivery.
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
+  // A queued result wait must observe completion before its notice can go out,
+  // so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  const outbox = new NotificationOutbox({
+    holdMs: NUDGE_HOLD_MS,
+    isIdle: () => {
+      try {
+        return currentCtx?.isIdle() ?? true;
+      } catch {
+        // A context from a session that has since been replaced throws on access.
+        return true;
+      }
+    },
+    deliver: (message) => {
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: message.content,
+        display: true,
+        details: message.details,
+      }, { deliverAs: "followUp", triggerTurn: true });
+    },
+  });
+  pi.on("agent_end", () => outbox.flush(true));
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
-  }
-
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer,
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+  /** Queue the notice for a finished agent. Details are captured now: the activity tracker is dropped on finish. */
+  function queueAgentNotice(record: AgentRecord): void {
+    const activity = agentActivity.get(record.id);
+    outbox.enqueue({
+      id: record.id,
+      consumed: () => record.resultConsumed === true,
+      text: (max) => formatTaskNotification(record, max, showCost),
+      details: (max) => buildNotificationDetails(record, max, activity),
+      footer: record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : "",
+    });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
+    queueAgentNotice(record);
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
-    (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
-
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+    (records) => {
+      for (const r of records) {
+        queueAgentNotice(r);
+        agentActivity.delete(r.id);
+        widget.markFinished(r.id);
+        fleet.onAgentFinished(r.id);
+      }
       widget.update();
     },
     30_000,
@@ -881,7 +865,7 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             markConsumed(record);
-            cancelNudge(record.id);
+            outbox.drop(record.id);
             return true;
           },
         },
@@ -1185,8 +1169,7 @@ export default function (pi: ExtensionAPI) {
     workflowTasks.clear();
     const detaching = event?.reason !== "quit" && sessionFile !== undefined && manager.detach() > 0;
     if (!detaching) manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    outbox.clear();
     fleet.dispose();
     if (detaching) {
       // Disposal waits for the survivors; it also releases their sessions.
@@ -2476,31 +2459,30 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
+   * agent uses — queued in the notification outbox, delivered as a follow-up that
    * triggers a turn, rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: formatWorkflowNotification(task),
-        display: true,
-        details: {
-          id: task.id,
-          description: `Workflow ${task.workflowName ?? task.id}`,
-          status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
-          toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "↻0" would be noise.
-          turnCount: 0,
-          totalTokens: task.totalTokens,
-          durationMs: elapsedMs(task, Date.now()),
-          error: task.error,
-          resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
-        },
-      }, { deliverAs: "followUp", triggerTurn: true });
+    const details = (max: number): NotificationDetails => ({
+      id: task.id,
+      description: `Workflow ${task.workflowName ?? task.id}`,
+      status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
+      toolUses: task.totalToolCalls,
+      // A workflow has agents, not turns; rendering "↻0" would be noise.
+      turnCount: 0,
+      totalTokens: task.totalTokens,
+      durationMs: elapsedMs(task, Date.now()),
+      error: task.error,
+      resultPreview: result.length > max ? `${result.slice(0, max)}…` : result,
+    });
+    outbox.enqueue({
+      id: task.id,
+      consumed: () => false,
+      text: () => formatWorkflowNotification(task),
+      details,
     });
   }
 
@@ -2907,7 +2889,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         markConsumed(record);
-        cancelNudge(params.agent_id);
+        outbox.drop(record.id);
       }
 
       // Verbose: include full conversation

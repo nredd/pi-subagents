@@ -605,6 +605,8 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 
+**Delivery (the outbox).** Whatever the join mode, a completion notice is queued rather than sent: core delivers one follow-up per turn while the parent is busy, so sending as agents finished made notices arrive late, one by one, and after the parent had often fetched the result itself. Pending notices go out as **one** message (a lone notice keeps its own format; several are merged the way a group is), straight away while the parent is idle (after a 200ms window to catch simultaneous finishes) or, if it is busy, on `agent_end`. A result fetched with `get_subagent_result` (or consumed over RPC) before then is dropped from the queue, so it never produces a duplicate notice. The "partial" wording of a timed-out group is no longer carried into the message.
+
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
 
@@ -1002,7 +1004,9 @@ src/
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
+  notification-outbox.ts # Queues completion notices; one coalesced message when idle or on agent_end
   group-join.ts       # Group join manager: batched completion notifications with timeout
+  notification-outbox.ts # Completion notice queue: one coalesced message when idle or on agent_end
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
 
