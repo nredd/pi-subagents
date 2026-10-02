@@ -517,7 +517,7 @@ Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. Th
 
 ### `steer_subagent`
 
-Send a steering message to a running agent. The message interrupts after the current tool execution.
+Send a steering message to a running agent. The message interrupts after the current tool execution. A queued agent (waiting on `maxConcurrent`) accepts it too: the result says it was queued, and it is delivered into the agent's first turn when it starts.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
