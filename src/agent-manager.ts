@@ -19,15 +19,30 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { type AssistantMessageInfo, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
 import { assignHandle, handleBase } from "./mention.js";
 import type { ModelCallEvent } from "./model-call.js";
-import { describeModel } from "./model-resolver.js";
+import { describeModel, describePhysicalModel, describeVirtualModel, isVirtualModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, Pool, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeInfo } from "./worktree.js";
+
+/**
+ * Relabel a record's model from the response that just finished. A virtual
+ * selection (`router/default`) is only a name until a request is routed; the
+ * assistant message is the one place that records the physical model, so the
+ * label follows it (and follows a router fallback to the next model).
+ */
+function relabelFromResponse(record: AgentRecord, message: AssistantMessageInfo | undefined): void {
+  const registry = (record.session as { modelRegistry?: Parameters<typeof describePhysicalModel>[1] } | undefined)
+    ?.modelRegistry;
+  const physical = describePhysicalModel(message, registry);
+  if (!physical) return;
+  record.invocation ??= {};
+  Object.assign(record.invocation, physical);
+}
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -893,7 +908,8 @@ export class AgentManager {
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
       onModelCall: options.onModelCall,
-      onAssistantUsage: (usage) => {
+      onAssistantUsage: (usage, message) => {
+        relabelFromResponse(record, message);
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
@@ -930,7 +946,10 @@ export class AgentManager {
           // Read the kept request first: a caller's level survives being clamped
           // AND, one line later, being replaced by the effective one.
           const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
-          Object.assign(record.invocation, describeModel(session.model));
+          Object.assign(
+            record.invocation,
+            isVirtualModel(session.model) ? describeVirtualModel(session.model) : describeModel(session.model),
+          );
           // Guarded for the reason above: a session that reports no level keeps
           // the request rather than losing it. Overwriting unconditionally would
           // turn an older or stubbed session into a blank `thinking:` tag, which
@@ -1330,7 +1349,8 @@ export class AgentManager {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
         },
-        onAssistantUsage: (usage) => {
+        onAssistantUsage: (usage, message) => {
+          relabelFromResponse(record, message);
           addUsage(record.lifetimeUsage, usage);
           this.onUsage?.(record, usage);
           options?.onAssistantUsage?.(usage);
@@ -1421,7 +1441,8 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onAssistantUsage: (usage) => {
+      onAssistantUsage: (usage, message) => {
+        relabelFromResponse(record, message);
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
