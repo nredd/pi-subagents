@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Router-backed agents show the physical model.** With `agentModels["*"] = "router/default"` a row read `router default · thinking: medium`. The label now says `router default (routing)` until the first response, then follows the model that answered (and a router fallback), in the widget, FleetView, the `Agent` result row and the conversation viewer. The thinking level is the session's selected level; a router chain entry's own `thinking` override is not recorded on messages and can differ.
+
 ### Added
 - **Live model-call activity.** The widget, the fleet row and the conversation viewer show `thinking · 2m41s` / `writing · 3.2k tok` while a model call is in flight, and `stalled? · 2m41s` after two minutes with no stream event. The viewer streams the reply being written and repaints once a second.
 - **Mouse in the conversation viewer (pi 1.0 fullscreen).** The wheel scrolls by the host's `wheelDelta` (so `fullscreenWheelScrollLines` and Alt = 5x apply), and a click outside the box closes it; in fullscreen the overlay covers the terminal and the box is drawn centred on a backdrop so the click can reach it. The footer hint reads `wheel/↑↓ scroll`.

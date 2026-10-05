@@ -40,7 +40,7 @@ import { cwdParam, isolationParam, resolveAgentInvocationConfig, resolveCwdParam
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { applyModelCallEvent, type ModelCallEvent } from "./model-call.js";
-import { describeModel, type ModelRegistry, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "./model-resolver.js";
+import { describeModel, describeVirtualModel, isVirtualModel, type ModelRegistry, resolveModel, setAgentModels, setModelAliases, setModelScopeProvider } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { NotificationOutbox } from "./notification-outbox.js";
@@ -1828,7 +1828,9 @@ Terse command-style prompts produce shallow, generic work.
       // parent's model used to show the level with nothing to attach it to.
       // This is the pre-session snapshot — agent-manager overwrites it with the
       // effective values the moment a session reports them.
-      const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
+      const { modelName, modelId } = model
+        ? isVirtualModel(model) ? describeVirtualModel(model) : describeModel(model)
+        : { modelName: undefined, modelId: undefined };
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
