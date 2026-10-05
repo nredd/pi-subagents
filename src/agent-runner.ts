@@ -496,6 +496,13 @@ export interface ToolActivity {
   toolName: string;
 }
 
+/** The fields of an assistant message the manager reads to relabel an agent's model. */
+export interface AssistantMessageInfo {
+  api?: string;
+  provider?: string;
+  model?: string;
+}
+
 export interface RunOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
@@ -574,7 +581,7 @@ export interface RunOptions {
    * We never price anything ourselves; every dollar figure this extension shows
    * or reports traces back to this field.
    */
-  onAssistantUsage?: (usage: LifetimeUsage) => void;
+  onAssistantUsage?: (usage: LifetimeUsage, message: AssistantMessageInfo) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
    * pre-compaction context size estimate. Aborted compactions don't fire.
@@ -1328,7 +1335,7 @@ export async function runAgent(
         cacheWrite: u.cacheWrite ?? 0,
         cacheRead: u.cacheRead ?? 0,
         cost: u.cost?.total ?? 0,
-      });
+      }, event.message as AssistantMessageInfo);
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
@@ -1413,7 +1420,7 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: LifetimeUsage) => void;
+    onAssistantUsage?: (usage: LifetimeUsage, message: AssistantMessageInfo) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
@@ -1437,7 +1444,7 @@ export async function resumeAgent(
             cacheWrite: u.cacheWrite ?? 0,
             cacheRead: u.cacheRead ?? 0,
             cost: u.cost?.total ?? 0,
-          });
+          }, event.message as AssistantMessageInfo);
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });

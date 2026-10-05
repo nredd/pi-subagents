@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Router-backed agents show the physical model.** With `agentModels["*"] = "router/default"` a row read `router default · thinking: medium`. The label now says `router default (routing)` until the first response, then follows the model that answered (and a router fallback), in the widget, FleetView, the `Agent` result row and the conversation viewer. The thinking level is the session's selected level; a router chain entry's own `thinking` override is not recorded on messages and can differ.
+
+### Fixed
 - **The forced final report is tool-free with other extensions loaded, and bounded.** pi-deferred-context-engine re-activates its always-active tools from `before_agent_start`, inside the report prompt, so the "tool-less" turn still offered 15 tools; with the turn cap off for that turn, a looping child ran 66 tool calls and ended `aborted` on its narration. The loadout is now pinned empty for the turn, stray calls are refused with `terminate`, and the turn is aborted if it calls a tool or runs past one turn.
 - **A subagent calling `SubagentWorkflow` gets the reason.** The tool is excluded from child sessions, so core answered "Tool SubagentWorkflow not found" before the refusal hook ran and the explanation promised above never arrived. Children with extensions now carry a refusing stand-in under that name.
 - **`steer_subagent` accepts a queued agent.** It refused anything not `running`, so an agent waiting on `maxConcurrent` could not be redirected before its first turn. The steer is now queued on the record, reported as queued, and delivered when the agent starts.
