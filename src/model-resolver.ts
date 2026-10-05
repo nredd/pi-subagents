@@ -87,6 +87,41 @@ export function describeModel(
   };
 }
 
+/** API id pi gives virtual catalog entries such as `router/default`; they never reach a provider. */
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+/** Whether `model` is a virtual (router) selection rather than a physical model. */
+export function isVirtualModel(model: { api?: string } | undefined): boolean {
+  return model?.api === VIRTUAL_MODEL_API;
+}
+
+/** The pre-response label of a virtual selection: no physical model has answered yet. */
+export function describeVirtualModel(model: { provider: string; id: string; name?: string }): {
+  modelName: string;
+  modelId: string;
+} {
+  const described = describeModel(model);
+  return { ...described, modelName: `${described.modelName} (routing)` };
+}
+
+/**
+ * The physical model behind an assistant message, or `undefined` when the
+ * message names none (an error from failed routing carries the virtual model).
+ *
+ * With a virtual selection (`agentModels["*"] = "router/default"`) the session
+ * model is the router; only responses record where a request actually went, so
+ * rows must be relabelled from them. `registry` supplies the display name, and
+ * is optional: without it the id stands in.
+ */
+export function describePhysicalModel(
+  message: { api?: string; provider?: string; model?: string } | undefined,
+  registry?: { find?(provider: string, modelId: string): { name?: string } | undefined },
+): { modelName: string; modelId: string } | undefined {
+  if (!message?.provider || !message.model || isVirtualModel(message)) return undefined;
+  const found = registry?.find?.(message.provider, message.model);
+  return describeModel({ provider: message.provider, id: message.model, name: found?.name });
+}
+
 /** Parsed `[major, minor]` of a model id, or undefined when the family has no known scheme. */
 export type ModelVersion = readonly [major: number, minor: number];
 
