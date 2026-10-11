@@ -976,8 +976,10 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(card).toContain("from-inline");
     expect(card).toContain("scanned 3 files");
     expect(card).toContain("done");
-    // The ticker repaints once more after the run ends, then stops.
+    // The ticker repaints once more after the run ends, then stops. Let any
+    // pending final tick land before taking the count.
     await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 5_000 });
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
     const settled = invalidate.mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     expect(invalidate.mock.calls.length).toBe(settled);
