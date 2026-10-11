@@ -1160,6 +1160,9 @@ describe("agent-runner master tool allowlist", () => {
 
       const tools = lastToolsPassed();
       expect(tools).not.toContain("Agent");
+      // The prompt and the workflow refusal agree: no Agent means nesting is off.
+      const { buildAgentPrompt } = await import("../src/prompts.js");
+      expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).toMatchObject({ nestingDisabled: true });
       // The siblings the agent did NOT deny stay available.
       expect(tools).toEqual(expect.arrayContaining(["get_subagent_result", "steer_subagent"]));
     });
