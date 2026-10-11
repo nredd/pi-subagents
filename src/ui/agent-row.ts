@@ -127,29 +127,28 @@ const ROW_TICK_MS = 1000;
 
 interface RowTickState {
   ticker?: ReturnType<typeof setInterval>;
-  details?: AgentDetails;
+  isLive?: () => boolean;
   invalidate?: () => void;
 }
 
 /**
- * Ask the host to redraw a live row once a second. The result component is live
- * (it reads the record on render) but nothing repaints a quiet screen, and the
- * widget/fleet timers are not guaranteed to be running. The ticker lives on the
- * row's shared `state`, always reads the newest details, and stops by itself
- * once the run is over.
+ * Ask the host to redraw a live tool row once a second. Pi caches a settled
+ * row's collapsed line until the renderer calls `context.invalidate()`, and
+ * nothing repaints a quiet screen, so a row that reads live state must tick.
+ * The ticker lives on the row's shared `state`, always asks the newest
+ * `isLive`, and stops by itself once the run is over.
  */
-export function keepRowTicking(
+export function keepTicking(
   context: { state?: unknown; invalidate?: () => void },
-  details: AgentDetails,
-  live: AgentRowLive,
+  isLive: () => boolean,
 ): void {
   const state = context.state as RowTickState | undefined;
   if (!state || !context.invalidate) return;
-  state.details = details;
+  state.isLive = isLive;
   state.invalidate = context.invalidate;
-  if (state.ticker !== undefined || !isRowLive(details, live)) return;
+  if (state.ticker !== undefined || !isLive()) return;
   state.ticker = setInterval(() => {
-    if (state.details && isRowLive(state.details, live)) {
+    if (state.isLive?.()) {
       state.invalidate?.();
       return;
     }
@@ -158,6 +157,15 @@ export function keepRowTicking(
     state.invalidate?.(); // one last repaint, showing the final state
   }, ROW_TICK_MS);
   state.ticker.unref?.();
+}
+
+/** {@link keepTicking} for an `Agent` row: live while its record is running or queued. */
+export function keepRowTicking(
+  context: { state?: unknown; invalidate?: () => void },
+  details: AgentDetails,
+  live: AgentRowLive,
+): void {
+  keepTicking(context, () => isRowLive(details, live));
 }
 
 /**

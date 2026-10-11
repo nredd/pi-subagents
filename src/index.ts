@@ -54,7 +54,7 @@ import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitCh
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
-import { AgentCallView, AgentResultView, type AgentRowLive, keepRowTicking } from "./ui/agent-row.js";
+import { AgentCallView, AgentResultView, type AgentRowLive, keepRowTicking, keepTicking } from "./ui/agent-row.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -2651,6 +2651,9 @@ Terse command-style prompts produce shallow, generic work.
       // No task means the run predates this session (a reloaded transcript) or
       // the call never started one — show what `execute` said instead.
       if (renderContext.isError || !task) return new Text(text, 0, 0);
+      // The card reads the live task; a background run settles its tool call
+      // while still going, so redraw until it stops.
+      keepTicking(renderContext, () => task.status === "running" || task.status === "paused");
       return renderWorkflowCard(
         {
           progress: task.workflowProgress,

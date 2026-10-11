@@ -942,6 +942,15 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const taskId = /Task ID: (\S+)/.exec(textOf(result))?.[1];
     expect(taskId).toBeTruthy();
 
+    // Pi caches a settled row until its renderer invalidates, and this call
+    // settled while the run is still going: the row has to ask for redraws.
+    const invalidate = vi.fn();
+    tools.get("SubagentWorkflow").renderResult(result, { expanded: false, isPartial: false }, plainTheme, {
+      isError: false,
+      state: {},
+      invalidate,
+    });
+
     // The tool returned before the run finished — the completion has to arrive
     // on its own, through the same channel a background agent uses.
     await vi.waitFor(
@@ -967,6 +976,11 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(card).toContain("from-inline");
     expect(card).toContain("scanned 3 files");
     expect(card).toContain("done");
+    // The ticker repaints once more after the run ends, then stops.
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 5_000 });
+    const settled = invalidate.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(invalidate.mock.calls.length).toBe(settled);
   });
 
   /** Wait for the completion notification a background run sends for `taskId`. */
