@@ -8,6 +8,7 @@ import {
   agentRowSummary,
   isRowLive,
   keepRowTicking,
+  keepTicking,
 } from "../src/ui/agent-row.js";
 import type { AgentActivity, AgentDetails } from "../src/ui/agent-widget.js";
 
@@ -174,6 +175,18 @@ describe("keepRowTicking", () => {
     keepRowTicking(idle, makeDetails({ status: "completed" }), live(undefined));
     vi.advanceTimersByTime(5_000);
     expect(idle.invalidate).not.toHaveBeenCalled();
+  });
+
+  it("keepTicking follows the newest liveness check for a non-agent row", () => {
+    let status = "running";
+    const invalidate = vi.fn();
+    const context = { state: {} as object, invalidate };
+    keepTicking(context, () => status === "running");
+    vi.advanceTimersByTime(2_000);
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    status = "completed";
+    vi.advanceTimersByTime(3_000);
+    expect(invalidate).toHaveBeenCalledTimes(3); // one final repaint, then stop
   });
 
   it("does nothing without a shared state or invalidate", () => {

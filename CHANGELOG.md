@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`SubagentWorkflow` rows follow a background run.** The card reads the live task, but a background call settles while the run is still going, and pi core (`1.0.0-nredd.6`) caches a settled row until the renderer calls `context.invalidate()`. The row now ticks once a second while the run is running or paused, through the same `keepTicking` the `Agent` row uses, and repaints once more when it ends.
 - **Router-backed agents show the physical model.** With `agentModels["*"] = "router/default"` a row read `router default · thinking: medium`. The label now says `router default (routing)` until the first response, then follows the model that answered (and a router fallback), in the widget, FleetView, the `Agent` result row and the conversation viewer. The thinking level is the session's selected level; a router chain entry's own `thinking` override is not recorded on messages and can differ.
 
 ### Added
