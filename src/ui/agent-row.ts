@@ -136,14 +136,16 @@ interface RowTickState {
  * row's collapsed line until the renderer calls `context.invalidate()`, and
  * nothing repaints a quiet screen, so a row that reads live state must tick.
  * The ticker lives on the row's shared `state`, always asks the newest
- * `isLive`, and stops by itself once the run is over.
+ * `isLive`, and stops by itself once the run is over. A host probe render
+ * (`probe: true`) gets throwaway state and re-runs on every invalidate, so it
+ * never starts one.
  */
 export function keepTicking(
-  context: { state?: unknown; invalidate?: () => void },
+  context: { state?: unknown; invalidate?: () => void; probe?: boolean },
   isLive: () => boolean,
 ): void {
   const state = context.state as RowTickState | undefined;
-  if (!state || !context.invalidate) return;
+  if (context.probe || !state || !context.invalidate) return;
   state.isLive = isLive;
   state.invalidate = context.invalidate;
   if (state.ticker !== undefined || !isLive()) return;
@@ -161,7 +163,7 @@ export function keepTicking(
 
 /** {@link keepTicking} for an `Agent` row: live while its record is running or queued. */
 export function keepRowTicking(
-  context: { state?: unknown; invalidate?: () => void },
+  context: { state?: unknown; invalidate?: () => void; probe?: boolean },
   details: AgentDetails,
   live: AgentRowLive,
 ): void {

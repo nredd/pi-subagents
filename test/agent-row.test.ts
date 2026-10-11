@@ -189,6 +189,14 @@ describe("keepRowTicking", () => {
     expect(invalidate).toHaveBeenCalledTimes(3); // one final repaint, then stop
   });
 
+  it("starts no ticker for a host probe render", () => {
+    const invalidate = vi.fn();
+    keepTicking({ state: {} as object, invalidate, probe: true }, () => true);
+    vi.advanceTimersByTime(3_000);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("does nothing without a shared state or invalidate", () => {
     expect(() => keepRowTicking({}, makeDetails(), live(makeRecord()))).not.toThrow();
   });
