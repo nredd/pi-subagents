@@ -5,7 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
-import { createNestedSubagentTools, getMaxSubagentDepth, NESTED_BACKGROUND_ERROR, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
+import {
+  createNestedSubagentTools,
+  getMaxSubagentDepth,
+  NESTED_BACKGROUND_ERROR,
+  NESTED_WORKFLOW_ERROR,
+  NESTED_WORKFLOW_NO_AGENT_ERROR,
+  type NestedAgentManager,
+  setMaxSubagentDepth,
+} from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
 
 let cwd: string;
@@ -555,5 +563,14 @@ describe("setMaxSubagentDepth clamping", () => {
   it("stores a valid depth unchanged", () => {
     setMaxSubagentDepth(3);
     expect(getMaxSubagentDepth()).toBe(3);
+  });
+});
+
+describe("workflow refusal messages", () => {
+  it("points at Agent only when the child has it", () => {
+    expect(NESTED_WORKFLOW_ERROR).toContain("call Agent in the foreground");
+    expect(NESTED_WORKFLOW_NO_AGENT_ERROR).not.toMatch(/call Agent/i);
+    expect(NESTED_WORKFLOW_NO_AGENT_ERROR).toContain("no Agent tool");
+    expect(NESTED_WORKFLOW_NO_AGENT_ERROR).toContain("Do the work directly");
   });
 });

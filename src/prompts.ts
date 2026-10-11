@@ -35,7 +35,7 @@ export interface PromptExtras {
   workflowChild?: boolean;
   /**
    * Set when the agent lists `allowed_subagents` but got no `Agent` tool (depth
-   * cap, isolation). Without the line it reads the missing tool as a fault and
+   * cap, isolation, `disallowed_tools`). Without the line it reads the missing tool as a fault and
    * emulates one, e.g. by shelling out to `claude -p`, which escapes the depth
    * cap, quota admission and usage reporting.
    */
@@ -95,7 +95,7 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
 
   const nestingBlock = extras?.nestingDisabled
     ? `\n\n<nesting_disabled>
-Subagents are disabled at this depth, so you have no Agent tool. Do the work yourself, inline.
+Nested subagents are disabled for this session, so you have no Agent tool. Do the work yourself, inline.
 Do not emulate subagents by running another agent CLI (e.g. \`claude -p\`) from bash.
 </nesting_disabled>`
     : "";

@@ -877,7 +877,12 @@ export async function runAgent(
   const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
     ? options.nestedRuntime
     : undefined;
-  if (agentConfig?.allowedSubagents && (!nestedRuntime || options.isolated)) extras.nestingDisabled = true;
+  // One answer for the prompt and the workflow refusal: does this child end up with `Agent`?
+  const agentAvailable = Boolean(
+    agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+      && !agentConfig.disallowedTools?.includes("Agent"),
+  );
+  if (agentConfig?.allowedSubagents && !agentAvailable) extras.nestingDisabled = true;
 
   // Build system prompt from agent config
   let systemPrompt: string;
@@ -1125,9 +1130,7 @@ export async function runAgent(
   // unsatisfiable by construction rather than merely restricted.
   // Only where extensions load, which is also where a foreign `workflow` tool
   // would be visible and refused; an isolated child gets no workflow tool at all.
-  const workflowError = nestedToolNames.has("Agent") && !disallowedSet?.has("Agent")
-    ? NESTED_WORKFLOW_ERROR
-    : NESTED_WORKFLOW_NO_AGENT_ERROR;
+  const workflowError = agentAvailable ? NESTED_WORKFLOW_ERROR : NESTED_WORKFLOW_NO_AGENT_ERROR;
   const refusalTools = !noExtensions && !disallowedSet?.has(SUBAGENT_TOOL_NAMES.WORKFLOW)
     ? [createWorkflowRefusalTool(workflowError)]
     : [];
