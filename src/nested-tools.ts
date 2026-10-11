@@ -64,6 +64,16 @@ export const NESTED_WORKFLOW_ERROR =
   "Workflows are not available inside a subagent: a workflow runs in the background and reports to the session that started it, "
   + "and this session ends when you return your answer. Do the work directly, or call Agent in the foreground.";
 
+/**
+ * `NESTED_WORKFLOW_ERROR` for a child that was never given `Agent` (depth cap,
+ * isolation, or no `allowed_subagents`). Pointing it at a tool it does not have
+ * sends it hunting, and then shelling out to a CLI that escapes every limit.
+ */
+export const NESTED_WORKFLOW_NO_AGENT_ERROR =
+  "Workflows are not available inside a subagent: a workflow runs in the background and reports to the session that started it, "
+  + "and this session ends when you return your answer. Subagents are disabled at this depth (`maxSubagentDepth`), so there is no Agent tool either. "
+  + "Do the work directly.";
+
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;

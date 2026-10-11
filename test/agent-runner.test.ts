@@ -113,7 +113,8 @@ vi.mock("../src/skill-loader.js", () => ({
 }));
 
 vi.mock("../src/nested-tools.js", () => ({
-  NESTED_WORKFLOW_ERROR: "Workflows are not available inside a subagent: mocked.",
+  NESTED_WORKFLOW_ERROR: "Workflows are not available inside a subagent: mocked. Call Agent in the foreground.",
+  NESTED_WORKFLOW_NO_AGENT_ERROR: "Workflows are not available inside a subagent: mocked. Nesting is disabled.",
   getMaxSubagentDepth: vi.fn(() => 2),
   createNestedSubagentTools: vi.fn(() => [
     { name: "Agent" },
@@ -1490,6 +1491,49 @@ describe("agent-runner master tool allowlist", () => {
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();
     expect(lastToolsPassed()).not.toContain("Agent");
+  });
+
+  describe("depth-capped agent that lists allowed_subagents", () => {
+    async function runCapped(maxSubagentDepth: number) {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(
+        makeAgentConfig({ extensions: true, allowedSubagents: "all" }),
+      );
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      await runAgent(ctx, "Explore", "go", {
+        pi,
+        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth },
+      });
+      return session;
+    }
+
+    it("tells the child nesting is off, and not to emulate it with a CLI", async () => {
+      const { buildAgentPrompt } = await import("../src/prompts.js");
+      await runCapped(1);
+      expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).toMatchObject({ nestingDisabled: true });
+    });
+
+    it("says nothing when the nested tools were injected", async () => {
+      const { buildAgentPrompt } = await import("../src/prompts.js");
+      await runCapped(3);
+      expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("nestingDisabled");
+    });
+
+    it("refuses a workflow without pointing at an Agent tool it does not have", async () => {
+      const session = await runCapped(1);
+      const blocked = await session.agent.beforeToolCall?.({ toolCall: { name: "workflow" } });
+      expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining("Nesting is disabled") });
+      expect(blocked.reason).not.toContain("Call Agent");
+      await expect(customTool("SubagentWorkflow").execute("id", {})).rejects.toThrow("Nesting is disabled");
+    });
+
+    it("still points at Agent when it was injected", async () => {
+      const session = await runCapped(3);
+      const blocked = await session.agent.beforeToolCall?.({ toolCall: { name: "workflow" } });
+      expect(blocked.reason).toContain("Call Agent in the foreground");
+    });
   });
 
   it("extensions: false with disallowedTools — denylist applies to built-ins", async () => {
