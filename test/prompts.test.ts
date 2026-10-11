@@ -457,6 +457,18 @@ describe("buildAgentPrompt", () => {
       }
     });
 
+    it("tells a child with no Agent tool that nesting is off, in both modes", () => {
+      for (const promptMode of ["replace", "append"] as const) {
+        const prompt = buildAgentPrompt(childConfig(promptMode), "/workspace", env, "Parent.", {
+          nestingDisabled: true,
+        });
+        expect(prompt).toContain("<nesting_disabled>");
+        expect(prompt).toContain("claude -p");
+        const without = buildAgentPrompt(childConfig(promptMode), "/workspace", env, "Parent.");
+        expect(without).not.toContain("<nesting_disabled>");
+      }
+    });
+
     it("tells a workflow child its final message is the return value, in both modes", () => {
       for (const promptMode of ["replace", "append"] as const) {
         const prompt = buildAgentPrompt(childConfig(promptMode), "/workspace", env, "Parent.", {

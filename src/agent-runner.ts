@@ -26,7 +26,13 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import type { ModelCallEvent } from "./model-call.js";
-import { createNestedSubagentTools, getMaxSubagentDepth, NESTED_WORKFLOW_ERROR, type NestedAgentManager } from "./nested-tools.js";
+import {
+  createNestedSubagentTools,
+  getMaxSubagentDepth,
+  NESTED_WORKFLOW_ERROR,
+  NESTED_WORKFLOW_NO_AGENT_ERROR,
+  type NestedAgentManager,
+} from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -62,7 +68,7 @@ const BLOCKED_IN_SUBAGENT: ReadonlySet<string> = new Set([SUBAGENT_TOOL_NAMES.WO
  * one. The scope hook blocks the call with `NESTED_WORKFLOW_ERROR`; the throw
  * covers a session without that hook.
  */
-function createWorkflowRefusalTool() {
+function createWorkflowRefusalTool(reason: string) {
   return defineTool({
     name: SUBAGENT_TOOL_NAMES.WORKFLOW,
     label: "SubagentWorkflow",
@@ -70,7 +76,7 @@ function createWorkflowRefusalTool() {
     // Open object: whatever arguments the model sends, the refusal is the answer.
     parameters: Type.Object({}),
     execute: async () => {
-      throw new Error(NESTED_WORKFLOW_ERROR);
+      throw new Error(reason);
     },
   });
 }
@@ -276,9 +282,12 @@ export function installExtensionToolScope(
      * seeded from `toolNames`.
      */
     readmitToolNames: Set<string>;
+    /** Why workflow tools are refused; defaults to the message that points at `Agent`. */
+    workflowError?: string;
   },
 ): void {
   const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
+  const workflowError = ctx.workflowError ?? NESTED_WORKFLOW_ERROR;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -333,7 +342,7 @@ export function installExtensionToolScope(
     // extension gets the reason, not "not available": it is loaded here like
     // any extension tool, and would otherwise run and report to a dead session.
     if (BLOCKED_IN_SUBAGENT.has(context.toolCall.name)) {
-      return { block: true, reason: NESTED_WORKFLOW_ERROR };
+      return { block: true, reason: workflowError };
     }
     if (!inScope().has(context.toolCall.name)) {
       return {
@@ -800,6 +809,17 @@ export async function runAgent(
     }
   }
 
+  // At (or past) the cap this agent can never spawn, so it can never own a child
+  // to fetch from or steer either — inject nothing rather than three tools whose
+  // every call is an error. This is also what makes `maxSubagentDepth` 0/1 mean
+  // "nesting off" instead of "nesting always fails". Resolved before the system
+  // prompt because an agent that asked for subagents and was refused is told so.
+  const effectiveMaxDepth = options.nestedRuntime?.maxSubagentDepth ?? getMaxSubagentDepth();
+  const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
+    ? options.nestedRuntime
+    : undefined;
+  if (agentConfig?.allowedSubagents && (!nestedRuntime || options.isolated)) extras.nestingDisabled = true;
+
   // Build system prompt from agent config
   let systemPrompt: string;
   if (agentConfig) {
@@ -974,14 +994,6 @@ export async function runAgent(
   // set `allowed_subagents` and a nestedRuntime was provided — and never when
   // isolated. Their names collide with EXCLUDED_TOOL_NAMES by design, so the
   // scoping below re-admits them explicitly (registry deny + active-set narrow).
-  const effectiveMaxDepth = options.nestedRuntime?.maxSubagentDepth ?? getMaxSubagentDepth();
-  // At (or past) the cap this agent can never spawn, so it can never own a child
-  // to fetch from or steer either — inject nothing rather than three tools whose
-  // every call is an error. This is also what makes `maxSubagentDepth` 0/1 mean
-  // "nesting off" instead of "nesting always fails".
-  const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
-    ? options.nestedRuntime
-    : undefined;
   const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
     ? createNestedSubagentTools({
         manager: nestedRuntime.manager,
@@ -1014,8 +1026,11 @@ export async function runAgent(
   // unsatisfiable by construction rather than merely restricted.
   // Only where extensions load, which is also where a foreign `workflow` tool
   // would be visible and refused; an isolated child gets no workflow tool at all.
+  const workflowError = nestedToolNames.has("Agent") && !disallowedSet?.has("Agent")
+    ? NESTED_WORKFLOW_ERROR
+    : NESTED_WORKFLOW_NO_AGENT_ERROR;
   const refusalTools = !noExtensions && !disallowedSet?.has(SUBAGENT_TOOL_NAMES.WORKFLOW)
-    ? [createWorkflowRefusalTool()]
+    ? [createWorkflowRefusalTool(workflowError)]
     : [];
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
@@ -1175,6 +1190,7 @@ export async function runAgent(
       extNames,
       narrowing,
       readmitToolNames,
+      workflowError,
     });
   }
 

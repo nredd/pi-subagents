@@ -33,6 +33,13 @@ export interface PromptExtras {
    * `get_subagent_result` — so terse raw data would be the wrong answer there.
    */
   workflowChild?: boolean;
+  /**
+   * Set when the agent lists `allowed_subagents` but got no `Agent` tool (depth
+   * cap, isolation). Without the line it reads the missing tool as a fault and
+   * emulates one, e.g. by shelling out to `claude -p`, which escapes the depth
+   * cap, quota admission and usage reporting.
+   */
+  nestingDisabled?: boolean;
 }
 
 /**
@@ -86,6 +93,13 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
 </workflow_child>`
     : "";
 
+  const nestingBlock = extras?.nestingDisabled
+    ? `\n\n<nesting_disabled>
+Subagents are disabled at this depth, so you have no Agent tool. Do the work yourself, inline.
+Do not emulate subagents by running another agent CLI (e.g. \`claude -p\`) from bash.
+</nesting_disabled>`
+    : "";
+
   // Build optional extras suffix
   const extraSections: string[] = [];
   if (extras?.memoryBlock) {
@@ -123,7 +137,7 @@ You are operating as a sub-agent invoked to handle a specific task.
     // placed verbatim (no wrapper tag) so it forms an identical byte prefix
     // with the parent session, maximising KV cache hits. The <active_agent>
     // tag and env block vary per call and are placed after the cached prefix.
-    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
+    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + nestingBlock + customSection + extrasSuffix;
   }
 
   // "replace" mode — env header + the config's full system prompt
@@ -132,7 +146,7 @@ You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
 
-  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + nestingBlock + "\n\n" + config.systemPrompt + extrasSuffix;
 }
 
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */
