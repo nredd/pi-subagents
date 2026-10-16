@@ -117,7 +117,8 @@ export function extensionCanonicalName(extPath: string): string {
  *     packages live), so reaching it means we've climbed out of the package —
  *     stop before reading a consumer's or parent package's manifest.
  * The name is then taken only when that root's `pi.extensions` manifest actually
- * lists this entry. That "declares this entry" check is deliberate: our own test
+ * lists this entry, either as the file itself or as a directory pi resolves to
+ * this `index.ts`/`index.js` (pi-web-access declares `./dist`). That "declares this entry" check is deliberate: our own test
  * fixtures live under this repo, whose root manifest declares `./src/index.ts`
  * as `@tintinweb/pi-subagents`, so a looser rule would misattribute every
  * co-located file to `pi-subagents`.
@@ -126,6 +127,7 @@ function extensionPackageName(extPath: string): string | undefined {
   // `builtin:<name>` names no file; climbing from it would read the process cwd's manifest.
   if (extPath.startsWith("builtin:")) return undefined;
   const entry = resolve(extPath);
+  const indexDir = /^index\.(ts|js)$/.test(basename(entry)) ? dirname(entry) : undefined;
   let dir = dirname(extPath);
   for (;;) {
     // Climbing into node_modules means we've left the owning package's tree.
@@ -144,7 +146,11 @@ function extensionPackageName(extPath: string): string | undefined {
     if (
       typeof pkg.name === "string" &&
       Array.isArray(entries) &&
-      entries.some((e) => typeof e === "string" && resolve(dir, e) === entry)
+      entries.some((e) => {
+        if (typeof e !== "string") return false;
+        const declared = resolve(dir, e);
+        return declared === entry || declared === indexDir;
+      })
     ) {
       const short = pkg.name.startsWith("@") ? pkg.name.slice(pkg.name.indexOf("/") + 1) : pkg.name;
       return short.toLowerCase();
