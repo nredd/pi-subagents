@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildAgentPrompt } from "../src/prompts.js";
 
 const {
   createAgentSession,
@@ -329,7 +330,6 @@ describe("agent-runner final output capture", () => {
   });
 
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {
-    const { buildAgentPrompt } = await import("../src/prompts.js");
     const { session } = createSession("ISOLATED");
     createAgentSession.mockResolvedValue({ session });
 
@@ -341,7 +341,6 @@ describe("agent-runner final output capture", () => {
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {
-    const { buildAgentPrompt } = await import("../src/prompts.js");
     const { session } = createSession("RAW");
     createAgentSession.mockResolvedValue({ session });
 
@@ -353,7 +352,6 @@ describe("agent-runner final output capture", () => {
   });
 
   it("leaves the block off a schema-bearing child, which answers through StructuredOutput", async () => {
-    const { buildAgentPrompt } = await import("../src/prompts.js");
     const { session } = createSession("RAW");
     createAgentSession.mockResolvedValue({ session });
 
@@ -1222,7 +1220,6 @@ describe("agent-runner master tool allowlist", () => {
       const tools = lastToolsPassed();
       expect(tools).not.toContain("Agent");
       // The prompt and the workflow refusal agree: no Agent means nesting is off.
-      const { buildAgentPrompt } = await import("../src/prompts.js");
       expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).toMatchObject({ nestingDisabled: true });
       // The siblings the agent did NOT deny stay available.
       expect(tools).toEqual(expect.arrayContaining(["get_subagent_result", "steer_subagent"]));
@@ -1574,13 +1571,11 @@ describe("agent-runner master tool allowlist", () => {
     }
 
     it("tells the child nesting is off, and not to emulate it with a CLI", async () => {
-      const { buildAgentPrompt } = await import("../src/prompts.js");
       await runCapped(1);
       expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).toMatchObject({ nestingDisabled: true });
     });
 
     it("says nothing when the nested tools were injected", async () => {
-      const { buildAgentPrompt } = await import("../src/prompts.js");
       await runCapped(3);
       expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("nestingDisabled");
     });

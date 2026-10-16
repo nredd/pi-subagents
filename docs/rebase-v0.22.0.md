@@ -32,11 +32,12 @@ The stock tests ran from an archive of `v0.22.0` inside this isolated worktree, 
 
 All model-backed tests used scripted faux responses, with `PI_E2E_LIVE=0`.
 
-- `npm run check`: biome clean (200 files), TypeScript clean, 126 test files passed; 2576 tests passed, 7 opt-in live tests skipped.
-- `npm run test:e2e`: 16 files passed; 88 tests passed, 7 opt-in live tests skipped.
+- `npm run check` (`PI_E2E_LIVE=0`): biome clean, TypeScript clean, 126 test files passed; 2578 tests passed, 7 opt-in live tests skipped.
+- `npm run test:e2e` (`PI_E2E_LIVE=0`): 16 files passed; 88 tests passed, 7 opt-in live tests skipped.
 - `npm run build`: passed.
-- `git diff --check`: passed.
-- Package/version/peer assertions and released-changelog comparison: passed.
+- `git diff --check`: passed (rerun after the review fixes).
+- Package/version/peer assertions and released-changelog comparison: passed (not rerun after the review fixes).
+- Review fixes: a quota-parked job re-admitted with a refusal that cannot park (`wait: false`, no reset, or a reset already past) now ends with `lastStatus: "error"` and a `subagents:scheduled` error event instead of spawning; it is not re-parked. Before the `src/schedule.ts` change, the rewritten `wait: false` case (formerly asserting a spawn) and the missing-reset case failed against the old source (2 failed, 15 passed). The already-past-reset case was added afterwards to cover the newly documented behavior and was not run against the old source. The three cases assert no spawn, the persisted error and the error event.
 - New held-notice transfer regressions were red before wiring the spool into the boundary outbox, then green. Coverage includes smart/group pending notices, consumed/delivered suppression, coalesced detached completions at a busy parent's boundary, one-shot group draining and outbox transfer without duplicate delivery.
 
 Vitest reports upstream's advisory about ESM syntax in `vitest.config.ts` under a future native config loader. It does not fail any gate.

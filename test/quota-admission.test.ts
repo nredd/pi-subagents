@@ -177,10 +177,12 @@ describe("SubagentScheduler — quota-parked jobs", () => {
   let store: ScheduleStore;
   let scheduler: SubagentScheduler;
   let manager: any;
+  let scheduled: { type: string; error?: string }[];
 
   function start(verdict: (model: string) => Verdict) {
     const bus = routerBus(verdict);
     const pi = { events: bus.events } as any;
+    bus.events.on("subagents:scheduled", e => scheduled.push(e as { type: string; error?: string }));
     const c = {
       cwd: "/tmp",
       model: MODEL,
@@ -200,6 +202,7 @@ describe("SubagentScheduler — quota-parked jobs", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    scheduled = [];
     tmp = mkdtempSync(join(tmpdir(), "scheduler-quota-"));
     store = new ScheduleStore(join(tmp, "s.json"));
     scheduler = new SubagentScheduler();
@@ -241,12 +244,37 @@ describe("SubagentScheduler — quota-parked jobs", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
   });
 
-  it("starts instead of re-parking when the router's policy now says fail", async () => {
+  it("errors instead of spawning or re-parking when the router's policy now says fail", async () => {
     start(() => ({ ok: false, resetAt: Date.now() + 10 * 60_000, wait: false }));
     const job = park();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(manager.spawn).toHaveBeenCalledTimes(1);
-    expect(store.get(job.id)?.enabled).toBe(false);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)).toMatchObject({ enabled: false, lastStatus: "error" });
+    expect(store.get(job.id)?.lastRun).toBeDefined();
+    expect(scheduled.filter(e => e.type === "error")).toHaveLength(1);
+  });
+
+  it("errors instead of spawning when the refusal carries no reset to park at", async () => {
+    start(() => ({ ok: false }));
+    const job = park();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)).toMatchObject({ enabled: false, lastStatus: "error" });
+    expect(scheduled.filter(e => e.type === "error")).toEqual([
+      expect.objectContaining({ error: expect.stringContaining("unknown time") }),
+    ]);
+  });
+
+  it("errors instead of spawning when the refusal's reset is already past", async () => {
+    start(() => ({ ok: false, resetAt: Date.now() - 1_000 }));
+    const job = park();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)).toMatchObject({ enabled: false, lastStatus: "error" });
+    expect(store.get(job.id)?.lastRun).toBeDefined();
+    expect(scheduled.filter(e => e.type === "error")).toEqual([
+      expect.objectContaining({ error: expect.stringContaining("The agent was not started.") }),
+    ]);
   });
 
   it("starts anyway when the router is gone, since admission fails open", async () => {
