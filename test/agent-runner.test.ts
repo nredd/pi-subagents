@@ -1858,6 +1858,19 @@ describe("extensionCanonicalNames (#143 — package short name alias)", () => {
     expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents"]);
   });
 
+  it("aliases a package-declared directory entry that resolves to its index file", () => {
+    // pi-web-access ships `pi.extensions: ["./dist"]`; pi loads `dist/index.js`, which
+    // otherwise only ever matches as "dist".
+    const dir = pkgDir("pi-web-access", ["./src"]);
+    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-web-access"]);
+  });
+
+  it("adds no alias when a declared directory holds the file but it is not the index", () => {
+    const dir = pkgDir("@scope/dir-ext", ["./src"]);
+    writeFileSync(join(dir, "src", "helper.ts"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "src", "helper.ts"))).toEqual(["helper"]);
+  });
+
   it("adds no alias for a loose file with no enclosing package.json", () => {
     const dir = mkdtempSync(join(tmpdir(), "subagents-loose-"));
     tmpDirs.push(dir);
