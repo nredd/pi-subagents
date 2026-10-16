@@ -855,7 +855,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     // failure lands on the record. spawnAndWait must still throw it — otherwise
     // queue pressure decides whether the Agent tool call is marked failed.
     const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
+    vi.mocked(createWorktree).mockRejectedValueOnce(new Error("/tmp is not inside a git repository"));
     let resolveRun!: (v: unknown) => void;
     vi.mocked(runAgent).mockClear();
     vi.mocked(runAgent).mockImplementationOnce(() => new Promise((res) => { resolveRun = res as (v: unknown) => void; }));

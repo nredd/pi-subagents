@@ -143,6 +143,16 @@ describe("CompletionOutbox", () => {
     expect(() => vi.advanceTimersByTime(NOTIFICATION_HOLD_MS)).not.toThrow();
   });
 
+  it("takes a coalesced snapshot for a session transfer without also delivering it", () => {
+    outbox.add(item("a"));
+    outbox.add(item("b"));
+    outbox.cancel("a");
+    expect(outbox.takePending()).toEqual(message("b"));
+    expect(outbox.takePending()).toBeUndefined();
+    vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("dispose drops pending completions and their timer", () => {
     outbox.add(item("a"));
     outbox.dispose();

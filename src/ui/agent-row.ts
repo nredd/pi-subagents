@@ -104,6 +104,7 @@ export function agentRowSummary(
   const parts = [text, formatClock(elapsed)];
   if (tokenText) parts.push(tokenText);
   if (cost) parts.push(cost);
+  if (!finished && details.backgroundHint && elapsed >= 2000) parts.push("(ctrl+b to run in background)");
   return `${icon} ${parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(` ${theme.fg("dim", "·")} `)}`;
 }
 

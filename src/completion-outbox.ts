@@ -92,16 +92,22 @@ export class CompletionOutbox {
     }, NOTIFICATION_HOLD_MS);
   }
 
-  private flush(): void {
+  /** Remove held completions for transfer to their session's detached spool. */
+  takePending(): OutboxMessage | undefined {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const items = this.items;
     this.items = [];
     const messages = items.map(item => item.build(item.ids));
-    if (messages.length === 0) return;
+    return messages.length > 0 ? combine(messages) : undefined;
+  }
+
+  private flush(): void {
+    const message = this.takePending();
+    if (!message) return;
     // A send from a timer can outlive the session it was meant for (pi -p
     // tearing down): pi throws on the stale context, and nothing is left to tell.
-    try { this.send(combine(messages)); } catch { /* stale context */ }
+    try { this.send(message); } catch { /* stale context */ }
   }
 }
 
