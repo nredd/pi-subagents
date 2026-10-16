@@ -22,7 +22,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -879,7 +879,7 @@ export async function runAgent(
     : undefined;
   // One answer for the prompt and the workflow refusal: does this child end up with `Agent`?
   const agentAvailable = Boolean(
-    agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+    agentConfig?.allowedSubagents && nestedRuntime && !isolated
       && !agentConfig.disallowedTools?.includes("Agent"),
   );
   if (agentConfig?.allowedSubagents && !agentAvailable) extras.nestingDisabled = true;

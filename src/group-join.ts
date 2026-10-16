@@ -131,6 +131,13 @@ export class GroupJoinManager {
     return this.agentToGroup.has(agentId);
   }
 
+  /** Release held completions to the outbox before a session transfer. */
+  flushPending(): void {
+    for (const group of [...this.groups.values()]) {
+      this.deliver(group, true);
+    }
+  }
+
   dispose(): void {
     for (const group of this.groups.values()) {
       if (group.timeoutHandle) clearTimeout(group.timeoutHandle);

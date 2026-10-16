@@ -35,6 +35,20 @@ describe("GroupJoinManager", () => {
     expect(mgr.isGrouped("a")).toBe(false);
   });
 
+  it("releases held members once for a session transfer and cancels their timeout", () => {
+    const deliver = vi.fn();
+    const mgr = new GroupJoinManager(deliver);
+    mgr.registerGroup("g", ["a", "b"]);
+    const record = makeRecord("a");
+    mgr.onAgentComplete(record);
+    mgr.flushPending();
+    expect(deliver).toHaveBeenCalledExactlyOnceWith([record], true);
+    mgr.flushPending();
+    vi.advanceTimersByTime(60_000);
+    expect(deliver).toHaveBeenCalledOnce();
+    mgr.dispose();
+  });
+
   it("holds the first completion and arms the join timeout", () => {
     const deliver = vi.fn();
     const mgr = new GroupJoinManager(deliver, 30_000);

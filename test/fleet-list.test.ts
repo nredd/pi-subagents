@@ -220,7 +220,7 @@ describe("FleetList detached agents", () => {
       notify: () => {},
       custom: (() => new Promise(() => {})) as FleetUICtx["custom"],
     } as FleetUICtx;
-    const fleet = new FleetList(fakeManager(own), new Map(), undefined, undefined, undefined, undefined, orphans);
+    const fleet = new FleetList(fakeManager(own), new Map(), undefined, undefined, undefined, undefined, undefined, undefined, orphans);
     fleet.setUICtx(ui);
     fleet.update();
     const render = () => (factory ? factory({ requestRender: () => {} }, theme).render(120).join("\n") : "");
@@ -827,7 +827,7 @@ describe("FleetList model and activity", () => {
   });
 
   function row(record: AgentRecord, showModel: boolean, activity?: Map<string, AgentActivity>): string {
-    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), undefined, undefined, undefined, () => showModel);
+    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), undefined, undefined, undefined, undefined, undefined, () => showModel);
     let factory: any;
     fleet.setUICtx({
       setWidget: (_k: string, c: any) => { factory = c; },

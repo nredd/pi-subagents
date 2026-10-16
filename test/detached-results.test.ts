@@ -169,6 +169,7 @@ describe("session switch with a running background agent", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     drainDetached(sessionFile);
     process.chdir(prevCwd);
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
@@ -180,7 +181,7 @@ describe("session switch with a running background agent", () => {
     vi.restoreAllMocks();
   });
 
-  async function spawnRunning(tools: Map<string, any>) {
+  async function spawnRunning(tools: Map<string, any>, parent = ctx(sessionFile)) {
     let finish!: (v: any) => void;
     let signal: AbortSignal | undefined;
     vi.mocked(runAgent).mockImplementation(((_c: any, _t: any, _p: any, opts: any) => {
@@ -194,7 +195,7 @@ describe("session switch with a running background agent", () => {
       { prompt: "go", description: "long reviewer", subagent_type: "general-purpose", run_in_background: true },
       undefined,
       undefined,
-      ctx(sessionFile),
+      parent,
     );
     const id = /Agent ID: (\S+)/.exec(r.content[0].text)![1];
     return { id, finish: () => finish({ responseText: "FINDINGS", session: { dispose: vi.fn() }, aborted: false, steered: false }), signal: () => signal };
@@ -217,12 +218,13 @@ describe("session switch with a running background agent", () => {
     const back = makePi();
     subagentsExtension(back.pi);
     await back.lifecycle.get("session_start")({ type: "session_start", reason: "resume" }, ctx(sessionFile));
+    await new Promise(resolve => setTimeout(resolve, 250));
     expect(back.pi.sendMessage).toHaveBeenCalledTimes(1);
     const [msg, opts] = back.pi.sendMessage.mock.calls[0];
     expect(msg.customType).toBe("subagent-notification");
     expect(msg.content).toContain("FINDINGS");
     expect(msg.content).toContain(agent.id);
-    expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(opts).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(back.pi.appendEntry).toHaveBeenCalledWith("subagents:record", expect.objectContaining({ id: agent.id, status: "completed" }));
     await back.lifecycle.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx(sessionFile));
   });
@@ -256,8 +258,85 @@ describe("session switch with a running background agent", () => {
 
     agent.finish();
     await flush();
+    await new Promise(resolve => setTimeout(resolve, 250));
     expect(back.pi.sendMessage).toHaveBeenCalledTimes(1);
     await back.lifecycle.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx(sessionFile));
+  });
+
+  it.each(["smart", "group"])("transfers held %s completions once, without repeating their history", async (joinMode) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, defaultJoinMode: joinMode }));
+    const first = makePi();
+    subagentsExtension(first.pi);
+    const parent = ctx(sessionFile);
+    parent.signal = new AbortController().signal;
+    await first.lifecycle.get("session_start")({ type: "session_start" }, parent);
+    // Every spawn in this turn is still waiting for the parent's boundary.
+    const agent = await spawnRunning(first.tools, parent);
+    agent.finish();
+    await flush();
+    expect(first.pi.sendMessage).not.toHaveBeenCalled();
+
+    await first.lifecycle.get("session_before_switch")?.();
+    await first.lifecycle.get("session_shutdown")({ reason: "reload" });
+    const back = makePi();
+    subagentsExtension(back.pi);
+    await back.lifecycle.get("session_start")({ type: "session_start" }, ctx(sessionFile));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(back.pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(back.pi.sendMessage.mock.calls[0][0].content).toContain("FINDINGS");
+    expect(back.pi.appendEntry).not.toHaveBeenCalledWith("subagents:record", expect.anything());
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(back.pi.sendMessage).toHaveBeenCalledTimes(1);
+    await back.lifecycle.get("session_shutdown")({ reason: "quit" });
+  });
+
+  it.each(["consumed", "delivered"])("does not replay a result already %s before a switch", async (handled) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const first = makePi();
+    subagentsExtension(first.pi);
+    await first.lifecycle.get("session_start")({ type: "session_start" }, ctx(sessionFile));
+    const agent = await spawnRunning(first.tools);
+    agent.finish();
+    await flush();
+    if (handled === "consumed") {
+      await first.tools.get("get_subagent_result").execute("read", { agent_id: agent.id }, undefined, undefined, ctx(sessionFile));
+    } else {
+      await vi.advanceTimersByTimeAsync(200);
+      expect(first.pi.sendMessage).toHaveBeenCalledOnce();
+    }
+    await first.lifecycle.get("session_shutdown")({ reason: "new" });
+    const back = makePi();
+    subagentsExtension(back.pi);
+    await back.lifecycle.get("session_start")({ type: "session_start" }, ctx(sessionFile));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(back.pi.sendMessage).not.toHaveBeenCalled();
+    await back.lifecycle.get("session_shutdown")({ reason: "quit" });
+  });
+
+  it("holds a detached result for the reopened parent's boundary and coalesces completions", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const first = makePi();
+    subagentsExtension(first.pi);
+    await first.lifecycle.get("session_start")({ type: "session_start" }, ctx(sessionFile));
+    const one = await spawnRunning(first.tools);
+    const two = await spawnRunning(first.tools);
+    await first.lifecycle.get("session_shutdown")({ reason: "reload" });
+    const back = makePi();
+    subagentsExtension(back.pi);
+    const parent = ctx(sessionFile);
+    parent.signal = new AbortController().signal;
+    await back.lifecycle.get("session_start")({ type: "session_start" }, parent);
+    one.finish();
+    two.finish();
+    await flush();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(back.pi.sendMessage).not.toHaveBeenCalled();
+    back.lifecycle.get("turn_end")({ type: "turn_end", message: { role: "assistant", stopReason: "toolUse" } });
+    expect(back.pi.sendMessage).toHaveBeenCalledOnce();
+    const details = back.pi.sendMessage.mock.calls[0][0].details;
+    expect([details.id, ...details.others.map((other: any) => other.id)].sort()).toEqual([one.id, two.id].sort());
+    await back.lifecycle.get("session_shutdown")({ reason: "quit" });
   });
 
   it("still aborts on quit", async () => {

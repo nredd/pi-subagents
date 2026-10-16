@@ -98,21 +98,6 @@ function textResult(msg: string, details?: AgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details: details as any };
 }
 
-export function renderRunningAgentStatus(
-  frame: string,
-  statsText: string,
-  activity: string,
-  theme: Pick<Theme, "fg">,
-): Container {
-  const container = new Container();
-  container.addChild(new Text(theme.fg("accent", frame) + (statsText ? " " + statsText : ""), 0, 0));
-  container.addChild(new Text(theme.fg("dim", `  ⎿  ${activity}`), 0, 0));
-  return container;
-}
-
-/** How long a foreground `Agent` call runs before its row offers ctrl+b. */
-const BACKGROUND_HINT_DELAY_MS = 2000;
-
 /** Format an agent's lifetime token total, or "" when zero. */
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
   const t = getLifetimeTotal(o.lifetimeUsage);
@@ -572,13 +557,12 @@ export default function (pi: ExtensionAPI) {
 
   function deliverDetachedResult(result: DetachedResult) {
     try {
-      pi.appendEntry("subagents:record", result.record);
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: result.content,
-        display: true,
-        details: result.details as NotificationDetails,
-      }, { deliverAs: "followUp", triggerTurn: true });
+      if (result.record) pi.appendEntry("subagents:record", result.record);
+      const details = result.details as NotificationDetails;
+      outbox.add({
+        ids: [details.id, ...(details.others?.map(other => other.id) ?? [])],
+        build: () => ({ content: result.content, details }),
+      });
     } catch { /* session already gone again; the transcript file still has the result */ }
   }
 
@@ -1135,6 +1119,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    // Keep unread records until shutdown can transfer their held notices.
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -1164,7 +1149,24 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
-    const detaching = event?.reason !== "quit" && sessionFile !== undefined && manager.detach() > 0;
+    const switching = event?.reason !== "quit" && sessionFile !== undefined;
+    if (switching) {
+      // A group may still be held, or not registered until the parent's turn
+      // ends. Release both into the outbox before transferring its snapshot.
+      groupJoin.flushPending();
+      for (const id of turnGroupSpawns) {
+        const record = manager.getRecord(id);
+        if (record && !record.resultConsumed && record.status !== "running" && record.status !== "queued") {
+          sendIndividualNudge(record);
+        }
+      }
+      const pending = outbox.takePending();
+      if (pending) {
+        try { spoolDetached(sessionFile, { id: nanoid(8), ...pending }); }
+        catch { console.error("[pi-subagents] Could not spool held completion notices; results remain in their transcripts."); }
+      }
+    }
+    const detaching = switching && manager.detach() > 0;
     if (!detaching) manager.abortAll();
     // Activation-owned UI and group state (#256): `session_shutdown` also runs for
     // reload and session replacement, where the Node process survives, so a live

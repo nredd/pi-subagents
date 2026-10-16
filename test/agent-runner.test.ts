@@ -2980,7 +2980,7 @@ describe("agent-runner turn limits", () => {
       const controller = new AbortController();
       controller.abort();
       const { session } = await runRunaway({ maxTurns: 2, turns: 4, signal: controller.signal });
-      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(session.prompt).not.toHaveBeenCalled();
     });
 
     /** A run that hits the cap, then plays `reportTurn` as the forced report prompt. */

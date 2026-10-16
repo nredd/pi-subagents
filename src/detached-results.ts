@@ -23,8 +23,8 @@ export interface DetachedResult {
   content: string;
   /** `subagent-notification` renderer details. */
   details: unknown;
-  /** Payload for the `subagents:record` history entry. */
-  record: Record<string, unknown>;
+  /** History entry for a result that finished detached; absent if already appended. */
+  record?: Record<string, unknown>;
 }
 
 const SINK_KEY = Symbol.for("pi-subagents:detached-sink");

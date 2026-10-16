@@ -150,7 +150,8 @@ describe("evicted agents", () => {
     subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
 
-    await vi.advanceTimersByTimeAsync(45 * 60_000);
+    vi.advanceTimersByTime(45 * 60_000);
+    await flush();
 
     const out = textOf(await tools.get("get_subagent_result").execute("tc", { agent_id: id }, undefined, undefined, ctx()));
     expect(out).toContain("THE-RESULT-PAYLOAD");
