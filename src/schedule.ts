@@ -23,7 +23,7 @@ import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
-import { checkAdmission, mayPark, modelRef, PARKED_RESUME_DELAY_MS, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
+import { checkAdmission, describeBlock, mayPark, modelRef, PARKED_RESUME_DELAY_MS, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -251,8 +251,17 @@ export class SubagentScheduler {
     const admissionModel = resolvedModel ?? ctx.model;
     if (job.quotaParked && admissionModel) {
       void checkAdmission(pi.events, modelRef(admissionModel)).then(block => {
-        if (block && mayPark(block) && block.resetAt > Date.now()) this.repark(id, block.resetAt);
-        else this.spawnJob(id, resolvedModel);
+        if (!block) {
+          this.spawnJob(id, resolvedModel);
+        } else if (mayPark(block) && block.resetAt > Date.now()) {
+          this.repark(id, block.resetAt);
+        } else {
+          // Refused and it cannot wait (`wait: false`, no reset, or a reset
+          // already past): only an explicit admission may spawn, so persist the
+          // failure instead of starting on an exhausted provider.
+          this.store?.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+          this.emit({ type: "error", jobId: id, error: `${describeBlock(block)} The agent was not started.` });
+        }
       });
       return;
     }

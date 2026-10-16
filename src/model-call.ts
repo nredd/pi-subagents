@@ -66,11 +66,6 @@ export function formatClock(ms: number): string {
   return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
-/** `950`, `3.2k`. */
-function compactCount(n: number): string {
-  return n < 1_000 ? `${n}` : `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
-}
-
 /**
  * `thinking · 2m41s`, `writing · 3.2k tok`, or `stalled? · 2m41s`; undefined
  * when no call is in flight.
@@ -80,7 +75,9 @@ export function describeModelCall(state: ModelCallState | undefined, now: number
   const silent = now - state.lastEventAt;
   if (silent >= STALL_MS) return `stalled? · ${formatClock(silent)}`;
   if (state.kind === "writing") {
-    return `writing · ${compactCount(Math.round(state.writtenChars / CHARS_PER_TOKEN))} tok`;
+    // `950`, `3.2k`.
+    const tokens = Math.round(state.writtenChars / CHARS_PER_TOKEN);
+    return `writing · ${tokens < 1_000 ? `${tokens}` : `${(tokens / 1_000).toFixed(1).replace(/\.0$/, "")}k`} tok`;
   }
   return `thinking · ${formatClock(now - state.startedAt)}`;
 }
