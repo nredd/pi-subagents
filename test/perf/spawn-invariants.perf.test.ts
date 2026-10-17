@@ -34,7 +34,7 @@ vi.mock("../../src/custom-agents.js", async () => {
 import { runAgent } from "../../src/agent-runner.js";
 import { registerAgents } from "../../src/agent-types.js";
 import subagentsExtension from "../../src/index.js";
-import { ctx, flush, type Hermetic, hermeticDir, makePi } from "../helpers/boot-extension.js";
+import { ctx, flush, type Hermetic, hermeticDir, makePi, startSession } from "../helpers/boot-extension.js";
 
 let hermetic: Hermetic;
 
@@ -56,21 +56,29 @@ afterEach(() => {
 });
 
 /** Boot the real extension in a hermetic cwd and hand back its Agent tool. */
-function bootAgentTool() {
+async function bootAgentTool() {
   hermetic = hermeticDir({
     agentFiles: {
       alpha: '---\ndescription: "First fixture agent."\n---\n\nAlpha.\n',
       beta: '---\ndescription: "Second fixture agent."\n---\n\nBeta.\n',
     },
   });
-  const { pi, tools } = makePi();
+  const { pi, tools, lifecycle } = makePi();
   subagentsExtension(pi);
-  return tools.get("Agent");
+  // Project agents load at the first `session_start`, once trust is known, which
+  // also re-registers `Agent`. Fetch the tool only afterwards.
+  await startSession(lifecycle, true);
+  const agent = tools.get("Agent");
+  // Prove both fixtures loaded, so the counters below measure a real sweep.
+  const advertised = `${agent.description}\n${JSON.stringify(agent.parameters)}`;
+  expect(advertised).toContain("alpha");
+  expect(advertised).toContain("beta");
+  return agent;
 }
 
 describe("one Agent call, one sweep of the agent directories", () => {
   it("reloads agent files at most once per background spawn", async () => {
-    const agent = bootAgentTool();
+    const agent = await bootAgentTool();
     loads = 0; // activation legitimately loads once; this counts the call only
 
     await agent.execute(
@@ -86,7 +94,7 @@ describe("one Agent call, one sweep of the agent directories", () => {
   });
 
   it("does not scale the sweep with the number of spawns in flight", async () => {
-    const agent = bootAgentTool();
+    const agent = await bootAgentTool();
     loads = 0;
 
     for (let i = 0; i < 5; i++) {

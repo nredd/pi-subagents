@@ -20,8 +20,8 @@ vi.mock("../src/agent-runner.js", async () => {
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
-import { addUsage } from "../src/usage.js";
-import { ctx, flush, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
+import { addUsage, PendingUsagePool } from "../src/usage.js";
+import { ctx, flush, type Hermetic, hermeticDir, makePi, startSession } from "./helpers/boot-extension.js";
 
 /** Drive one foreground run that spends `usage` on a single assistant message. */
 function runSpending(usage: { input: number; output: number; cacheWrite: number; cacheRead?: number; cost?: number }) {
@@ -64,6 +64,7 @@ describe("reporting subagent usage back to the parent session", () => {
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
     registerAgents(new Map());
     hermetic?.restore();
+    vi.restoreAllMocks();
   });
 
   it("attaches a complete pi Usage to the tool result", async () => {
@@ -147,6 +148,31 @@ describe("reporting subagent usage back to the parent session", () => {
     const real = await spawn(tools, "tc-2");
     expect(real.usage.cost.total).toBe(0.0123);
     expect(real.usage.totalTokens).toBe(160);
+  });
+
+  it("reports usage once through the Agent tool re-registered at session_start", async () => {
+    // A second wrapper drains twice. Concurrent background spend arriving
+    // between those drains can overwrite the first wrapper's usage report.
+    const drain = vi.spyOn(PendingUsagePool.prototype, "drain");
+    hermetic = hermeticDir({
+      settings: { reportUsage: true },
+      agentFiles: { rogue: "---\ndescription: ROGUE project only\ntools: read\n---\nRogue.\n" },
+    });
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const activation = tools.get("Agent");
+    await startSession(lifecycle, true);
+    expect(tools.get("Agent")).not.toBe(activation);
+    runSpending({ input: 100, output: 50, cacheWrite: 10, cost: 0.0123 });
+
+    const result = await spawn(tools, "tc-1");
+
+    expect(result.usage.totalTokens).toBe(160);
+    expect(result.usage.cost.total).toBe(0.0123);
+    expect(drain).toHaveBeenCalledTimes(1);
+    runSpendingNothing();
+    expect((await spawn(tools, "tc-2")).usage).toBeUndefined();
+    expect(drain).toHaveBeenCalledTimes(2);
   });
 
   it("attaches nothing when a run produced no usage at all", async () => {

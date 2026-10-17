@@ -15,6 +15,7 @@ import {
   setMaxSubagentDepth,
 } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
+import { resetPackageState, setProjectTrusted } from "../src/package-resources.js";
 
 let cwd: string;
 let manager: NestedAgentManager;
@@ -50,6 +51,7 @@ function tools(
   depth = 1,
   maxSubagentDepth = 2,
   configCwd = cwd,
+  projectTrusted = true,
 ) {
   return createNestedSubagentTools({
     manager,
@@ -59,6 +61,7 @@ function tools(
     maxSubagentDepth,
     allowedSubagents,
     configCwd,
+    projectTrusted,
   });
 }
 
@@ -70,7 +73,7 @@ beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "nested-tools-test-"));
   writeAgent("scout");
   writeAgent("reviewer");
-  registerAgents(loadCustomAgents(cwd));
+  registerAgents(loadCustomAgents(cwd, false, { projectTrusted: true }));
   records = new Map();
   spawn = vi.fn((_pi, _ctx, type, _prompt, options) => {
     const id = `child-${records.size + 1}`;
@@ -138,6 +141,50 @@ describe("child-safe nested Agent tools", () => {
       expect(spawnAndWait).not.toHaveBeenCalled();
     } finally {
       rmSync(workCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("hides project agent files from the nested registry when the parent's project is untrusted", async () => {
+    const [agent] = tools("all", 1, 2, cwd, false);
+    expect(agent.parameters.properties.subagent_type.description).not.toContain("scout");
+
+    const result = await execute(agent, { subagent_type: "scout", description: "scout it", prompt: "Go" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Unknown or disabled");
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+
+  it("offers project agent files when the parent's project is trusted", () => {
+    const [agent] = tools("all", 1, 2, cwd, true);
+    expect(agent.parameters.properties.subagent_type.description).toContain("scout");
+  });
+
+  it("decides on the captured parent trust, not on the session state", async () => {
+    // Session state is process-wide and may say anything; the child's own
+    // decision was made once, by the runner, and travels with its tools.
+    setProjectTrusted(false);
+    try {
+      const [agent] = tools("all", 1, 2, cwd, true);
+      const result = await execute(agent, { subagent_type: "scout", description: "scout it", prompt: "Go" });
+      expect(result.isError).toBe(false);
+    } finally {
+      resetPackageState();
+    }
+  });
+
+  it("hands its config root's trust to the child it spawns, paired with the root", async () => {
+    for (const trusted of [true, false]) {
+      spawnAndWait.mockClear();
+      const [agent] = tools("all", 1, 2, cwd, trusted);
+      // An untrusted root hides `scout`, so use a built-in-free path: spawn only when visible.
+      const result = await execute(agent, { subagent_type: "scout", description: "scout it", prompt: "Go" });
+      if (trusted) {
+        expect(result.isError).toBe(false);
+        expect(spawnAndWait.mock.lastCall![4]).toMatchObject({ configCwd: cwd, configProjectTrusted: true });
+      } else {
+        expect(spawnAndWait).not.toHaveBeenCalled();
+      }
     }
   });
 

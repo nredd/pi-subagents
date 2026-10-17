@@ -1,12 +1,17 @@
 /**
  * strict-agent-files-wiring.test.ts — proves `strictAgentFiles` gates the real
- * extension activation, and that it is a STARTUP decision only.
+ * extension startup, and that it is a STARTUP decision only.
  *
- * The load-bearing pair: activating with the setting on must throw (that is the
- * whole point — pi refuses to start rather than run a substituted agent), while
- * a later reload of the same broken file must not. Agents reload once per
- * `Agent` call, so a strict reload would kill the session on an unrelated spawn
- * long after the bad edit, where the failure looks disconnected from its cause.
+ * Project agent files load at `session_start`, once pi's canonical trust answer
+ * exists, so strict failures surface there, as the host's `ExtensionStartupError`
+ * (which fails the bind before any provider request). A later reload of the same
+ * broken file must not throw: agents reload once per `Agent` call, and a strict
+ * reload would kill the session on an unrelated spawn long after the bad edit.
+ *
+ * MOCK SCOPE: the installed host SDK (1.1.0) has no `ExtensionStartupError`, so
+ * this file models a NEW host by adding a stand-in class to the SDK module. The
+ * old-host refusal is covered, against the real SDK, by
+ * strict-agent-files-old-host.test.ts.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,22 +19,17 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { ctx, makePi, startSession } from "./helpers/boot-extension.js";
 
-function makePi() {
-  const tools = new Map<string, any>();
-  return {
-    registerMessageRenderer: vi.fn(),
-    registerTool: vi.fn((t: any) => tools.set(t.name, t)),
-    registerCommand: vi.fn(),
-    registerEntryRenderer: vi.fn(),
-    registerFlag: vi.fn(),
-    getFlag: vi.fn(),
-    on: vi.fn(),
-    events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
-    appendEntry: vi.fn(),
-    sendMessage: vi.fn(),
-  } as any;
-}
+vi.mock("@earendil-works/pi-coding-agent", async importOriginal => {
+  class ExtensionStartupError extends Error {
+    constructor(message: string, options?: ErrorOptions) {
+      super(message, options);
+      this.name = "ExtensionStartupError";
+    }
+  }
+  return { ...(await importOriginal<object>()), ExtensionStartupError };
+});
 
 const BROKEN = "---\nname: broken\ndescription: Use this: that\n---\n\nBroken.\n";
 
@@ -52,7 +52,7 @@ function writeBrokenAgent(): string {
   return path;
 }
 
-describe("strictAgentFiles gates extension activation", () => {
+describe("strictAgentFiles gates session startup", () => {
   let warn: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -80,18 +80,52 @@ describe("strictAgentFiles gates extension activation", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("aborts activation naming the file when enabled", () => {
+  it("activates, then fails session_start naming the file with the host's startup error", async () => {
     const path = writeBrokenAgent();
     writeSettings({ strictAgentFiles: true });
+    const { pi, lifecycle } = makePi();
 
-    expect(() => subagentsExtension(makePi())).toThrow(path);
+    expect(() => subagentsExtension(pi)).not.toThrow();
+    const failure = await startSession(lifecycle, true).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).toBe("ExtensionStartupError");
+    expect((failure as Error).message).toContain(path);
+    expect(((failure as Error).cause as Error).message).toContain(path);
   });
 
-  it("skips the file and activates when disabled (the default)", () => {
-    writeBrokenAgent();
+  it("stays latched until a bind succeeds, so a retried bind is strict again", async () => {
+    const path = writeBrokenAgent();
+    writeSettings({ strictAgentFiles: true });
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
 
-    expect(() => subagentsExtension(makePi())).not.toThrow();
-    expect(String(warn.mock.calls[0]?.[0])).toContain("Skipping agent file");
+    await expect(startSession(lifecycle, true)).rejects.toThrow(path);
+    await expect(startSession(lifecycle, true)).rejects.toThrow(path);
+    writeFileSync(path, "---\ndescription: Fixed\n---\n\nFixed.\n");
+    await expect(startSession(lifecycle, true)).resolves.toBeUndefined();
+  });
+
+  it("never reads a malformed project file of an untrusted project", async () => {
+    writeBrokenAgent();
+    writeSettings({ strictAgentFiles: true });
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    await expect(startSession(lifecycle, false)).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("Skipping agent file"));
+  });
+
+  it("skips the file and starts when disabled (the default)", async () => {
+    writeBrokenAgent();
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    await expect(startSession(lifecycle, true)).resolves.toBeUndefined();
+    expect(String(warn.mock.calls.find(c => String(c[0]).includes("Skipping agent file"))?.[0])).toContain("Skipping agent file");
   });
 
   it("is a startup decision: a later reload of the same file does not throw", async () => {
@@ -100,28 +134,19 @@ describe("strictAgentFiles gates extension activation", () => {
 
     // Start clean, so the session exists — then break the file underneath it.
     writeFileSync(path, "---\ndescription: Fixed\n---\n\nFixed.\n");
-    const pi = makePi();
-    expect(() => subagentsExtension(pi)).not.toThrow();
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await startSession(lifecycle, true);
     writeFileSync(path, BROKEN);
 
-    const agentTool = (pi.registerTool as any).mock.calls
-      .map((c: any[]) => c[0])
-      .find((t: any) => t.name === "Agent");
+    const agentTool = tools.get("Agent");
     expect(agentTool).toBeDefined();
 
     // The Agent tool reloads the registry per call. That reload must be
     // non-strict: it returns a normal "unknown type" result, not a YAML throw.
-    const uiCtx = {
-      hasUI: false,
-      ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
-      cwd,
-      model: undefined,
-      modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-      sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
-      getSystemPrompt: vi.fn(() => "parent"),
-    } as any;
-
-    const result = await agentTool.execute("call-1", { subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), uiCtx);
+    const result = await agentTool.execute("call-1", { subagent_type: "nope", prompt: "x" }, undefined, vi.fn(), ctx({ cwd }));
     expect(JSON.stringify(result)).not.toContain("Nested mappings");
+    // And so is a later session_start (new / resume / reload-in-place).
+    await expect(startSession(lifecycle, true)).resolves.toBeUndefined();
   });
 });

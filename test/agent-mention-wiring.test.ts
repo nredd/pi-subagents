@@ -28,7 +28,7 @@ vi.mock("../src/mention-clone.js", () => ({ runMentionClone: vi.fn() }));
 import { getDefaultMaxTurns, resumeAgent, runAgent, setDefaultMaxTurns } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { runMentionClone } from "../src/mention-clone.js";
-import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
+import { ctx, flush, type Hermetic, hermeticDir, makePi, startSession, textOf } from "./helpers/boot-extension.js";
 
 let hermetic: Hermetic | undefined;
 /** The most recently booted extension, so teardown runs even when a test throws. */
@@ -213,6 +213,7 @@ describe("messaging a finished agent", () => {
     const b = makePi();
     subagentsExtension(b.pi);
     booted = b.lifecycle;
+    await startSession(b.lifecycle, true); // project agents load at session_start
     finishedRun(fakeSession());
     vi.mocked(resumeAgent).mockResolvedValue({ text: "second answer", failure: undefined } as any);
 
@@ -593,6 +594,30 @@ describe("letting a clone of the conversation start the agent", () => {
         agentTool: tools.get("Agent"),
       }),
     );
+  });
+
+  it("hands the clone the re-registered Agent tool after session_start refreshes it", async () => {
+    // A trusted session_start rebuilds the tool with the project's agent types.
+    // The clone must get that definition, not the activation-time one.
+    hermetic = hermeticDir({
+      settings: { outputTranscript: false },
+      agentFiles: { rogue: "---\ndescription: ROGUE project only\ntools: read\n---\nRogue.\n" },
+    });
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
+    const activation = b.tools.get("Agent");
+    await startSession(b.lifecycle, true);
+    cloneReturns({ spawned: true });
+
+    await send(b.lifecycle, "@rogue go");
+    await flush();
+
+    const refreshed = b.tools.get("Agent");
+    expect(refreshed).not.toBe(activation);
+    expect(refreshed.description).toContain("ROGUE project only");
+    const handed = vi.mocked(runMentionClone).mock.calls[0][0].agentTool;
+    expect(handed).toBe(refreshed);
   });
 
   it("does not block the prompt on the clone's turn", async () => {
@@ -1131,6 +1156,7 @@ describe("resuming an evicted agent by name", () => {
     const b = makePi();
     subagentsExtension(b.pi);
     booted = b.lifecycle;
+    await startSession(b.lifecycle, true); // project agents load at session_start
     finishedRun(fakeSession());
     await evict(await spawnBackground(b.tools, "scout"));
     await flush();
@@ -1162,6 +1188,7 @@ describe("resuming an evicted agent by name", () => {
     const b = makePi();
     subagentsExtension(b.pi);
     booted = b.lifecycle;
+    await startSession(b.lifecycle, true); // project agents load at session_start
     // Spawn while it is still enabled, then disable, mention, re-enable.
     const file = join(process.cwd(), ".pi", "agents", "scout.md");
     writeFileSync(file, "---\ndescription: scouts\n---\nbody");

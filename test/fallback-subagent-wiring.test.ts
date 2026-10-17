@@ -22,6 +22,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import { getAllTypes, getAvailableTypes, NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { startSession } from "./helpers/boot-extension.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -98,15 +99,17 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  function boot() {
+  /** Project agent files load at session_start, once pi reports the project trusted. */
+  async function boot() {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await startSession(lifecycle, true);
     return { pi, tools, lifecycle };
   }
 
   for (const background of [false, true]) {
     it(`refuses an unknown type without spawning (run_in_background: ${background})`, async () => {
-      const { tools } = boot();
+      const { tools } = await boot();
       setFallbackSubagent(NO_FALLBACK);
 
       const result = await tools.get("Agent").execute(
@@ -128,7 +131,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   }
 
   it("still falls back — and says so — when the setting is unset", async () => {
-    const { tools } = boot();
+    const { tools } = await boot();
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false,
     });
@@ -149,7 +152,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   it("carries the fallback note on the background branch too", async () => {
     // Previously the note was computed after spawnAndWait returned, so only a
     // foreground caller ever saw it (#183).
-    const { tools } = boot();
+    const { tools } = await boot();
     vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
 
     const result = await tools.get("Agent").execute(
@@ -168,7 +171,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   });
 
   it("refuses a disabled type, which used to dispatch with a mixed identity", async () => {
-    const { tools } = boot();
+    const { tools } = await boot();
     setFallbackSubagent(NO_FALLBACK);
     // Pin the fixture: without this the test passes identically if retired.md
     // stopped loading, since "unknown" and "disabled" share one message.
@@ -188,7 +191,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   it("never persists a blank type into a scheduled job", async () => {
     // `fellBackFrom` is "" for a blank request, and `??` does not treat "" as
     // nullish — the job would be stored with an empty type and re-fail forever.
-    const { tools, lifecycle } = boot();
+    const { tools, lifecycle } = await boot();
     await lifecycle.get("session_start")({}, ctx());
 
     const result = await tools.get("Agent").execute(
@@ -210,7 +213,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     // resume replays a stored session; the type is required by the schema but
     // unused. Gating it would make a live agent unresumable the moment its type
     // is deleted or disabled — the opposite of what strict dispatch is for.
-    const { tools } = boot();
+    const { tools } = await boot();
     vi.mocked(runAgent).mockResolvedValue({
       // `messages` is not optional on a real AgentSession, and a background
       // resume reads it to anchor transcript streaming.
@@ -238,7 +241,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   it("applies the same contract to cross-extension spawns", async () => {
     // The registry entry is what RPC callers reach; it must not be a way around
     // the setting. A throw here becomes an error envelope at the RPC boundary.
-    boot();
+    await boot();
     setFallbackSubagent(NO_FALLBACK);
     const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
 
