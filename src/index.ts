@@ -46,11 +46,12 @@ import { describeModel, describeVirtualModel, isVirtualModel, type ModelRegistry
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, packageNameForPath, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
+import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, isProjectTrusted, packageNameForPath, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { checkAdmission, describeBlock, mayPark, modelRef, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { hostStartupErrorClass } from "./startup-error.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -357,15 +358,27 @@ export default function (pi: ExtensionAPI) {
   // the initial load, which happens hundreds of lines before settings are applied.
   const bootSettings = loadSettings(process.cwd());
   let strictAgentFiles = bootSettings.strictAgentFiles === true;
+  // Strict agent files fail a bind by throwing the host's `ExtensionStartupError`
+  // from `session_start`. A host without that class would silently degrade to
+  // warnings, so refuse here, before any project agent definition is read.
+  const StartupError = hostStartupErrorClass();
+  if (strictAgentFiles && !StartupError) {
+    throw new Error(
+      "[pi-subagents] strictAgentFiles requires a pi host that exports ExtensionStartupError, which this host lacks. " +
+      "Upgrade pi, or set strictAgentFiles to false.",
+    );
+  }
 
   // Seed the package gates from the same merged settings, before the first load
   // below reads them. `applyAndEmitLoaded` sets them again through the appliers;
   // doing it here as well is what makes the *initial* registry honour them.
   setPackageAgentsGate(bootSettings.packageAgents);
   setPackageWorkflowsGate(bootSettings.packageWorkflows);
-  // And seed project trust from pi's saved decision, because the initial load is
-  // the one the `Agent` tool description is built from — see `seedProjectTrust`.
-  seedProjectTrust(process.cwd());
+  // Project trust is unknown at activation: pi's canonical answer exists only on
+  // `ctx` at `session_start`. Start untrusted, so this load reads global and
+  // globally configured package agents only; `session_start` reloads the
+  // project's and re-registers the `Agent` tool with the result.
+  setProjectTrusted(false);
 
   /** Reload agents from package/global/project agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
@@ -373,9 +386,12 @@ export default function (pi: ExtensionAPI) {
     registerAgents(userAgents);
   };
 
-  // Initial load — the only strict one. A bad edit mid-session must not kill the
-  // session on the next unrelated spawn, so every later reload keeps warning.
+  // Activation load: global and package agents only (project trust is not yet
+  // known). The first canonical load on `session_start` is the strict one; a bad
+  // edit mid-session must not kill the session on the next unrelated spawn, so
+  // every later reload keeps warning.
   reloadCustomAgents(strictAgentFiles);
+  let canonicalAgentsLoaded = false;
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
@@ -808,7 +824,21 @@ export default function (pi: ExtensionAPI) {
     // resumed session all land here, and any of them may follow a `pi install`
     // that added a package the cached root list predates.
     invalidatePackageCache();
-    reloadCustomAgents();
+    // The first load with the canonical trust answer is strict. Latched until it
+    // succeeds, so a retried bind is strict again.
+    const strictLoad = strictAgentFiles && !canonicalAgentsLoaded;
+    try {
+      reloadCustomAgents(strictLoad);
+    } catch (err) {
+      if (strictLoad && StartupError) {
+        throw new StartupError(err instanceof Error ? err.message : String(err), { cause: err });
+      }
+      throw err;
+    }
+    canonicalAgentsLoaded = true;
+    // The type list in the `Agent` description and parameters was built from the
+    // activation load; rebuild it from the canonical one before any provider turn.
+    refreshAgentTool();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1655,7 +1685,7 @@ export default function (pi: ExtensionAPI) {
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
   // small/local models. Per-option details live in the param descriptions.
-  const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
+  const compactAgentToolDescription = () => `Launch an autonomous agent for complex, multi-step tasks. Agent types:
 ${buildCompactTypeListText()}
 
 Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
@@ -1667,7 +1697,7 @@ Notes:
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
-  const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+  const fullAgentToolDescription = () => `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
 Available agent types and the tools they have access to:
 ${buildTypeListText()}
@@ -1731,10 +1761,11 @@ Terse command-style prompts produce shallow, generic work.
   };
 
   const loadCustomToolDescription = (): string | undefined => {
-    for (const path of [
-      join(process.cwd(), ".pi", "agent-tool-description.md"),
-      join(getAgentDir(), "agent-tool-description.md"),
-    ]) {
+    // The project file is project-supplied text for the model: same canonical
+    // trust gate as project agents, or it could carry an untrusted agent list.
+    const candidates = [join(getAgentDir(), "agent-tool-description.md")];
+    if (isProjectTrusted()) candidates.unshift(join(process.cwd(), ".pi", "agent-tool-description.md"));
+    for (const path of candidates) {
       try {
         if (!existsSync(path)) continue;
         const text = readFileSync(path, "utf-8").trim();
@@ -1747,16 +1778,19 @@ Terse command-style prompts produce shallow, generic work.
     return undefined;
   };
 
-  const agentToolDescription = (() => {
-    const mode = getToolDescriptionMode();
-    if (mode === "compact") return compactAgentToolDescription;
-    if (mode === "custom") {
+  // Mode is fixed at activation, as the description always was.
+  const descriptionMode = getToolDescriptionMode();
+  const buildAgentToolDescription = (): string => {
+    if (descriptionMode === "compact") return compactAgentToolDescription();
+    if (descriptionMode === "custom") {
       const custom = loadCustomToolDescription();
       if (custom) return custom;
       console.warn('[pi-subagents] toolDescriptionMode is "custom" but no agent-tool-description.md found — using "full"');
     }
-    return fullAgentToolDescription;
-  })();
+    return fullAgentToolDescription();
+  };
+  const buildSubagentTypeDescription = (): string =>
+    `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`;
 
   // Held rather than registered inline: the mention clone reuses this exact
   // definition, so the agent it starts is an ordinary top-level spawn instead
@@ -1764,7 +1798,7 @@ Terse command-style prompts produce shallow, generic work.
   const agentTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
     label: "Agent",
-    description: agentToolDescription,
+    description: buildAgentToolDescription(),
     promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
@@ -1786,7 +1820,7 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
       subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+        description: buildSubagentTypeDescription(),
       }),
       model: Type.Optional(
         Type.String({
@@ -2480,8 +2514,27 @@ Terse command-style prompts produce shallow, generic work.
 
   // The mention path is handed THIS object, not the bare `agentTool` — see the
   // mention-clone header on why the clone must call the registered tool.
-  const registeredAgentTool = withUsageReporting(agentTool);
+  let registeredAgentTool = withUsageReporting(agentTool);
+  let shownDescription = agentTool.description;
+  let shownTypeDescription = buildSubagentTypeDescription();
   pi.registerTool(registeredAgentTool);
+  /**
+   * Re-register `Agent` with a description and `subagent_type` text rebuilt from
+   * the current registry. Wraps the unwrapped `agentTool` again, never the
+   * previous wrapper, so usage is reported once. A no-op when nothing the model
+   * sees changed. `registeredAgentTool` is what the mention path reads, so it
+   * always points at the current definition.
+   */
+  function refreshAgentTool(): void {
+    const description = buildAgentToolDescription();
+    const typeDescription = buildSubagentTypeDescription();
+    if (description === shownDescription && typeDescription === shownTypeDescription) return;
+    shownDescription = description;
+    shownTypeDescription = typeDescription;
+    const properties = { ...agentTool.parameters.properties, subagent_type: Type.String({ description: typeDescription }) };
+    registeredAgentTool = withUsageReporting({ ...agentTool, description, parameters: { ...agentTool.parameters, properties } });
+    pi.registerTool(registeredAgentTool);
+  }
 
   // ---- Workflow tool ----
 

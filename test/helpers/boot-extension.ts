@@ -104,6 +104,21 @@ export const flush = async () => {
   await new Promise((r) => setImmediate(r));
 };
 
+/**
+ * Fire the extension's `session_start` the way pi does, with pi's canonical
+ * project-trust answer on `ctx.isProjectTrusted()`. Project agents, the project's
+ * `agent-tool-description.md` and the `Agent` tool's advertised types only appear
+ * after this: the activation load is global-only by design.
+ */
+export async function startSession(
+  lifecycle: Map<string, any>,
+  projectTrusted: boolean,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
+  const handler = lifecycle.get("session_start");
+  await handler({ type: "session_start", reason: "startup" }, ctx({ isProjectTrusted: () => projectTrusted, ...overrides }));
+}
+
 export interface Hermetic {
   dir: string;
   restore: () => void;
