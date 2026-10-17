@@ -38,6 +38,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `workflowId` | A forged value would hide an RPC-spawned agent inside someone else's workflow — and take it out of the concurrency pool with it |
 | `depth`, `maxSubagentDepth` | The nesting cap is inherited, not declared |
 | `configCwd` | Config-discovery root; only nested launches may set it |
+| `configProjectTrusted` | Trust decision for `configCwd`; a forged `true` would trust a directory the user never opened. Only nested launches set it, always paired with `configCwd` |
 | `rootSessionId` | Names a transcript directory, so a forged value is a path-traversal primitive |
 | `resumeSessionFile` | Worse: it names a file to **open and replay** as a conversation. Dispatcher only, and only from a path this extension itself recorded |
 | `reclaim` | Bypasses handle allocation, so a forged value would duplicate a live agent's name and make `@handle` ambiguous |

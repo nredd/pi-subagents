@@ -173,6 +173,21 @@ describe("child-safe nested Agent tools", () => {
     }
   });
 
+  it("hands its config root's trust to the child it spawns, paired with the root", async () => {
+    for (const trusted of [true, false]) {
+      spawnAndWait.mockClear();
+      const [agent] = tools("all", 1, 2, cwd, trusted);
+      // An untrusted root hides `scout`, so use a built-in-free path: spawn only when visible.
+      const result = await execute(agent, { subagent_type: "scout", description: "scout it", prompt: "Go" });
+      if (trusted) {
+        expect(result.isError).toBe(false);
+        expect(spawnAndWait.mock.lastCall![4]).toMatchObject({ configCwd: cwd, configProjectTrusted: true });
+      } else {
+        expect(spawnAndWait).not.toHaveBeenCalled();
+      }
+    }
+  });
+
   it("enforces a narrow allowlist", async () => {
     const [limited] = tools(["scout"]);
     const denied = await execute(limited, {

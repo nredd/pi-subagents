@@ -732,6 +732,7 @@ export default function (pi: ExtensionAPI) {
     delete safeOptions.depth;
     delete safeOptions.maxSubagentDepth;
     delete safeOptions.configCwd;
+    delete safeOptions.configProjectTrusted;
     // Also internal: it names a transcript directory, so a forged value would
     // be a path-traversal primitive.
     delete safeOptions.rootSessionId;
