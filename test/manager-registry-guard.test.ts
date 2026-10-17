@@ -149,6 +149,14 @@ describe("the registry spawn strips internal capabilities", () => {
     await root.lifecycle.get("session_shutdown")?.();
   });
 
+  it("refuses a forged config-root trust, which would trust a directory the user never opened", async () => {
+    const { runOpts, root } = forge({ configCwd: "/etc", configProjectTrusted: true });
+
+    expect(runOpts().configCwd).toBeUndefined();
+    expect(runOpts().configProjectTrusted).toBeUndefined();
+    await root.lifecycle.get("session_shutdown")?.();
+  });
+
   it("refuses a forged session file, which would replay someone else's conversation", async () => {
     const { root, runOpts } = forge({ resumeSessionFile: "/home/victim/.pi/agent/sessions/private.jsonl" });
 

@@ -577,6 +577,14 @@ export interface RunOptions {
    * parent's repo, so config resolving inside it is correct.)
    */
   configCwd?: string;
+  /**
+   * Project-trust decision for `configCwd`, inherited from the spawning session.
+   * Honored only alongside an explicit `configCwd`: a nested spawn after a
+   * custom-cwd spawn runs under a child ctx that deliberately reports its own
+   * (execution) cwd as untrusted, so re-deriving from `ctx` would drop the
+   * config root's trust. Never marks the execution cwd trusted.
+   */
+  configProjectTrusted?: boolean;
   /** Called on tool start/end with activity info. */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
@@ -969,7 +977,9 @@ export async function runAgent(
   // defaults to trusted, so without this a subagent in a project the user declined
   // to trust would load its `.pi` extensions and settings, and pi's built-in MCP
   // would start the stdio servers in its `.pi/mcp.json`.
-  const projectTrusted = ctx.isProjectTrusted();
+  const projectTrusted = options.configCwd !== undefined && options.configProjectTrusted !== undefined
+    ? options.configProjectTrusted
+    : ctx.isProjectTrusted();
   const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
   // That trust covers the parent's project (`configCwd`), not a directory a spawn
   // was sent into. The session answers `ctx.isProjectTrusted()` for its own cwd,

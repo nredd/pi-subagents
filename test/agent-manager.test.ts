@@ -1156,6 +1156,28 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     );
   });
 
+  it("forwards inherited config-root trust only together with an explicit configCwd", async () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const run = async (options: Record<string, unknown>) => {
+      vi.mocked(runAgent).mockClear();
+      resolvedRun();
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test", ...options });
+      await manager.getRecord(id)!.promise;
+      return vi.mocked(runAgent).mock.lastCall![3] as { configCwd?: string; configProjectTrusted?: boolean };
+    };
+
+    expect(await run({ cwd: "/", configCwd: "/trusted", configProjectTrusted: true }))
+      .toMatchObject({ configCwd: "/trusted", configProjectTrusted: true });
+    expect(await run({ cwd: "/", configCwd: "/untrusted", configProjectTrusted: false }))
+      .toMatchObject({ configCwd: "/untrusted", configProjectTrusted: false });
+    // No explicit root: the manager derives one from ctx, and the runner derives its trust.
+    const derived = await run({ cwd: "/", configProjectTrusted: true });
+    expect(derived.configCwd).toBe("/tmp");
+    expect(derived.configProjectTrusted).toBeUndefined();
+    expect((await run({ configProjectTrusted: true })).configProjectTrusted).toBeUndefined();
+  });
+
   it("without cwd, configCwd stays unset — existing behavior untouched", async () => {
     // mockClear + lastCall: toHaveBeenCalledWith would scan the file's whole
     // accumulated call history, where earlier no-cwd spawns already match.

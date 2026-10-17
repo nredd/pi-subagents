@@ -91,6 +91,8 @@ interface NestedSpawnOptions {
   parentAgentId: string;
   maxSubagentDepth: number;
   configCwd?: string;
+  /** Trust decision for `configCwd`; always set together with it. */
+  configProjectTrusted?: boolean;
   rootSessionId?: string;
 }
 
@@ -325,6 +327,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: context.maxSubagentDepth,
         configCwd: context.configCwd,
+        configProjectTrusted: context.projectTrusted,
         rootSessionId,
       };
 

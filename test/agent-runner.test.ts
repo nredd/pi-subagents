@@ -292,6 +292,58 @@ describe("agent-runner final output capture", () => {
     expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ projectTrusted: false }));
   });
 
+  describe("config-root trust inherited through nested spawns", () => {
+    async function trustSeen(opts: { configCwd?: string; configProjectTrusted?: boolean }, ctxTrusted: boolean) {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(
+        makeAgentConfig({ extensions: false, allowedSubagents: ["scout"] }),
+      );
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      ctx.isProjectTrusted.mockReturnValue(ctxTrusted);
+      try {
+        await runAgent(ctx, "Explore", "go", {
+          pi,
+          cwd: "/target",
+          ...opts,
+          nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 2, maxSubagentDepth: 4 },
+        });
+      } finally {
+        ctx.isProjectTrusted.mockReturnValue(true);
+      }
+      return {
+        nested: vi.mocked(createNestedSubagentTools).mock.lastCall![0].projectTrusted,
+        settings: settingsManagerCreate.mock.calls.map((c) => (c as unknown[])[2]),
+        sessionTrusted: createAgentSession.mock.calls[0][0].settingsManager.isProjectTrusted?.(),
+      };
+    }
+
+    it("uses the inherited trust for the config root while the session cwd stays untrusted", async () => {
+      // The child's own ctx answers false for its custom cwd; the root's trust rides in options.
+      const seen = await trustSeen({ configCwd: "/project", configProjectTrusted: true }, false);
+      expect(seen.nested).toBe(true);
+      expect(seen.settings).toEqual([{ projectTrusted: true }, { projectTrusted: true }]);
+      expect(seen.sessionTrusted).toBe(false);
+    });
+
+    it("an inherited false beats a trusting ctx", async () => {
+      const seen = await trustSeen({ configCwd: "/project", configProjectTrusted: false }, true);
+      expect(seen.nested).toBe(false);
+      expect(seen.settings).toEqual([{ projectTrusted: false }, { projectTrusted: false }]);
+    });
+
+    it("ignores the inherited trust without its config root", async () => {
+      const seen = await trustSeen({ configProjectTrusted: true }, false);
+      expect(seen.nested).toBe(false);
+    });
+
+    it("falls back to the ctx when no trust was inherited", async () => {
+      expect((await trustSeen({ configCwd: "/project" }, false)).nested).toBe(false);
+      expect((await trustSeen({ configCwd: "/project" }, true)).nested).toBe(true);
+    });
+  });
+
   it("carries the parent's project-trust decision into the child's settings and loader", async () => {
     const { session } = createSession("UNTRUSTED");
     createAgentSession.mockResolvedValue({ session });
