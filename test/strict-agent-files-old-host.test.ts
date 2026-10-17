@@ -33,7 +33,7 @@ describe("strictAgentFiles on a host without ExtensionStartupError", () => {
   });
 
   afterEach(() => {
-    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    Reflect.deleteProperty(globalThis, Symbol.for("pi-subagents:manager"));
     process.chdir(originalCwd);
     if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
