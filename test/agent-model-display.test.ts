@@ -21,12 +21,12 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 import { setModelAliases } from "../src/model-resolver.js";
-import { startSession } from "./helpers/boot-extension.js";
+import { type SessionStartHandler, startSession } from "./helpers/boot-extension.js";
 
 /** Boot the extension and start a session on a trusted project, as pi would. */
 async function agentTool() {
   const tools = new Map<string, any>();
-  const lifecycle = new Map<string, any>();
+  const lifecycle = new Map<string, SessionStartHandler>();
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
@@ -36,7 +36,7 @@ async function agentTool() {
     getFlag: vi.fn(),
     getAllTools: vi.fn(() => [] as any[]),
     setActiveTools: vi.fn(),
-    on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
+    on: vi.fn((event: string, handler: SessionStartHandler) => lifecycle.set(event, handler)),
     events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
