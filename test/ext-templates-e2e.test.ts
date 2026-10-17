@@ -85,7 +85,7 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
     // Load the templates through the REAL loader (project agents come from
     // <cwd>/.pi/agents → FIXTURES_DIR/.pi/agents) and install them in the
     // registry runAgent reads from.
-    registerAgents(loadCustomAgents(FIXTURES_DIR));
+    registerAgents(loadCustomAgents(FIXTURES_DIR, false, { projectTrusted: true }));
   });
 
   afterAll(() => {

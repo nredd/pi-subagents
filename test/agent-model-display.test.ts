@@ -21,9 +21,12 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 import { setModelAliases } from "../src/model-resolver.js";
+import { startSession } from "./helpers/boot-extension.js";
 
-function agentTool() {
+/** Boot the extension and start a session on a trusted project, as pi would. */
+async function agentTool() {
   const tools = new Map<string, any>();
+  const lifecycle = new Map<string, any>();
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
@@ -33,12 +36,14 @@ function agentTool() {
     getFlag: vi.fn(),
     getAllTools: vi.fn(() => [] as any[]),
     setActiveTools: vi.fn(),
-    on: vi.fn(),
+    on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
   subagentsExtension(pi);
+  // Project agent files load at session_start, once trust is known.
+  await startSession(lifecycle, true);
   return tools.get("Agent");
 }
 
@@ -133,7 +138,7 @@ describe("Agent tool result — effective model", () => {
       options.onSessionCreated?.(s);
       return { responseText: "done", session: s, aborted: false, steered: false } as never;
     });
-    const tool = agentTool();
+    const tool = await agentTool();
 
     const result = await tool.execute(
       "tc-1",
@@ -160,7 +165,7 @@ describe("Agent tool result — effective model", () => {
       options.onSessionCreated?.(s);
       return { responseText: "done", session: s, aborted: false, steered: false } as never;
     });
-    const tool = agentTool();
+    const tool = await agentTool();
     const onUpdate = vi.fn();
 
     await tool.execute(
@@ -185,7 +190,7 @@ describe("Agent tool result — effective model", () => {
       options.onSessionCreated?.(s);
       return { responseText: "done", session: s, aborted: false, steered: false } as never;
     });
-    const tool = agentTool();
+    const tool = await agentTool();
 
     const result = await tool.execute(
       "tc-2",
@@ -205,7 +210,7 @@ describe("Agent tool result — effective model", () => {
       options.onSessionCreated?.(s);
       return { responseText: "done", session: s, aborted: false, steered: false } as never;
     });
-    const tool = agentTool();
+    const tool = await agentTool();
 
     const result = await tool.execute(
       "tc-3",
@@ -224,7 +229,7 @@ describe("Agent tool result — effective model", () => {
   // the agent file outranking the parameter.
   it("discloses a level an agent file pinned over the caller's (#182)", async () => {
     pinnedAgent("thinking: low\n");
-    const tool = agentTool();
+    const tool = await agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
 
     const result = await tool.execute(
@@ -242,7 +247,7 @@ describe("Agent tool result — effective model", () => {
     // The frontmatter supplies a portable default. A caller that chose a model
     // for this dispatch must not silently run that default instead.
     pinnedAgent("model: claude-haiku-4-5\n");
-    const tool = agentTool();
+    const tool = await agentTool();
     let dispatchedModel: { provider: string; id: string } | undefined;
     vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
       dispatchedModel = options.model;
@@ -281,7 +286,7 @@ describe("Agent tool result — effective model", () => {
       JSON.stringify({ version: 1, subagents: { modelAliases: { "work-coder": ["corp_anthropic/anthropic::claude-5-sonnet"] } } }),
     );
     chmodSync(manifest, 0o600);
-    const tool = agentTool();
+    const tool = await agentTool();
     let dispatchedModel: { provider: string; id: string } | undefined;
     vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
       dispatchedModel = options.model;
@@ -307,7 +312,7 @@ describe("Agent tool result — effective model", () => {
       options.onSessionCreated?.(s);
       return { responseText: "done", session: s, aborted: false, steered: false } as never;
     });
-    const tool = agentTool();
+    const tool = await agentTool();
 
     const result = await tool.execute(
       "tc-6",
@@ -333,7 +338,7 @@ describe("Agent tool result — resume", () => {
       return { responseText: "first", session: s, aborted: false, steered: false } as never;
     });
     vi.mocked(resumeAgent).mockResolvedValue({ text: "second" } as never);
-    const tool = agentTool();
+    const tool = await agentTool();
     const context = ctx();
 
     const first = await tool.execute(

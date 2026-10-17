@@ -58,6 +58,7 @@ afterEach(() => {
 /** Boot the real extension in a hermetic cwd and hand back its Agent tool. */
 function bootAgentTool() {
   hermetic = hermeticDir({
+    projectTrusted: true,
     agentFiles: {
       alpha: '---\ndescription: "First fixture agent."\n---\n\nAlpha.\n',
       beta: '---\ndescription: "Second fixture agent."\n---\n\nBeta.\n',

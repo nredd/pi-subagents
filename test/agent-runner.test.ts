@@ -274,6 +274,24 @@ describe("agent-runner final output capture", () => {
     }));
   });
 
+  it("hands the parent's project-trust decision to the child's nested tools", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowedSubagents: ["scout"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    ctx.isProjectTrusted.mockReturnValueOnce(false);
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+    });
+
+    expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ projectTrusted: false }));
+  });
+
   it("carries the parent's project-trust decision into the child's settings and loader", async () => {
     const { session } = createSession("UNTRUSTED");
     createAgentSession.mockResolvedValue({ session });
