@@ -123,7 +123,7 @@ describe("project agent trust, wired through the extension", () => {
   it("re-registers Agent only when the model-visible text changed", async () => {
     setup();
     activate();
-    const registered = () => booted.pi.registerTool.mock.calls.filter((c: any[]) => c[0].name === "Agent").length;
+    const registered = () => booted.pi.registerTool.mock.calls.filter((c) => c[0].name === "Agent").length;
     expect(registered()).toBe(1);
 
     await startSession(booted.lifecycle, false);
