@@ -11,10 +11,11 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
-export type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void> | void;
+/** A `pi.on` lifecycle handler as the extension registers them; the map is keyed by event name. */
+export type SessionStartHandler = (event: SessionStartEvent | SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | void;
 
 export interface BootedPi {
   pi: any;

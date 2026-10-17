@@ -10,13 +10,13 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import subagentsExtension from "../src/index.js";
 import { setWorktreeIsolationEnabled } from "../src/worktree.js";
-import { startSession } from "./helpers/boot-extension.js";
+import { type SessionStartHandler, startSession } from "./helpers/boot-extension.js";
 
 const EXAMPLE_TEMPLATE = fileURLToPath(new URL("../examples/agent-tool-description.md", import.meta.url));
 
 function makePi() {
   const tools = new Map<string, any>();
-  const handlers = new Map<string, any>();
+  const handlers = new Map<string, SessionStartHandler>();
 
   return {
     pi: {
@@ -28,7 +28,7 @@ function makePi() {
       registerEntryRenderer: vi.fn(),
       registerFlag: vi.fn(),
       getFlag: vi.fn(),
-      on: vi.fn((event: string, handler: any) => {
+      on: vi.fn((event: string, handler: SessionStartHandler) => {
         handlers.set(event, handler);
       }),
       events: {
@@ -50,7 +50,7 @@ describe("toolDescriptionMode", () => {
   let prevAgentDir: string | undefined;
   let prevHome: string | undefined;
   let shutdown: (() => Promise<void>) | undefined;
-  let handlers: Map<string, any>;
+  let handlers: Map<string, SessionStartHandler>;
 
   function setup(settings?: Record<string, unknown>, beforeInstantiate?: () => void) {
     tmpDir = mkdtempSync(join(tmpdir(), "pi-tooldesc-"));
@@ -74,7 +74,7 @@ describe("toolDescriptionMode", () => {
     handlers = made.handlers;
     subagentsExtension(pi);
     shutdown = async () => {
-      await handlers.get("session_shutdown")?.({}, { hasUI: false, ui: {} } as any);
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, { hasUI: false, ui: {} } as never);
     };
     return tools;
   }
@@ -271,7 +271,7 @@ describe("toolDescriptionMode", () => {
     try {
       expect(customDesc).toBe(second.tools.get("Agent").description);
     } finally {
-      await second.handlers.get("session_shutdown")?.({}, { hasUI: false, ui: {} } as any);
+      await second.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, { hasUI: false, ui: {} } as never);
     }
   });
 
