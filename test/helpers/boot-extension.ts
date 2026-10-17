@@ -14,7 +14,7 @@ import { join } from "node:path";
 import type { ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
-type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void> | void;
+export type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void> | void;
 
 export interface BootedPi {
   pi: any;
