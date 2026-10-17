@@ -286,7 +286,7 @@ describe("agent-runner final output capture", () => {
 
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+      nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
     });
 
     expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ projectTrusted: false }));
@@ -307,7 +307,7 @@ describe("agent-runner final output capture", () => {
           pi,
           cwd: "/target",
           ...opts,
-          nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 2, maxSubagentDepth: 4 },
+          nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 2, maxSubagentDepth: 4 },
         });
       } finally {
         ctx.isProjectTrusted.mockReturnValue(true);
@@ -886,7 +886,16 @@ import {
   getConfig,
   getToolNamesForType,
 } from "../src/agent-types.js";
-import { createNestedSubagentTools } from "../src/nested-tools.js";
+import { createNestedSubagentTools, type NestedAgentManager } from "../src/nested-tools.js";
+
+/** The runner only forwards the manager to the nested tools, which are mocked, so no method is ever called. */
+const unusedManager: NestedAgentManager = {
+  spawn: vi.fn(),
+  awaitStartup: vi.fn(),
+  spawnAndWait: vi.fn(),
+  getRecord: vi.fn(),
+  resume: vi.fn(),
+};
 
 const BUILTINS_7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -1540,7 +1549,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+        nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
       });
 
       const tools = lastToolsPassed();
@@ -1599,7 +1608,7 @@ describe("agent-runner master tool allowlist", () => {
     );
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+      nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
     });
     expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ maxSubagentDepth: 3 }));
   });
