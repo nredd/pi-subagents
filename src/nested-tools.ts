@@ -91,6 +91,8 @@ interface NestedSpawnOptions {
   parentAgentId: string;
   maxSubagentDepth: number;
   configCwd?: string;
+  /** Trust decision for `configCwd`; always set together with it. */
+  configProjectTrusted?: boolean;
   rootSessionId?: string;
 }
 
@@ -127,6 +129,13 @@ export interface NestedToolContext {
   allowedSubagents: "all" | string[];
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
+  /**
+   * The spawning session's project-trust decision for `configCwd`, as the runner
+   * resolved it for the child's own settings. Gates project agent files in the
+   * registry built here; read from the session's state it would answer for the
+   * child's cwd, which is untrusted for a cross-directory spawn.
+   */
+  projectTrusted: boolean;
 }
 
 function textResult(text: string, isError = false) {
@@ -172,7 +181,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd, false, { projectTrusted: context.projectTrusted }));
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined
@@ -318,6 +327,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: context.maxSubagentDepth,
         configCwd: context.configCwd,
+        configProjectTrusted: context.projectTrusted,
         rootSessionId,
       };
 

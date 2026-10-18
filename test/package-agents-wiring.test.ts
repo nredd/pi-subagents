@@ -7,6 +7,10 @@
 // registered at activation, hundreds of lines before any context exists, so the
 // trust answer that decides whether a project's `packages[]` is visible arrives
 // afterwards.
+//
+// MOCK SCOPE: the strict-activation case below needs a host that exports
+// `ExtensionStartupError`; the installed SDK (1.1.0) lacks it, so the SDK module
+// gets a stand-in class here. Nothing else in this file depends on it.
 
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -16,6 +20,16 @@ import subagentsExtension from "../src/index.js";
 import { packageNameForPath, resetPackageState } from "../src/package-resources.js";
 import { listSavedWorkflows, readSavedWorkflow } from "../src/workflow/saved.js";
 import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
+
+vi.mock("@earendil-works/pi-coding-agent", async importOriginal => {
+  class ExtensionStartupError extends Error {
+    constructor(message: string, options?: ErrorOptions) {
+      super(message, options);
+      this.name = "ExtensionStartupError";
+    }
+  }
+  return { ...(await importOriginal<object>()), ExtensionStartupError };
+});
 
 const AGENT = "---\nname: pkg-researcher\ndescription: From a package\ntools: read, grep\n---\nYou research.\n";
 
@@ -193,8 +207,8 @@ describe("package-provided agents, wired through the extension", () => {
       expect(getAllTypes()).not.toContain("pkg-researcher");
     });
 
-    it("does not abort a strict activation over a package file it was told to ignore", async () => {
-      // `strictAgentFiles` makes an unparseable agent file throw at activation,
+    it("does not abort a strict startup over a package file it was told to ignore", async () => {
+      // `strictAgentFiles` makes an unparseable agent file fail startup,
       // by design — a checked-in `.pi/agents/` should fail loudly. A package the
       // user switched off is not theirs to fix, so it must not be read at all.
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -204,7 +218,7 @@ describe("package-provided agents, wired through the extension", () => {
         writeFileSync(join(root, "agents", "broken.md"), "---\nname: [unclosed\n---\nBody.");
         writePiSettings("user", [root]);
 
-        await expect(activate()).resolves.toBeUndefined();
+        await expect(boot(false)).resolves.toBeUndefined();
       } finally {
         warn.mockRestore();
       }
@@ -350,13 +364,14 @@ describe("package-provided agents, wired through the extension", () => {
     });
   });
 
-  // The `Agent` tool's description — the list of types the model is told about —
-  // is built once at activation, before any session context exists. Correcting
-  // project trust on `session_start` is therefore too late for it: the agent
-  // would be dispatchable but never advertised. `seedProjectTrust` reads pi's
-  // saved decision so the common case is right from the first turn.
+  // The `Agent` tool's description -- the list of types the model is told about --
+  // is first built at activation, before any session context exists, from global
+  // and globally configured package agents only. `session_start` carries pi's
+  // canonical trust answer, reloads the project's agents and re-registers `Agent`
+  // before the first provider turn. pi's persisted `trust.json` is NOT consulted:
+  // it can disagree with the canonical answer (`--approve`, trust events).
   describe("a trusted project's package reaches the model, not just the dispatcher", () => {
-    /** A project-scoped package, plus whatever trust state the case needs. */
+    /** A project-scoped package, plus whatever persisted trust the case needs. */
     function setupProjectPackage(opts: { savedTrust?: boolean; defaultTrust?: string } = {}): void {
       const root = join(env.dir, "packages", "project-scoped");
       mkdirSync(join(root, "agents"), { recursive: true });
@@ -369,10 +384,7 @@ describe("package-provided agents, wired through the extension", () => {
 
       const agentDir = process.env.PI_CODING_AGENT_DIR as string;
       if (opts.savedTrust !== undefined) {
-        writeFileSync(
-          join(agentDir, "trust.json"),
-          JSON.stringify({ [realpathSync(env.dir)]: opts.savedTrust }),
-        );
+        writeFileSync(join(agentDir, "trust.json"), JSON.stringify({ [realpathSync(env.dir)]: opts.savedTrust }));
       }
       if (opts.defaultTrust) {
         writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: opts.defaultTrust }));
@@ -381,57 +393,41 @@ describe("package-provided agents, wired through the extension", () => {
 
     const typeList = () => String(booted.tools.get("Agent")?.description ?? "");
 
-    it("advertises it when pi has already saved a trust decision", async () => {
+    it("does not advertise it at activation, before the canonical answer exists", async () => {
       env = hermeticDir();
-      setupProjectPackage({ savedTrust: true });
+      setupProjectPackage({ savedTrust: true, defaultTrust: "always" });
 
-      await boot(true);
-      expect(typeList()).toContain("- pkg-researcher:");
-    });
-
-    it("advertises it under defaultProjectTrust: always, with no saved decision", async () => {
-      env = hermeticDir();
-      setupProjectPackage({ defaultTrust: "always" });
-
-      await boot(true);
-      expect(typeList()).toContain("- pkg-researcher:");
-    });
-
-    it("keeps it out entirely when the saved decision is distrust", async () => {
-      env = hermeticDir();
-      setupProjectPackage({ savedTrust: false });
-
-      await boot(false);
+      await activate();
       expect(getAllTypes()).not.toContain("pkg-researcher");
       expect(typeList()).not.toContain("- pkg-researcher:");
     });
 
-    it("lets an explicit distrust beat a permissive global default", async () => {
-      // `defaultProjectTrust` is only the fallback for a project with no saved
-      // answer. A repo the user explicitly declined stays declined, even on a
-      // machine that trusts everything else by default.
-      env = hermeticDir();
-      setupProjectPackage({ savedTrust: false, defaultTrust: "always" });
-
-      await boot(false);
-      expect(getAllTypes()).not.toContain("pkg-researcher");
-      // The type list is the assertion that bites: a seed that read the global
-      // default over the saved answer would advertise an agent to the model that
-      // dispatch then refuses, which is worse than never advertising it.
-      expect(typeList()).not.toContain("- pkg-researcher:");
-    });
-
-    it("registers but does not yet advertise it on the very first session", async () => {
-      // No saved decision and `defaultProjectTrust: "ask"` — the user answers the
-      // prompt interactively, after the tool description was built. Dispatch
-      // accepts the agent; the type list catches up next session. Pinned because
-      // it is the one case the seed cannot reach, not because it is desirable.
+    it("advertises it once session_start reports the project trusted", async () => {
       env = hermeticDir();
       setupProjectPackage({});
 
       await boot(true);
       expect(getAllTypes()).toContain("pkg-researcher");
+      expect(typeList()).toContain("- pkg-researcher:");
+      expect(JSON.stringify(booted.tools.get("Agent")?.parameters)).toContain("pkg-researcher");
+    });
+
+    it("trusts the canonical answer over a saved distrust (e.g. --approve)", async () => {
+      env = hermeticDir();
+      setupProjectPackage({ savedTrust: false });
+
+      await boot(true);
+      expect(typeList()).toContain("- pkg-researcher:");
+    });
+
+    it("keeps it out when the canonical answer is distrust, despite a saved trust (e.g. --noapprove)", async () => {
+      env = hermeticDir();
+      setupProjectPackage({ savedTrust: true, defaultTrust: "always" });
+
+      await boot(false);
+      expect(getAllTypes()).not.toContain("pkg-researcher");
       expect(typeList()).not.toContain("- pkg-researcher:");
+      expect(JSON.stringify(booted.tools.get("Agent")?.parameters)).not.toContain("pkg-researcher");
     });
   });
 
@@ -441,7 +437,7 @@ describe("package-provided agents, wired through the extension", () => {
     });
     writePiSettings("user", [makePackage()]);
 
-    await boot(false);
+    await boot(true);
     expect(getAgentConfig("pkg-researcher")?.source).toBe("project");
     expect(getAgentConfig("pkg-researcher")?.description).toBe("Mine");
   });

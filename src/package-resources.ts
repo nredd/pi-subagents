@@ -55,7 +55,7 @@
 
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { DefaultPackageManager, getAgentDir, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 /** Resource kinds a package may declare. Agents are `.md`, workflows are `.js`. */
 export type PackageResourceKind = "agents" | "workflows";
@@ -131,9 +131,9 @@ let agentsGate: PackageGate;
 let workflowsGate: PackageGate;
 /**
  * Defaults to `false` — an extension activates before any session context
- * exists, and reading an untrusted project's package list only to take it away
- * again is the wrong direction to fail. `index.ts` corrects it from
- * `ctx.isProjectTrusted()` on `session_start`.
+ * exists, and pi's persisted trust file is not a substitute for its canonical
+ * answer (project trust events and `--approve`/`--noapprove` override it). Only
+ * `ctx.isProjectTrusted()` on `session_start` raises it, via `setProjectTrusted`.
  */
 let projectTrustedState = false;
 
@@ -158,42 +158,6 @@ export function getPackageWorkflowsGate(): PackageGate {
 }
 
 /**
- * Seed the trust state from pi's *saved* decision, before any session exists.
- *
- * The correction on `session_start` is too late for one thing that matters: the
- * `Agent` tool's description — the list of agent types the model is told about —
- * is built once at activation, so an agent registered after it never reaches the
- * model even though dispatch would accept it. That is exactly the shape a team
- * ships agents in: a package named in a committed `.pi/settings.json`, which is
- * invisible until the project is trusted.
- *
- * Pi keeps that decision in `<agentDir>/trust.json`, keyed by canonical path
- * with the nearest ancestor winning, so on the second and every later session in
- * a trusted repo the answer is already on disk. No saved decision falls back to
- * the global `defaultProjectTrust`, which is what pi does; `"ask"` resolves to
- * untrusted here, because the prompt has not been answered yet and guessing yes
- * would be the wrong direction to guess.
- *
- * Best-effort by design: any failure leaves the state untrusted, and
- * `session_start` still delivers pi's real answer either way.
- */
-export function seedProjectTrust(cwd: string): void {
-  try {
-    if (typeof ProjectTrustStore !== "function") return;
-    const agentDir = getAgentDir();
-    const saved = new ProjectTrustStore(agentDir).get(cwd);
-    if (typeof saved === "boolean") {
-      setProjectTrusted(saved);
-      return;
-    }
-    const settings = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
-    setProjectTrusted(settings.getGlobalSettings().defaultProjectTrust === "always");
-  } catch {
-    // Leave it untrusted; session_start corrects it.
-  }
-}
-
-/**
  * Record pi's project-trust answer. Drops the cache when the answer changes,
  * since a project's `packages[]` becomes visible or invisible with it. A repeat
  * of the same answer is a no-op — `session_start` fires on every new, resumed
@@ -203,6 +167,14 @@ export function setProjectTrusted(trusted: boolean): void {
   if (projectTrustedState === trusted) return;
   projectTrustedState = trusted;
   invalidatePackageCache();
+}
+
+/**
+ * Pi's project-trust answer as last recorded, `false` until one is. The loader
+ * for project-supplied agent files reads this, so a missing answer fails closed.
+ */
+export function isProjectTrusted(): boolean {
+  return projectTrustedState;
 }
 
 /** Reset every session-scoped value. Tests only — the extension never un-loads. */

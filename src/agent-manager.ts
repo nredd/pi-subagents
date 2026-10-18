@@ -380,6 +380,8 @@ interface SpawnOptions {
   maxSubagentDepth?: number;
   /** Config-discovery root inherited by nested launches when it differs from the working directory. */
   configCwd?: string;
+  /** Project-trust decision for `configCwd`; only meaningful paired with it, set by nested launches. */
+  configProjectTrusted?: boolean;
   /** Root session id, inherited by nested launches so transcripts stay grouped. */
   rootSessionId?: string;
 }
@@ -900,6 +902,7 @@ export class AgentManager {
       // copy came from, so the prompt can tell the agent not to work there.
       worktreeBase: worktreeCwd ? baseCwd : undefined,
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+      configProjectTrusted: options.configCwd !== undefined ? options.configProjectTrusted : undefined,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;

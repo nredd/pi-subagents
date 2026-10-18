@@ -129,6 +129,11 @@ export interface RunPrintModeOptions {
    * false in live mode (so real auth/config resolve). Restored on `dispose()`.
    */
   isolateGlobals?: boolean;
+  /**
+   * Faux mode: pi's project-trust answer for `cwd`, as the host session reports
+   * it to extensions. Omitted keeps pi's in-memory default (trusted).
+   */
+  projectTrusted?: boolean;
   /** Wall-clock guard for the whole run. Default 30_000ms. */
   timeoutMs?: number;
   /** Abort the parent (and forwarded children) externally. */
@@ -372,7 +377,10 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     // Faux: in-memory, deterministic, no disk.
     settingsManager: live
       ? SettingsManager.create(cwd, agentDir)
-      : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+      : SettingsManager.inMemory(
+          { compaction: { enabled: false }, retry: { enabled: false } },
+          options.projectTrusted === undefined ? undefined : { projectTrusted: options.projectTrusted },
+        ),
   });
   session.setSessionName("print-mode-host");
 
