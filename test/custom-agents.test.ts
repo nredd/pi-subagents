@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
-import { MAX_PACKAGE_RESOURCE_BYTES } from "../src/package-resources.js";
+import { MAX_PACKAGE_RESOURCE_BYTES, resetPackageState, setProjectTrusted } from "../src/package-resources.js";
 import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
@@ -19,6 +19,10 @@ describe("loadCustomAgents", () => {
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.HOME = tmpDir;
     delete process.env.PI_CODING_AGENT_DIR;
+    // These suites exercise project agent files, which load only for a trusted
+    // project. Untrusted behaviour lives in project-agent-trust.test.ts.
+    resetPackageState();
+    setProjectTrusted(true);
   });
 
   afterEach(() => {
@@ -26,6 +30,7 @@ describe("loadCustomAgents", () => {
     else process.env.HOME = originalHome;
     if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    resetPackageState();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -1208,6 +1213,10 @@ describe("package-provided agents", () => {
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.HOME = tmpDir;
     delete process.env.PI_CODING_AGENT_DIR;
+    // These suites exercise project agent files, which load only for a trusted
+    // project. Untrusted behaviour lives in project-agent-trust.test.ts.
+    resetPackageState();
+    setProjectTrusted(true);
   });
 
   afterEach(() => {
@@ -1215,6 +1224,7 @@ describe("package-provided agents", () => {
     else process.env.HOME = originalHome;
     if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    resetPackageState();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { disableInContent, enableInContent } from "../src/agent-file-toggle.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { resetPackageState, setProjectTrusted } from "../src/package-resources.js";
 
 const BOM = "﻿";
 const AGENT = `${BOM}---
@@ -40,6 +41,9 @@ describe("BOM-prefixed agent files", () => {
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.HOME = tmpDir;
     delete process.env.PI_CODING_AGENT_DIR;
+    // Project agent files load only for a trusted project.
+    resetPackageState();
+    setProjectTrusted(true);
   });
 
   afterEach(() => {
@@ -47,6 +51,7 @@ describe("BOM-prefixed agent files", () => {
     else process.env.HOME = originalHome;
     if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    resetPackageState();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

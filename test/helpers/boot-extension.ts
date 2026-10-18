@@ -11,12 +11,16 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
+
+/** A `pi.on` lifecycle handler as the extension registers them; the map is keyed by event name. */
+export type SessionStartHandler = (event: SessionStartEvent | SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | void;
 
 export interface BootedPi {
   pi: any;
   tools: Map<string, any>;
-  lifecycle: Map<string, any>;
+  lifecycle: Map<string, SessionStartHandler>;
   /** Custom entry renderers, by `customType`. */
   entryRenderers: Map<string, any>;
   /** Flags the extension registered, by name. */
@@ -35,7 +39,7 @@ export interface BootedPi {
  */
 export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
   const tools = new Map<string, any>();
-  const lifecycle = new Map<string, any>();
+  const lifecycle = new Map<string, SessionStartHandler>();
   const entryRenderers = new Map<string, any>();
   const registeredFlags = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -50,7 +54,7 @@ export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
     registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)),
     registerFlag: vi.fn((name: string, options: any) => registeredFlags.set(name, options)),
     getFlag: vi.fn((name: string) => flags[name]),
-    on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
+    on: vi.fn((event: string, handler: SessionStartHandler) => lifecycle.set(event, handler)),
     events: {
       emit: vi.fn(),
       on: vi.fn(() => vi.fn()),
@@ -103,6 +107,22 @@ export const flush = async () => {
   await new Promise((r) => setImmediate(r));
   await new Promise((r) => setImmediate(r));
 };
+
+/**
+ * Fire the extension's `session_start` the way pi does, with pi's canonical
+ * project-trust answer on `ctx.isProjectTrusted()`. Project agents, the project's
+ * `agent-tool-description.md` and the `Agent` tool's advertised types only appear
+ * after this: the activation load is global-only by design.
+ */
+export async function startSession(
+  lifecycle: Map<string, SessionStartHandler>,
+  projectTrusted: boolean,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
+  const handler = lifecycle.get("session_start");
+  if (!handler) throw new Error("session_start handler was not registered");
+  await handler({ type: "session_start", reason: "startup" }, ctx({ isProjectTrusted: () => projectTrusted, ...overrides }));
+}
 
 export interface Hermetic {
   dir: string;

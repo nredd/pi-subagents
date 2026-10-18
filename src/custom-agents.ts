@@ -8,6 +8,7 @@ import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import {
   isPackageResourceExcluded,
+  isProjectTrusted,
   MAX_PACKAGE_RESOURCE_BYTES,
   packageAgentDirs,
   packageAgentFiles,
@@ -47,6 +48,13 @@ export interface LoadCustomAgentsOptions {
   packageFiles?: string[];
   /** Explicit `!` exclusion predicate, bypassing discovery. */
   packageExcluded?: Excluder;
+  /**
+   * Whether pi trusts the project at `cwd`. Gates the project roots and, for
+   * discovered packages, the project's `.pi/settings.json`. Omitted falls back to
+   * the session state in package-resources.ts, which is untrusted until pi's
+   * answer is recorded.
+   */
+  projectTrusted?: boolean;
 }
 
 /**
@@ -56,6 +64,13 @@ export interface LoadCustomAgentsOptions {
  *   2. Workspace: <cwd>/.agents/agents/*.md (shared cross-tool .agents workspace, read-only)
  *   3. Global:    $PI_CODING_AGENT_DIR/agents/*.md (default: ~/.pi/agent/agents/*.md)
  *   4. Package:   paths declared by an installed pi package (read-only)
+ *
+ * The two project roots are project-supplied content and load only when pi
+ * trusts the project (`opts.projectTrusted`, else the session state). Untrusted,
+ * they are not even read: they cannot override a global or package agent, and a
+ * malformed file in them neither warns nor, under `strict`, throws. Global agents
+ * and globally configured packages are unaffected; packages configured only by
+ * the project's `.pi/settings.json` are gated by the same decision.
  *
  * Project-level agents override global ones with the same name. On a name clash
  * between the two project locations, .pi/agents wins — .pi stays the project
@@ -83,18 +98,21 @@ export function loadCustomAgents(
   const workspaceProjectDir = join(cwd, ".agents", "agents");
   const projectDir = join(cwd, ".pi", "agents");
 
-  const pkgDirs = opts.packageDirs ?? packageAgentDirs(cwd);
-  const pkgFiles = opts.packageFiles ?? packageAgentFiles(cwd);
+  const projectTrusted = opts.projectTrusted ?? isProjectTrusted();
+  const pkgDirs = opts.packageDirs ?? packageAgentDirs(cwd, { projectTrusted });
+  const pkgFiles = opts.packageFiles ?? packageAgentFiles(cwd, { projectTrusted });
   // `!./agents/wip.md` alongside `./agents` excludes one file out of a directory
   // that is only enumerated here, so the check has to run per file.
-  const excluded: Excluder = opts.packageExcluded ?? (path => isPackageResourceExcluded(path, cwd, "agents"));
+  const excluded: Excluder = opts.packageExcluded ?? (path => isPackageResourceExcluded(path, cwd, "agents", { projectTrusted }));
 
   const agents = new Map<string, AgentConfig>();
   for (const dir of pkgDirs) loadFromDir(dir, agents, "package", strict, excluded); // lowest priority
   for (const file of pkgFiles) loadOneFile(file, agents, "package", strict);
   loadFromDir(globalDir, agents, "global", strict);
-  loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  if (projectTrusted) {
+    loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
+    loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  }
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();

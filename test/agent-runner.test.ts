@@ -274,6 +274,76 @@ describe("agent-runner final output capture", () => {
     }));
   });
 
+  it("hands the parent's project-trust decision to the child's nested tools", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowedSubagents: ["scout"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    ctx.isProjectTrusted.mockReturnValueOnce(false);
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+    });
+
+    expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ projectTrusted: false }));
+  });
+
+  describe("config-root trust inherited through nested spawns", () => {
+    async function trustSeen(opts: { configCwd?: string; configProjectTrusted?: boolean }, ctxTrusted: boolean) {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(
+        makeAgentConfig({ extensions: false, allowedSubagents: ["scout"] }),
+      );
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      ctx.isProjectTrusted.mockReturnValue(ctxTrusted);
+      try {
+        await runAgent(ctx, "Explore", "go", {
+          pi,
+          cwd: "/target",
+          ...opts,
+          nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 2, maxSubagentDepth: 4 },
+        });
+      } finally {
+        ctx.isProjectTrusted.mockReturnValue(true);
+      }
+      return {
+        nested: vi.mocked(createNestedSubagentTools).mock.lastCall![0].projectTrusted,
+        settings: settingsManagerCreate.mock.calls.map((c) => (c as unknown[])[2]),
+        sessionTrusted: createAgentSession.mock.calls[0][0].settingsManager.isProjectTrusted?.(),
+      };
+    }
+
+    it("uses the inherited trust for the config root while the session cwd stays untrusted", async () => {
+      // The child's own ctx answers false for its custom cwd; the root's trust rides in options.
+      const seen = await trustSeen({ configCwd: "/project", configProjectTrusted: true }, false);
+      expect(seen.nested).toBe(true);
+      expect(seen.settings).toEqual([{ projectTrusted: true }, { projectTrusted: true }]);
+      expect(seen.sessionTrusted).toBe(false);
+    });
+
+    it("an inherited false beats a trusting ctx", async () => {
+      const seen = await trustSeen({ configCwd: "/project", configProjectTrusted: false }, true);
+      expect(seen.nested).toBe(false);
+      expect(seen.settings).toEqual([{ projectTrusted: false }, { projectTrusted: false }]);
+    });
+
+    it("ignores the inherited trust without its config root", async () => {
+      const seen = await trustSeen({ configProjectTrusted: true }, false);
+      expect(seen.nested).toBe(false);
+    });
+
+    it("falls back to the ctx when no trust was inherited", async () => {
+      expect((await trustSeen({ configCwd: "/project" }, false)).nested).toBe(false);
+      expect((await trustSeen({ configCwd: "/project" }, true)).nested).toBe(true);
+    });
+  });
+
   it("carries the parent's project-trust decision into the child's settings and loader", async () => {
     const { session } = createSession("UNTRUSTED");
     createAgentSession.mockResolvedValue({ session });
@@ -816,7 +886,16 @@ import {
   getConfig,
   getToolNamesForType,
 } from "../src/agent-types.js";
-import { createNestedSubagentTools } from "../src/nested-tools.js";
+import { createNestedSubagentTools, type NestedAgentManager } from "../src/nested-tools.js";
+
+/** The runner only forwards the manager to the nested tools, which are mocked, so no method is ever called. */
+const unusedManager: NestedAgentManager = {
+  spawn: vi.fn(),
+  awaitStartup: vi.fn(),
+  spawnAndWait: vi.fn(),
+  getRecord: vi.fn(),
+  resume: vi.fn(),
+};
 
 const BUILTINS_7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -1470,7 +1549,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+        nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
       });
 
       const tools = lastToolsPassed();
@@ -1529,7 +1608,7 @@ describe("agent-runner master tool allowlist", () => {
     );
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+      nestedRuntime: { manager: unusedManager, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
     });
     expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ maxSubagentDepth: 3 }));
   });
