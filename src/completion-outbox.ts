@@ -18,6 +18,7 @@
  *   it as soon as the interrupted turn stops.
  */
 
+import { type Clock, realClock, type TimerHandle } from "./clock.js";
 import type { NotificationDetails } from "./types.js";
 
 /** How long an idle parent's notification is held before it is sent. */
@@ -40,13 +41,15 @@ export interface OutboxItem {
 
 export class CompletionOutbox {
   private items: OutboxItem[] = [];
-  private timer: ReturnType<typeof setTimeout> | undefined;
+  private timer: TimerHandle | undefined;
 
   constructor(
     /** Delivers one message as a steer that triggers a turn when the parent is idle. */
     private send: (message: OutboxMessage) => void,
     /** Whether the parent has a run in flight, so a `turn_end` is coming. */
     private parentRunning: () => boolean,
+    /** Shared with the scheduler by hosts that control time in-process. */
+    private clock: Clock = realClock,
   ) {}
 
   /** A newer completion of the same agent (a resume) replaces its pending one. */
@@ -79,14 +82,14 @@ export class CompletionOutbox {
   }
 
   dispose(): void {
-    if (this.timer) clearTimeout(this.timer);
+    this.timer?.cancel();
     this.timer = undefined;
     this.items = [];
   }
 
   /** Not reset by later items: the first completion is never pushed back. */
   private arm(): void {
-    this.timer ??= setTimeout(() => {
+    this.timer ??= this.clock.setTimeout(() => {
       this.timer = undefined;
       this.flush();
     }, NOTIFICATION_HOLD_MS);
@@ -94,7 +97,7 @@ export class CompletionOutbox {
 
   /** Remove held completions for transfer to their session's detached spool. */
   takePending(): OutboxMessage | undefined {
-    if (this.timer) clearTimeout(this.timer);
+    this.timer?.cancel();
     this.timer = undefined;
     const items = this.items;
     this.items = [];

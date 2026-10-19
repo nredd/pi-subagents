@@ -52,6 +52,51 @@ pi -e ./src/index.ts
 
 Requires pi **1.1.0 or newer**: pi 0.86 and 0.87 moved the system prompt and conversation history into the session transcript, and the `@handle` conversation clone and the agent transcript files are built on that model. The `peerDependencies` range declares it, so npm flags an older pi at install time.
 
+### In-process factory and clock
+
+`src/index.ts` exports `createSubagentsExtension(options: SubagentsExtensionOptions = {}): ExtensionFactory`.
+The default export is `createSubagentsExtension()` and keeps native time and timer reference behavior.
+For an in-process host, pass `createSubagentsExtension({ clock })` as an inline extension. No setting or
+process-global clock patch is needed. The same clock object can be shared with session-kit and its
+`now` method with the subscription router:
+
+```ts
+import { createSubagentsExtension, type Clock } from "@tintinweb/pi-subagents/src/index.ts";
+
+// Host-provided clock; use () => clock.now() when passing `now` separately.
+declare const clock: Clock;
+const extension = createSubagentsExtension({ clock });
+```
+
+`SubagentsExtensionOptions` has one optional field, `clock?: Clock`. The exported clock contract matches
+session-kit's scheduling boundary:
+
+```ts
+interface TimerHandle { cancel(): void }
+interface Clock {
+  now(): number;
+  setTimeout(callback: () => void, ms: number): TimerHandle;
+  setInterval(callback: () => void, ms: number): TimerHandle;
+}
+```
+
+Cancellation wraps native `clearTimeout` / `clearInterval`; the supplied clock owns whether its timers
+are referenced or unreferenced. The default clock does not add or remove `unref()` calls. Clock callbacks
+must be deferred, not invoked synchronously by `setTimeout` / `setInterval`.
+
+The clock controls relative schedule parsing, ISO validation, one-shot/interval dispatch, quota
+re-parking, run timestamps and the 200ms idle completion hold. Cron remains owned by Croner, including
+validation and next-run calculation; this seam deliberately leaves its existing behavior untouched.
+`SubagentScheduler` also accepts `{ clock }` directly, and `CompletionOutbox` accepts it as its third
+constructor argument. Static `detectSchedule(s, now?)` and `parseRelativeTime(s, now?)` accept epoch
+milliseconds; omitted `now` uses `Date.now()`.
+
+This is not a whole-extension virtual clock: cron, admission's 100ms RPC timeout, manager retention, group-join
+holds, UI animation, workflow timers, detached-spool filenames and schedule-store lock retries retain
+native time. The fork's Vitest gate is `npm run check`; the clock tests also run with
+`bun test test/injected-clock.test.ts test/extension-clock.test.ts` without real-clock waits. The existing
+outbox suite is not Bun-clean (`toHaveBeenCalledExactlyOnceWith` is unsupported there).
+
 ### Other hosts
 
 This extension is developed and tested against [pi](https://pi.dev).
@@ -1118,6 +1163,7 @@ src/
   abortable.ts        # Race a wait against Esc without cancelling the background child
   model-call.ts       # In-flight model call tracking: thinking / writing / stalled?
   completion-outbox.ts # Deliver completion notifications at the parent's next boundary, coalesced
+  clock.ts            # Injectable scheduler/outbox clock and native cancellable timers
   detached-results.ts # Session-scoped spool and registry for background agents surviving reload/switch
   group-join.ts       # `group` join mode: one notification per turn's batch, with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
