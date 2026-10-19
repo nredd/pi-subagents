@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionFactory, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
 import { Type } from "typebox";
@@ -24,6 +24,7 @@ import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAge
 import { rowDescription, sourceIndicator, sourceLegend } from "./agent-source-badge.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import type { Clock } from "./clock.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -314,7 +315,21 @@ export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryDat
 /** Statuses the Agent row has a rendering for. */
 const AGENT_ROW_STATUSES = new Set(["running", "background", "completed", "steered", "aborted", "stopped", "error"]);
 
-export default function (pi: ExtensionAPI) {
+export type { Clock, TimerHandle } from "./clock.js";
+
+/** Optional host dependencies, shared by the scheduler and completion delivery. */
+export interface SubagentsExtensionOptions {
+  clock?: Clock;
+}
+
+/** Create the extension with an optional host-owned clock; the default export uses native time. */
+export function createSubagentsExtension(options: SubagentsExtensionOptions = {}): ExtensionFactory {
+  return pi => activateSubagents(pi, options);
+}
+
+export default createSubagentsExtension();
+
+function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
@@ -448,6 +463,7 @@ export default function (pi: ExtensionAPI) {
       details: message.details,
     }, { deliverAs: "steer", triggerTurn: true }),
     () => currentCtx?.signal !== undefined,
+    options.clock,
   );
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
@@ -795,7 +811,7 @@ export default function (pi: ExtensionAPI) {
   // Session-scoped: store is constructed inside session_start once sessionId
   // is available. Mirrors pi-chonky-tasks's session-scoped task store —
   // schedules reset on /new, restore on /resume.
-  const scheduler = new SubagentScheduler();
+  const scheduler = new SubagentScheduler({ clock: options.clock });
 
   function startScheduler(ctx: ExtensionContext) {
     try {

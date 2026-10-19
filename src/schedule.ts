@@ -22,6 +22,7 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { type Clock, realClock, type TimerHandle } from "./clock.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkAdmission, describeBlock, mayPark, modelRef, PARKED_RESUME_DELAY_MS, QUOTA_RESTART_GRACE_MS } from "./quota-admission.js";
 import type { ScheduleStore } from "./schedule-store.js";
@@ -51,13 +52,23 @@ export interface NewJobInput {
   quotaParked?: boolean;
 }
 
+/** Optional in-process scheduling dependencies; omitted clock uses native time. */
+export interface SubagentSchedulerOptions {
+  clock?: Clock;
+}
+
 export class SubagentScheduler {
+  private readonly clock: Clock;
   private jobs = new Map<string, Cron>();
-  private intervals = new Map<string, NodeJS.Timeout>();
+  private intervals = new Map<string, TimerHandle>();
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
   private ctx: ExtensionContext | undefined;
   private manager: AgentManager | undefined;
+
+  constructor(options: SubagentSchedulerOptions = {}) {
+    this.clock = options.clock ?? realClock;
+  }
 
   /** Start the scheduler: bind to a session's store and arm enabled jobs. */
   start(pi: ExtensionAPI, ctx: ExtensionContext, manager: AgentManager, store: ScheduleStore): void {
@@ -75,7 +86,7 @@ export class SubagentScheduler {
   stop(): void {
     for (const cron of this.jobs.values()) cron.stop();
     this.jobs.clear();
-    for (const t of this.intervals.values()) clearTimeout(t);
+    for (const t of this.intervals.values()) t.cancel();
     this.intervals.clear();
     this.store = undefined;
     this.pi = undefined;
@@ -97,7 +108,7 @@ export class SubagentScheduler {
    * format and tags `scheduleType`. Throws on invalid input.
    */
   buildJob(input: NewJobInput): ScheduledSubagent {
-    const detected = SubagentScheduler.detectSchedule(input.schedule);
+    const detected = SubagentScheduler.detectSchedule(input.schedule, this.clock.now());
     return {
       id: nanoid(10),
       name: input.name,
@@ -114,7 +125,7 @@ export class SubagentScheduler {
       isolation: input.isolation,
       quotaParked: input.quotaParked,
       enabled: true,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(this.clock.now()).toISOString(),
       runCount: 0,
     };
   }
@@ -163,7 +174,7 @@ export class SubagentScheduler {
       // Before the first fire there's no `lastRun`, so fall back to "now" —
       // accurate at create time (setInterval was just armed) and within
       // intervalMs of correct in any pre-first-fire view.
-      const base = job.lastRun ? new Date(job.lastRun).getTime() : Date.now();
+      const base = job.lastRun ? new Date(job.lastRun).getTime() : this.clock.now();
       return new Date(base + job.intervalMs).toISOString();
     }
     return undefined;
@@ -176,16 +187,16 @@ export class SubagentScheduler {
     if (!store) return;
     try {
       if (job.scheduleType === "interval" && job.intervalMs) {
-        const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
+        const t = this.clock.setInterval(() => this.executeJob(job.id), job.intervalMs);
         this.intervals.set(job.id, t);
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
-        let delay = target - Date.now();
+        let delay = target - this.clock.now();
         // A quota-parked job whose reset passed while pi was closed still owes a
         // dispatch: re-admit it shortly after start instead of erroring it.
         if (delay <= 0 && job.quotaParked) delay = PARKED_RESUME_DELAY_MS;
         if (delay > 0) {
-          const t = setTimeout(() => {
+          const t = this.clock.setTimeout(() => {
             this.executeJob(job.id);
             // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
             store.update(job.id, { enabled: false });
@@ -215,8 +226,7 @@ export class SubagentScheduler {
     }
     const t = this.intervals.get(id);
     if (t) {
-      clearTimeout(t);
-      clearInterval(t);
+      t.cancel();
       this.intervals.delete(id);
     }
   }
@@ -253,13 +263,13 @@ export class SubagentScheduler {
       void checkAdmission(pi.events, modelRef(admissionModel)).then(block => {
         if (!block) {
           this.spawnJob(id, resolvedModel);
-        } else if (mayPark(block) && block.resetAt > Date.now()) {
+        } else if (mayPark(block) && block.resetAt > this.clock.now()) {
           this.repark(id, block.resetAt);
         } else {
           // Refused and it cannot wait (`wait: false`, no reset, or a reset
           // already past): only an explicit admission may spawn, so persist the
           // failure instead of starting on an exhausted provider.
-          this.store?.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+          this.store?.update(id, { lastRun: new Date(this.clock.now()).toISOString(), lastStatus: "error" });
           this.emit({ type: "error", jobId: id, error: `${describeBlock(block)} The agent was not started.` });
         }
       });
@@ -324,7 +334,7 @@ export class SubagentScheduler {
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      store.update(id, { lastRun: new Date(this.clock.now()).toISOString(), lastStatus: "error" });
       this.emit({ type: "error", jobId: id, error });
       return;
     }
@@ -335,7 +345,7 @@ export class SubagentScheduler {
       const next = this.getNextRun(id);
       const current = store.get(id);
       store.update(id, {
-        lastRun: new Date().toISOString(),
+        lastRun: new Date(this.clock.now()).toISOString(),
         lastStatus: status,
         runCount: (current?.runCount ?? 0) + 1,
         nextRun: next,
@@ -373,10 +383,10 @@ export class SubagentScheduler {
    * Order matters: relative ("+10m") and interval ("5m") both match digit+unit;
    * relative requires the leading "+" to disambiguate.
    */
-  static detectSchedule(s: string): { type: "cron" | "once" | "interval"; intervalMs?: number; normalized: string } {
+  static detectSchedule(s: string, now = Date.now()): { type: "cron" | "once" | "interval"; intervalMs?: number; normalized: string } {
     const trimmed = s.trim();
     // "+10m" — relative one-shot
-    const rel = SubagentScheduler.parseRelativeTime(trimmed);
+    const rel = SubagentScheduler.parseRelativeTime(trimmed, now);
     if (rel !== null) return { type: "once", normalized: rel };
     // "5m" — interval
     const ivl = SubagentScheduler.parseInterval(trimmed);
@@ -387,7 +397,7 @@ export class SubagentScheduler {
     if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
       const d = new Date(trimmed);
       if (!Number.isNaN(d.getTime())) {
-        if (d.getTime() <= Date.now()) {
+        if (d.getTime() <= now) {
           throw new Error(`Scheduled time ${d.toISOString()} is in the past.`);
         }
         return { type: "once", normalized: d.toISOString() };
@@ -420,11 +430,11 @@ export class SubagentScheduler {
   }
 
   /** "+10s"/"+5m"/"+1h"/"+2d" → ISO timestamp. */
-  static parseRelativeTime(s: string): string | null {
+  static parseRelativeTime(s: string, now = Date.now()): string | null {
     const m = s.match(/^\+(\d+)(s|m|h|d)$/);
     if (!m) return null;
     const ms = parseInt(m[1], 10) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
-    return new Date(Date.now() + ms).toISOString();
+    return new Date(now + ms).toISOString();
   }
 
   /** "10s"/"5m"/"1h"/"2d" → milliseconds. */
