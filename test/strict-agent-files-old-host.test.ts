@@ -1,6 +1,6 @@
 /**
- * strict-agent-files-old-host.test.ts — against the REAL installed host SDK,
- * which predates `ExtensionStartupError`: strictAgentFiles must refuse at
+ * strict-agent-files-old-host.test.ts — simulate a host SDK that predates
+ * `ExtensionStartupError`: strictAgentFiles must refuse at
  * activation, clearly, before any project file is read, rather than silently
  * degrade to warnings. Non-strict activation stays fully supported.
  */
@@ -13,6 +13,13 @@ import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 import { hostStartupErrorClass } from "../src/startup-error.js";
 import { makePi, startSession } from "./helpers/boot-extension.js";
+
+// The suite now runs on the fork host; remove only the optional export to keep
+// the old-host compatibility contract independent of the installed SDK version.
+vi.mock("@earendil-works/pi-coding-agent", async () => {
+  const sdk = await vi.importActual<typeof hostSdk>("@earendil-works/pi-coding-agent");
+  return { ...sdk, ExtensionStartupError: undefined };
+});
 
 let cwd: string;
 let originalCwd: string;
@@ -43,7 +50,7 @@ describe("strictAgentFiles on a host without ExtensionStartupError", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("is really an old host: the SDK exports no startup error", () => {
+  it("simulates an old host: the SDK exports no startup error", () => {
     expect(Reflect.get(hostSdk, "ExtensionStartupError")).toBeUndefined();
     expect(hostStartupErrorClass()).toBeUndefined();
   });

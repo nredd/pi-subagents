@@ -24,7 +24,7 @@ import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAge
 import { rowDescription, sourceIndicator, sourceLegend } from "./agent-source-badge.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
-import type { Clock } from "./clock.js";
+import { type Clock, realClock } from "./clock.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -110,7 +110,7 @@ function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
  * Create an AgentActivity state and spawn callbacks for tracking tool usage.
  * Used by both foreground and background paths to avoid duplication.
  */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
+function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void, clock: Clock = realClock) {
   const state: AgentActivity = {
     activeTools: new Map(),
     toolUses: 0,
@@ -141,7 +141,7 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       onStreamUpdate?.();
     },
     onModelCall: (event: ModelCallEvent) => {
-      state.modelCall = applyModelCallEvent(state.modelCall, event, Date.now());
+      state.modelCall = applyModelCallEvent(state.modelCall, event, clock.now());
       onStreamUpdate?.();
     },
     onSessionCreated: (session: any) => {
@@ -330,6 +330,7 @@ export function createSubagentsExtension(options: SubagentsExtensionOptions = {}
 export default createSubagentsExtension();
 
 function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions) {
+  const clock = options.clock ?? realClock;
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
@@ -724,7 +725,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
   }, (record, message) => {
     if (!isTopLevelAgent(record)) return;
     pi.events.emit("subagents:steered", { id: record.id, message });
-  });
+  }, clock);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -767,7 +768,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
     // built with `undefined` renders `↻3` where the Agent tool renders `↻3≤20`.
     // Like the tool's own, it is a prediction — editing the agent file mid-run
     // leaves the displayed ceiling stale.
-    const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
+    const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns), undefined, clock);
     // Repaints are left to the manager's `onStart` callback, which already starts
     // the widget/fleet timers for agents that enter this way.
     const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
@@ -928,7 +929,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
-            markConsumed(record);
+            markConsumed(record, clock.now());
             outbox.cancel(record.id);
             return true;
           },
@@ -1303,7 +1304,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled, clock);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   /**
@@ -1396,7 +1397,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
     getFullscreenScrollbar, backgroundActionFor, isShowModelEnabled,
     // Agents the previous instance of this session left running (/reload, /new, ...).
-    () => listRunningDetached(currentCtx?.sessionManager?.getSessionFile?.()));
+    () => listRunningDetached(currentCtx?.sessionManager?.getSessionFile?.()), clock);
   /** What the Agent tool row reads at render time, so its summary stays live. */
   const agentRowLive: AgentRowLive = {
     getRecord: (id) => manager.getRecord(id),
@@ -1575,7 +1576,7 @@ function activateSubagents(pi: ExtensionAPI, options: SubagentsExtensionOptions)
     // this index, so it is written exactly once.
     const transcriptAnchor = existing.session?.messages.length ?? 0;
 
-    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(normalizeMaxTurns(opts.maxTurns));
+    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(normalizeMaxTurns(opts.maxTurns), undefined, clock);
     // resumeAgent has no onSessionCreated — the session predates this run —
     // so seed it directly, or the widget shows no context % for the agent.
     bgState.session = existing.session;
@@ -1982,8 +1983,8 @@ Terse command-style prompts produce shallow, generic work.
       // its own — raw text beats guessing at one.
       if (!AGENT_ROW_STATUSES.has(details.status)) return new Text(text, 0, 0);
 
-      keepRowTicking(renderContext, details, agentRowLive);
-      return new AgentResultView(details, text, expanded, agentRowLive, theme);
+      keepRowTicking(renderContext, details, agentRowLive, clock);
+      return new AgentResultView(details, text, expanded, agentRowLive, theme, clock);
     },
 
     // ---- Execute ----
@@ -2244,7 +2245,7 @@ Terse command-style prompts produce shallow, generic work.
         // Tracked like a foreground spawn, so the widget row and the result
         // card show THIS run's `↻N≤M` and tool activity rather than the
         // previous run's. The session predates this run, so it is seeded here.
-        const { state: resumeState, callbacks: resumeCallbacks } = createActivityTracker(normalizeMaxTurns(resumeMaxTurns));
+        const { state: resumeState, callbacks: resumeCallbacks } = createActivityTracker(normalizeMaxTurns(resumeMaxTurns), undefined, clock);
         resumeState.session = existing.session;
         agentActivity.set(existing.id, resumeState);
         widget.markRunning(existing.id);
@@ -2305,7 +2306,7 @@ Terse command-style prompts produce shallow, generic work.
       // exhaustion policy says fail now (`wait: false`). Anything else fails
       // now, with the reset, rather than starting on an exhausted provider.
       const dispatchModel = model ?? ctx.model;
-      const quotaBlock = dispatchModel ? await checkAdmission(pi.events, modelRef(dispatchModel)) : undefined;
+      const quotaBlock = dispatchModel ? await checkAdmission(pi.events, modelRef(dispatchModel), undefined, clock) : undefined;
       if (quotaBlock) {
         // A parked job is a scheduled job, which has no `cwd` to carry.
         const canPark = runInBackground && !inheritContext && cwd === undefined && mayPark(quotaBlock)
@@ -2334,7 +2335,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Background execution
       if (runInBackground) {
-        const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
+        const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns, undefined, clock);
 
         // Wrap onSessionCreated to wire output file streaming.
         // The callback lazily reads record.outputFile (set right after spawn)
@@ -2453,7 +2454,7 @@ Terse command-style prompts produce shallow, generic work.
         });
       };
 
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
+      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate, clock);
 
       // Wire session creation: register in widget + stream to output file.
       // The output file path is set synchronously after spawn (below),
@@ -2488,7 +2489,7 @@ Terse command-style prompts produce shallow, generic work.
       };
 
       // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
-      const spinnerInterval = setInterval(() => {
+      const spinnerInterval = clock.setInterval(() => {
         spinnerFrame++;
         streamUpdate();
       }, 80);
@@ -2547,7 +2548,7 @@ Terse command-style prompts produce shallow, generic work.
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
-        clearInterval(spinnerInterval);
+        spinnerInterval.cancel();
         if (handoffId !== undefined) foregroundHandoffs.delete(handoffId);
         // A handed-off run is still working: its row stays, and the
         // background settle in `onComplete` tears it down when it really ends.
@@ -2811,7 +2812,7 @@ Terse command-style prompts produce shallow, generic work.
       if (renderContext.isError || !task) return new Text(text, 0, 0);
       // The card reads the live task; a background run settles its tool call
       // while still going, so redraw until it stops.
-      keepTicking(renderContext, () => task.status === "running" || task.status === "paused");
+      keepTicking(renderContext, () => task.status === "running" || task.status === "paused", clock);
       return renderWorkflowCard(
         {
           progress: task.workflowProgress,
@@ -3106,16 +3107,13 @@ Terse command-style prompts produce shallow, generic work.
       // them), so poll until they leave the queue, then await like a running one.
       if (params.wait && (record.status === "running" || record.status === "queued")) {
         while (record.status === "queued") {
-          await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
-            signal,
-          );
+          await abortable(record.startGate ?? new Promise<void>((resolve) => clock.setTimeout(resolve, QUEUE_WAIT_POLL_MS)), signal);
         }
         if (record.promise) await abortable(record.promise, signal);
       }
 
       const displayName = getDisplayName(record.type);
-      const duration = formatDuration(record.startedAt, record.completedAt);
+      const duration = formatDuration(record.startedAt, record.completedAt, clock.now());
       const tokens = formatLifetimeTokens(record);
       const contextPercent = getSessionContextPercent(record.session);
       const statsParts = [`Tool uses: ${record.toolUses}`];
@@ -3143,7 +3141,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
-        markConsumed(record);
+        markConsumed(record, clock.now());
         outbox.cancel(record.id);
       }
 
@@ -3390,7 +3388,7 @@ Terse command-style prompts produce shallow, generic work.
     // string match would open whichever came first.
     const record = await selectItem(ctx.ui, "Running agents", agents, a => {
       const dn = getDisplayName(a.type);
-      const dur = formatDuration(a.startedAt, a.completedAt);
+      const dur = formatDuration(a.startedAt, a.completedAt, clock.now());
       return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
     });
     if (!record) return;
@@ -3418,7 +3416,7 @@ Terse command-style prompts produce shallow, generic work.
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
         }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx), getFullscreenScrollbar(),
-        backgroundActionFor(record, message => ctx.ui.notify(message, "info")));
+        backgroundActionFor(record, message => ctx.ui.notify(message, "info")), clock);
       },
       {
         overlay: true,

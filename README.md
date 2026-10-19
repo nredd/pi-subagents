@@ -72,7 +72,7 @@ const extension = createSubagentsExtension({ clock });
 session-kit's scheduling boundary:
 
 ```ts
-interface TimerHandle { cancel(): void }
+interface TimerHandle { cancel(): void; unref?(): void }
 interface Clock {
   now(): number;
   setTimeout(callback: () => void, ms: number): TimerHandle;
@@ -85,17 +85,26 @@ are referenced or unreferenced. The default clock does not add or remove `unref(
 must be deferred, not invoked synchronously by `setTimeout` / `setInterval`.
 
 The clock controls relative schedule parsing, ISO validation, one-shot/interval dispatch, quota
-re-parking, run timestamps and the 200ms idle completion hold. Cron remains owned by Croner, including
+re-parking, the Agent admission timeout, manager retention and lifecycle timestamps, model-call
+activity/stall ages, UI repaint tickers and the 200ms idle completion hold. Cron remains owned by Croner, including
 validation and next-run calculation; this seam deliberately leaves its existing behavior untouched.
 `SubagentScheduler` also accepts `{ clock }` directly, and `CompletionOutbox` accepts it as its third
 constructor argument. Static `detectSchedule(s, now?)` and `parseRelativeTime(s, now?)` accept epoch
 milliseconds; omitted `now` uses `Date.now()`.
 
-This is not a whole-extension virtual clock: cron, admission's 100ms RPC timeout, manager retention, group-join
-holds, UI animation, workflow timers, detached-spool filenames and schedule-store lock retries retain
-native time. The fork's Vitest gate is `npm run check`; the clock tests also run with
-`bun test test/injected-clock.test.ts test/extension-clock.test.ts` without real-clock waits. The existing
-outbox suite is not Bun-clean (`toHaveBeenCalledExactlyOnceWith` is unsupported there).
+This is not a whole-extension virtual clock: cron, scheduled re-admission's RPC timeout, group-join
+holds, workflow execution timers, child-shutdown watchdogs, detached-spool filenames, core scrollbar
+auto-hide and schedule-store lock retries retain native time. Queued result waits use the manager's
+start gate when present; legacy queued resumes retain the clock-driven fallback.
+
+`npm run check` runs Biome, TypeScript, the full Vitest suite and `test:bun`. The four session scenario
+files (`test/{session-scenarios,fleet-session,viewer-session,worktree-isolation-e2e}.test.ts`) run under
+both Vitest and Bun 1.3.14 on core `v1.3.0-nredd.6` release tarballs. They use exported `createHarness`
+and `createInteractiveHarness`/`VirtualTerminal`, real child sessions and git, one injected extension
+clock, promise-held tools/streams and raw SGR mouse input. Homes, settings and provider credentials
+are fixtures; no installed pi, tmux or real-clock sleeps are needed. Existing old-host strict-mode
+coverage explicitly removes the optional SDK export; the shared faux runtime uses the host's real
+`withBeforeProviderRequest` facade. The full older suite remains Vitest-only.
 
 ### Other hosts
 
@@ -1087,7 +1096,7 @@ The worktree is made from the repo containing the agent's working directory, whi
 Agent({ subagent_type: "general-purpose", prompt: "...", isolation: "worktree", cwd: "~/code/other-repo/pkg" })
 ```
 
-The agent works at the same subdirectory inside the copy (`pkg/` here), and the result names the branch and that repo's toplevel to merge in. The `cwd` gets the same treatment as the [RPC `cwd` option](#cross-extension-rpc): `.pi` config still loads from the session's project.
+The agent works at the same subdirectory inside the copy (`pkg/` here), and the result names the branch and that repo's toplevel to merge in. `~/` expansion honors `HOME` (`USERPROFILE` on Windows), including on Bun; it falls back to the OS home when unset. The `cwd` gets the same treatment as the [RPC `cwd` option](#cross-extension-rpc): `.pi` config still loads from the session's project.
 
 If the worktree cannot be created, the `Agent` call fails with an error naming the directory it tried and the cause (not a git repo, no commits yet, a git timeout, or `git worktree add`'s stderr) instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
 
@@ -1155,7 +1164,8 @@ docs/                 # Long-form guides (shipped to npm; README links out to th
 examples/
   workflows/          # Runnable examples, executed by test/workflow-examples.test.ts
   agent-tool-description.md
-test/                 # vitest suite; e2e/ and perf/ subdirectories
+test/                 # Full Vitest suite; four session scenario files also run under Bun
+  helpers/scenario-session.ts # Exported core host, child/provider barriers and isolated homes
 src/
   index.ts            # Extension entry: tool/command registration, /agents menu, rendering
   types.ts            # Type definitions (AgentConfig, AgentRecord, etc.)
@@ -1177,7 +1187,7 @@ src/
   abortable.ts        # Race a wait against Esc without cancelling the background child
   model-call.ts       # In-flight model call tracking: thinking / writing / stalled?
   completion-outbox.ts # Deliver completion notifications at the parent's next boundary, coalesced
-  clock.ts            # Injectable scheduler/outbox clock and native cancellable timers
+  clock.ts            # Shared scheduler/outbox/admission/retention/UI clock and native timers
   detached-results.ts # Session-scoped spool and registry for background agents surviving reload/switch
   group-join.ts       # `group` join mode: one notification per turn's batch, with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes

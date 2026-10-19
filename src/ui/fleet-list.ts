@@ -14,6 +14,7 @@
 import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { type Clock, realClock, type TimerHandle } from "../clock.js";
 import type { RunningDetached } from "../detached-results.js";
 import { describeModelCall } from "../model-call.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -105,7 +106,7 @@ export class FleetList {
   private widgetRegistered = false;
   /** The registered widget component, so a late `dispose()` of a replaced one is ignored. */
   private component: object | undefined;
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private timer: TimerHandle | undefined;
 
   private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
@@ -167,6 +168,7 @@ export class FleetList {
      * stopped and steered through the orphan's manager. Omitted -> none.
      */
     private detachedSource: () => readonly RunningDetached[] = () => [],
+    private readonly clock: Clock = realClock,
   ) {}
 
   // ---- Lifecycle ----
@@ -191,7 +193,7 @@ export class FleetList {
 
   /** Ensure the re-render timer is running (called when an agent spawns). */
   ensureTimer(): void {
-    if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
+    if (!this.timer) this.timer = this.clock.setInterval(() => this.update(), TICK_MS);
   }
 
   /**
@@ -203,7 +205,7 @@ export class FleetList {
   }
 
   dispose(): void {
-    if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+    if (this.timer) { this.timer.cancel(); this.timer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
     if (this.viewerClose) { this.viewerClose(); this.viewerClose = undefined; }
@@ -240,7 +242,7 @@ export class FleetList {
       // event, which a slow first response delays by minutes. Keep ticking while
       // one is starting so its row appears as soon as the session exists.
       if (this.enabled && this.hasStartingAgent()) this.ensureTimer();
-      else if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      else if (this.timer) { this.timer.cancel(); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;
@@ -292,7 +294,7 @@ export class FleetList {
    * (`listAgents()` is newest-first, so we re-sort.)
    */
   private agentRecords(): AgentRecord[] {
-    const now = Date.now();
+    const now = this.clock.now();
     // Orphans are live objects, so a settled one is simply skipped; the
     // registry drops it itself. Own records win if an id appears in both.
     const own = this.manager.listAgents();
@@ -334,7 +336,7 @@ export class FleetList {
   /** Live runs, plus recently settled ones — the same linger the agents get. */
   private workflows(): FleetWorkflow[] {
     if (!this.workflowSource) return [];
-    const now = Date.now();
+    const now = this.clock.now();
     return [...this.workflowSource()]
       .filter(run =>
         run.status === "running"
@@ -494,6 +496,7 @@ export class FleetList {
           this.onViewerMarkdown,
           this.scrollbarMode(),
           this.backgroundAction?.(record, message => this.ui?.notify(message, "info")),
+          this.clock,
         );
       },
       {
@@ -584,7 +587,7 @@ export class FleetList {
     const name = selected ? theme.fg("text", workflow.name) : workflow.name;
     const left = `  ${this.bullet(rosterIndex, sel, theme)} ${kind}  ${name}`;
     // Frozen once the run settles, exactly as an agent's clock is.
-    const elapsed = (workflow.completedAt ?? Date.now()) - workflow.startedAt;
+    const elapsed = (workflow.completedAt ?? this.clock.now()) - workflow.startedAt;
     const agents = `${workflow.doneCount}/${workflow.totalCount} agent${workflow.totalCount === 1 ? "" : "s"}`;
     const stats = `${agents} · ${formatFleetElapsed(elapsed)} · ${formatFleetTokens(workflow.tokens)}`;
     return rightAlign(left, selected ? theme.fg("text", stats) : theme.fg("dim", stats), width);
@@ -605,7 +608,7 @@ export class FleetList {
     // running line: only the record carries a nested child's spend, and only it
     // outlives the agent.
     const tokens = getLifetimeTotal(record.lifetimeUsage);
-    const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
+    const elapsedMs = (record.completedAt ?? this.clock.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
     const parts: string[] = [];
     if (this.showModel()) {
@@ -618,7 +621,7 @@ export class FleetList {
     // What the in-flight model call is doing, only while the agent is running:
     // a finished row has no call to describe.
     const call = record.status === "running"
-      ? describeModelCall(this.activityFor(record.id)?.modelCall, Date.now())
+      ? describeModelCall(this.activityFor(record.id)?.modelCall, this.clock.now())
       : undefined;
     if (call) parts.push(call);
     parts.push(formatFleetElapsed(elapsedMs), formatFleetTokens(tokens));

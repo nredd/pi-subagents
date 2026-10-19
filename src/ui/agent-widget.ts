@@ -9,6 +9,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
+import { type Clock, realClock, type TimerHandle } from "../clock.js";
 import { describeModelCall, type ModelCallState } from "../model-call.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
@@ -177,9 +178,9 @@ export function formatMs(ms: number): string {
 }
 
 /** Format duration from start/completed timestamps. */
-export function formatDuration(startedAt: number, completedAt?: number): string {
+export function formatDuration(startedAt: number, completedAt?: number, now = Date.now()): string {
   if (completedAt) return formatMs(completedAt - startedAt);
-  return `${formatMs(Date.now() - startedAt)} (running)`;
+  return `${formatMs(now - startedAt)} (running)`;
 }
 
 /** Get display name for any agent type (built-in or custom). */
@@ -269,7 +270,7 @@ export function describeActivity(
 export class AgentWidget {
   private uiCtx: UICtx | undefined;
   private widgetFrame = 0;
-  private widgetInterval: ReturnType<typeof setInterval> | undefined;
+  private widgetInterval: TimerHandle | undefined;
   /** Tracks how many turns each finished agent has survived. Key: agent ID, Value: turns since finished. */
   private finishedTurnAge = new Map<string, number>();
   /** How many extra turns errors/aborted agents linger (completed agents clear after 1 turn). */
@@ -307,6 +308,7 @@ export class AgentWidget {
      * conversation viewer unconditionally.
      */
     private showModel: () => boolean = () => false,
+    private readonly clock: Clock = realClock,
   ) {}
 
   /**
@@ -357,7 +359,7 @@ export class AgentWidget {
   /** Ensure the widget update timer is running. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
+      this.widgetInterval = this.clock.setInterval(() => this.update(), 80);
     }
   }
 
@@ -389,7 +391,7 @@ export class AgentWidget {
   /** Render a finished agent line. */
   private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
-    const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
+    const duration = formatMs((a.completedAt ?? this.clock.now()) - a.startedAt);
 
     let icon: string;
     let statusText: string;
@@ -464,7 +466,7 @@ export class AgentWidget {
     for (const a of running) {
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
+      const elapsed = formatMs(this.clock.now() - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
@@ -494,7 +496,7 @@ export class AgentWidget {
       parts.push(elapsed);
       const statsText = parts.join(" · ");
 
-      const activity = bg ? describeActivity(bg.activeTools, bg.responseText, bg.modelCall) : "thinking…";
+      const activity = bg ? describeActivity(bg.activeTools, bg.responseText, bg.modelCall, this.clock.now()) : "thinking…";
 
       runningLines.push([
         truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
@@ -615,7 +617,7 @@ export class AgentWidget {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
       }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
+      if (this.widgetInterval) { this.widgetInterval.cancel(); this.widgetInterval = undefined; }
       // Clean up stale entries
       for (const [id] of this.finishedTurnAge) {
         if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
@@ -675,7 +677,7 @@ export class AgentWidget {
 
   dispose() {
     if (this.widgetInterval) {
-      clearInterval(this.widgetInterval);
+      this.widgetInterval.cancel();
       this.widgetInterval = undefined;
     }
     if (this.uiCtx) {

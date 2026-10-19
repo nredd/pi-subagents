@@ -8,6 +8,7 @@
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
+import { type Clock, realClock, type TimerHandle } from "../clock.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
@@ -169,7 +170,7 @@ export class ConversationViewer implements Component, Focusable {
   private lastInnerW = 0;
   private closed = false;
   /** Repaints once a second while the agent runs; see `LIVE_TICK_MS`. */
-  private liveTimer: ReturnType<typeof setInterval> | undefined;
+  private liveTimer: TimerHandle | undefined;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
   private keys: ViewerKeys;
@@ -225,6 +226,7 @@ export class ConversationViewer implements Component, Focusable {
      * affordance (history views).
      */
     private onBackground?: ViewerBackgroundAction,
+    private readonly clock: Clock = realClock,
   ) {
     this.fullscreen = tui.mode === "fullscreen";
     this.markdownTheme = resolveMarkdownTheme(theme);
@@ -241,7 +243,7 @@ export class ConversationViewer implements Component, Focusable {
       this.tui.requestRender();
     });
     if (record.status === "running" || record.status === "queued") {
-      this.liveTimer = setInterval(() => {
+      this.liveTimer = this.clock.setInterval(() => {
         if (this.closed) return;
         this.tui.requestRender();
         if (this.record.status !== "running" && this.record.status !== "queued") this.stopLiveTimer();
@@ -251,7 +253,7 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   private stopLiveTimer(): void {
-    if (this.liveTimer !== undefined) clearInterval(this.liveTimer);
+    this.liveTimer?.cancel();
     this.liveTimer = undefined;
   }
 
@@ -470,7 +472,7 @@ export class ConversationViewer implements Component, Focusable {
         : this.record.status === "error"
           ? th.fg("error", "✗")
           : th.fg("dim", "○");
-    const duration = formatDuration(this.record.startedAt, this.record.completedAt);
+    const duration = formatDuration(this.record.startedAt, this.record.completedAt, this.clock.now());
 
     const headerParts: string[] = [duration];
     const toolUses = this.activity?.toolUses ?? this.record.toolUses;
@@ -820,7 +822,7 @@ export class ConversationViewer implements Component, Focusable {
 
     // Streaming indicator for running agents
     if (this.record.status === "running" && this.activity) {
-      const act = describeActivity(this.activity.activeTools, this.activity.responseText, this.activity.modelCall);
+      const act = describeActivity(this.activity.activeTools, this.activity.responseText, this.activity.modelCall, this.clock.now());
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
     }

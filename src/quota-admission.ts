@@ -12,6 +12,7 @@
  */
 
 import { nanoid } from "nanoid";
+import { type Clock, realClock } from "./clock.js";
 
 export const ADMIT_CHANNEL = "router:rpc:admit";
 
@@ -53,6 +54,7 @@ export function checkAdmission(
   events: AdmissionEvents,
   model: string,
   timeoutMs = ADMIT_TIMEOUT_MS,
+  clock: Clock = realClock,
 ): Promise<QuotaBlock | undefined> {
   const requestId = nanoid();
   return new Promise(resolve => {
@@ -60,7 +62,7 @@ export function checkAdmission(
     const finish = (block: QuotaBlock | undefined) => {
       if (done) return;
       done = true;
-      clearTimeout(timer);
+      timer.cancel();
       unsubscribe();
       resolve(block);
     };
@@ -75,7 +77,7 @@ export function checkAdmission(
         ...(typeof wait === "boolean" ? { wait } : {}),
       });
     });
-    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    const timer = clock.setTimeout(() => finish(undefined), timeoutMs);
     events.emit(ADMIT_CHANNEL, { requestId, model });
   });
 }

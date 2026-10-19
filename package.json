@@ -42,22 +42,30 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/",
-    "check": "npm run lint && npm run typecheck && npm run test",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run test:bun",
+    "test:bun": "bun test test/session-scenarios.test.ts test/fleet-session.test.ts test/viewer-session.test.ts test/worktree-isolation-e2e.test.ts",
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench",
     "bench:ab": "node test/perf/ab.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@earendil-works/pi-ai": "1.1.0",
-    "@earendil-works/pi-coding-agent": "1.1.0",
-    "@earendil-works/pi-tui": "1.1.0",
+    "@earendil-works/pi-ai": "https://github.com/nredd/pi/releases/download/v1.3.0-nredd.6/earendil-works-pi-ai-1.3.0.tgz",
+    "@earendil-works/pi-coding-agent": "https://github.com/nredd/pi/releases/download/v1.3.0-nredd.6/earendil-works-pi-coding-agent-1.3.0.tgz",
+    "@earendil-works/pi-tui": "https://github.com/nredd/pi/releases/download/v1.3.0-nredd.6/earendil-works-pi-tui-1.3.0.tgz",
+    "@xterm/headless": "5.5.0",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.11",
     "typebox": "^1.3.27",
     "typescript": "^6.0.0",
     "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "@earendil-works/pi-ai": "$@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "$@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui": "$@earendil-works/pi-tui",
+    "@earendil-works/pi-agent-core": "https://github.com/nredd/pi/releases/download/v1.3.0-nredd.6/earendil-works-pi-agent-core-1.3.0.tgz"
   },
   "pi": {
     "extensions": [

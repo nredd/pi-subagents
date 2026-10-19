@@ -21,6 +21,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type AssistantMessageInfo, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
+import { type Clock, realClock, type TimerHandle } from "./clock.js";
 import { assignHandle, handleBase } from "./mention.js";
 import type { ModelCallEvent } from "./model-call.js";
 import { describeModel, describePhysicalModel, describeVirtualModel, isVirtualModel } from "./model-resolver.js";
@@ -128,9 +129,9 @@ const MIN_SWEEP_INTERVAL_MS = 1_000;
 const MAX_EVICTED_NOTES = 500;
 
 /** Mark a record's result as read, which shortens its retention and suppresses its notice. */
-export function markConsumed(record: Pick<AgentRecord, "resultConsumed" | "consumedAt">): void {
+export function markConsumed(record: Pick<AgentRecord, "resultConsumed" | "consumedAt">, now = Date.now()): void {
   record.resultConsumed = true;
-  record.consumedAt = Date.now();
+  record.consumedAt = now;
 }
 
 /**
@@ -462,7 +463,7 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
 
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
-  private cleanupInterval: ReturnType<typeof setInterval>;
+  private cleanupInterval: TimerHandle;
   /** `CONSUMED_RECORD_TTL_MS` unless `PI_SUBAGENTS_CONSUMED_TTL_MIN` overrides it. */
   private readonly consumedTtlMs = retentionMs("PI_SUBAGENTS_CONSUMED_TTL_MIN", CONSUMED_RECORD_TTL_MS);
   /** `UNCONSUMED_RECORD_TTL_MS` unless `PI_SUBAGENTS_UNREAD_TTL_MIN` overrides it. */
@@ -527,6 +528,7 @@ export class AgentManager {
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
     onSteered?: OnAgentSteered,
+    private readonly clock: Clock = realClock,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
@@ -539,8 +541,8 @@ export class AgentManager {
       MAX_SWEEP_INTERVAL_MS,
       Math.max(MIN_SWEEP_INTERVAL_MS, Math.min(this.consumedTtlMs, this.unreadTtlMs)),
     );
-    this.cleanupInterval = setInterval(() => this.cleanup(), sweepMs);
-    this.cleanupInterval.unref();
+    this.cleanupInterval = this.clock.setInterval(() => this.cleanup(), sweepMs);
+    this.cleanupInterval.unref?.();
   }
 
   /** Update the max concurrent background agents limit. */
@@ -635,7 +637,7 @@ export class AgentManager {
       // since the pool decision needs the finished record.
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
-      startedAt: Date.now(),
+      startedAt: this.clock.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
@@ -711,7 +713,7 @@ export class AgentManager {
       const record = this.agents.get(id);
       if (record) {
         record.status = "stopped";
-        record.completedAt = Date.now();
+        record.completedAt = this.clock.now();
       }
       return false;
     }
@@ -766,10 +768,10 @@ export class AgentManager {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
-          if (queuedPool === "foreground") markConsumed(record);
+          if (queuedPool === "foreground") markConsumed(record, this.clock.now());
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
-          record.completedAt = Date.now();
+          record.completedAt = this.clock.now();
           this.onComplete?.(record);
         } else {
           this.agents.delete(id);
@@ -832,7 +834,7 @@ export class AgentManager {
     // below never reach `settleRun`, so they hand the slot back themselves.
     record.chargedPool = this.poolFor(record);
     record.status = "running";
-    record.startedAt = Date.now();
+    record.startedAt = this.clock.now();
     record.startGate = undefined;
     this.chargePool(record.chargedPool, 1);
 
@@ -1048,7 +1050,7 @@ export class AgentManager {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
+        record.completedAt ??= this.clock.now();
 
         detach();
 
@@ -1103,7 +1105,7 @@ export class AgentManager {
    * the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean): void {
-    if (!record.isBackground) markConsumed(record);
+    if (!record.isBackground) markConsumed(record, this.clock.now());
     // Nobody waits on a settled run; a later foreground resume must not look
     // like a spawn `sendToBackground` could hand off.
     record.blocking = false;
@@ -1332,7 +1334,7 @@ export class AgentManager {
             } catch (err) {
               record.status = "error";
               record.error = err instanceof Error ? err.message : String(err);
-              record.completedAt = Date.now();
+              record.completedAt = this.clock.now();
               this.onComplete?.(record);
             }
           },
@@ -1346,7 +1348,7 @@ export class AgentManager {
 
     // Foreground resume: run inline and return the settled record.
     record.status = "running";
-    record.startedAt = Date.now();
+    record.startedAt = this.clock.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
@@ -1421,7 +1423,7 @@ export class AgentManager {
       }
     }
     record.result = text;
-    record.completedAt ??= Date.now();
+    record.completedAt ??= this.clock.now();
   }
 
   /** A resume whose runner rejected: an error, unless an external stop got there first. */
@@ -1430,7 +1432,7 @@ export class AgentManager {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
     }
-    record.completedAt ??= Date.now();
+    record.completedAt ??= this.clock.now();
   }
 
   /**
@@ -1450,7 +1452,7 @@ export class AgentManager {
     if (!record.session) return;
 
     record.status = "running";
-    record.startedAt = Date.now();
+    record.startedAt = this.clock.now();
     if (occupiesPoolSlot(record)) this.runningBackground++;
     this.onStart?.(record);
 
@@ -1635,14 +1637,14 @@ export class AgentManager {
     if (record.status === "queued") {
       this.dequeue(q => q.id === id);
       record.status = "stopped";
-      record.completedAt = Date.now();
+      record.completedAt = this.clock.now();
       return true;
     }
 
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
-    record.completedAt = Date.now();
+    record.completedAt = this.clock.now();
     return true;
   }
 
@@ -1679,7 +1681,7 @@ export class AgentManager {
       type: record.type,
       description: record.description,
       sessionFile: record.sessionFile,
-      completedAt: record.completedAt ?? Date.now(),
+      completedAt: record.completedAt ?? this.clock.now(),
     });
     // Bound the memory a long session can accumulate. Oldest first, since the
     // agent someone still wants to reach is the one they used most recently.
@@ -1691,14 +1693,14 @@ export class AgentManager {
 
   /** Remember that `record` existed, so its id still answers with something better than "not found". */
   private noteEviction(record: AgentRecord): void {
-    const completedAt = record.completedAt ?? Date.now();
+    const completedAt = record.completedAt ?? this.clock.now();
     this.evictedNotes.delete(record.id);
     this.evictedNotes.set(record.id, {
       id: record.id,
       type: record.type,
       description: record.description,
       status: record.status,
-      evictedAfterMin: Math.max(0, Math.round((Date.now() - completedAt) / 60_000)),
+      evictedAfterMin: Math.max(0, Math.round((this.clock.now() - completedAt) / 60_000)),
       transcript: record.outputFile ?? record.sessionFile,
     });
     while (this.evictedNotes.size > MAX_EVICTED_NOTES) {
@@ -1720,7 +1722,7 @@ export class AgentManager {
    * completion.
    */
   private cleanup() {
-    const now = Date.now();
+    const now = this.clock.now();
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       const completedAt = record.completedAt ?? 0;
@@ -1776,7 +1778,7 @@ export class AgentManager {
       const record = this.agents.get(queued.id);
       if (record) {
         record.status = "stopped";
-        record.completedAt = Date.now();
+        record.completedAt = this.clock.now();
       }
     }
     this.dequeue(() => true);
@@ -1790,7 +1792,7 @@ export class AgentManager {
       }
       record.abortController?.abort();
       record.status = "stopped";
-      record.completedAt = Date.now();
+      record.completedAt = this.clock.now();
     }
     return survivors;
   }
@@ -1803,7 +1805,7 @@ export class AgentManager {
       const record = this.agents.get(queued.id);
       if (record) {
         record.status = "stopped";
-        record.completedAt = Date.now();
+        record.completedAt = this.clock.now();
         count++;
       }
     }
@@ -1813,7 +1815,7 @@ export class AgentManager {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
-        record.completedAt = Date.now();
+        record.completedAt = this.clock.now();
         count++;
       }
     }
@@ -1846,7 +1848,7 @@ export class AgentManager {
    *   it (tests, teardown of a manager that never spawned) skips the prune.
    */
   async dispose(pi?: ExtensionAPI): Promise<void> {
-    clearInterval(this.cleanupInterval);
+    this.cleanupInterval.cancel();
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);

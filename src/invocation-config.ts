@@ -82,8 +82,10 @@ export const cwdParam = {
 export function resolveCwdParam(cwd: string | undefined, sessionCwd: string): string | undefined {
   const trimmed = cwd?.trim();
   if (!trimmed) return undefined;
-  if (trimmed === "~") return homedir();
-  if (trimmed.startsWith("~/")) return resolve(homedir(), trimmed.slice(2));
+  // Bun 1.3 ignores HOME in os.homedir(); honor the same explicit override as Node.
+  const home = process.env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || homedir();
+  if (trimmed === "~") return home;
+  if (trimmed.startsWith("~/")) return resolve(home, trimmed.slice(2));
   return resolve(sessionCwd, trimmed);
 }
 

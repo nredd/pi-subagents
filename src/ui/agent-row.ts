@@ -12,6 +12,7 @@
 
 import { pathToFileURL } from "node:url";
 import { type Component, hyperlink, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Clock, realClock, type TimerHandle } from "../clock.js";
 import { formatClock } from "../model-call.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
@@ -127,7 +128,7 @@ export function transcriptLink(path: string, theme: Theme): string {
 const ROW_TICK_MS = 1000;
 
 interface RowTickState {
-  ticker?: ReturnType<typeof setInterval>;
+  ticker?: TimerHandle;
   isLive?: () => boolean;
   invalidate?: () => void;
 }
@@ -144,18 +145,19 @@ interface RowTickState {
 export function keepTicking(
   context: { state?: unknown; invalidate?: () => void; probe?: boolean },
   isLive: () => boolean,
+  clock: Clock = realClock,
 ): void {
   const state = context.state as RowTickState | undefined;
   if (context.probe || !state || !context.invalidate) return;
   state.isLive = isLive;
   state.invalidate = context.invalidate;
   if (state.ticker !== undefined || !isLive()) return;
-  state.ticker = setInterval(() => {
+  state.ticker = clock.setInterval(() => {
     if (state.isLive?.()) {
       state.invalidate?.();
       return;
     }
-    clearInterval(state.ticker);
+    state.ticker?.cancel();
     state.ticker = undefined;
     state.invalidate?.(); // one last repaint, showing the final state
   }, ROW_TICK_MS);
@@ -167,8 +169,9 @@ export function keepRowTicking(
   context: { state?: unknown; invalidate?: () => void; probe?: boolean },
   details: AgentDetails,
   live: AgentRowLive,
+  clock: Clock = realClock,
 ): void {
-  keepTicking(context, () => isRowLive(details, live));
+  keepTicking(context, () => isRowLive(details, live), clock);
 }
 
 /**
@@ -182,10 +185,11 @@ export class AgentResultView implements Component {
     private readonly expanded: boolean,
     private readonly live: AgentRowLive,
     private readonly theme: Theme,
+    private readonly clock: Clock = realClock,
   ) {}
 
   render(width: number): string[] {
-    const lines = [truncateToWidth(agentRowSummary(this.details, this.live, this.theme), width)];
+    const lines = [truncateToWidth(agentRowSummary(this.details, this.live, this.theme, this.clock.now()), width)];
     if (!this.expanded) return lines;
 
     const record = this.details.agentId ? this.live.getRecord(this.details.agentId) : undefined;

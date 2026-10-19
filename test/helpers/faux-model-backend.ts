@@ -16,6 +16,7 @@
  * no auth.json, no network, no local login state.
  */
 import type { Model } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { streamSimple } from "./pi-ai.js";
 
 /** Both option shapes for `createAgentSession`, for the given faux model. */
@@ -38,6 +39,8 @@ export function fauxModelBackend(model: Model<string>): {
       unregisterProvider: () => {},
     },
     modelRuntime: {
+      // Use the host's real session-owned facade instead of bypassing its startup gate.
+      withBeforeProviderRequest: ModelRuntime.prototype.withBeforeProviderRequest,
       getModel: () => model,
       getModels: () => [model],
       getProvider: () => undefined,

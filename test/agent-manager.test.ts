@@ -467,9 +467,13 @@ describe("AgentManager — cleanup timer", () => {
   });
 
   it("does not keep the process alive on its own", () => {
-    manager = new AgentManager();
-
-    expect((manager as any).cleanupInterval.hasRef()).toBe(false);
+    const interval = vi.spyOn(globalThis, "setInterval");
+    try {
+      manager = new AgentManager();
+      expect(interval.mock.results[0]?.value.hasRef()).toBe(false);
+    } finally {
+      interval.mockRestore();
+    }
   });
 });
 

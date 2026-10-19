@@ -1,6 +1,7 @@
 /** A timer owns cancellation, without requiring a Node-specific handle. */
 export interface TimerHandle {
   cancel(): void;
+  unref?(): void;
 }
 
 /** Scheduling boundary, structurally compatible with pi-session-kit's clock. */
@@ -19,6 +20,6 @@ export const realClock: Clock = {
   },
   setInterval(callback, ms) {
     const timer = setInterval(callback, ms);
-    return { cancel: () => clearInterval(timer) };
+    return { cancel: () => clearInterval(timer), unref: () => { timer.unref(); } };
   },
 };
